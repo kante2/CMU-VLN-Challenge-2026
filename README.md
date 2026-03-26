@@ -227,7 +227,7 @@ Any questions regarding the challenge can be asked by opening a Github issue wit
    All evaluation will be conducted prior to the IROS conference. The top 3 teams will be contacted with the opportunity to present their method either in-person or remotely.
 
 ## Acknowledgements
-Thank you to [AlphaZ](https://alpha-z.ai/) for sponsoring the challenge for 2025! Their generous support enables us to provide the top three teams with a cash prize.
+Thank you to [AlphaZ](https://alpha-z.ai/) for sponsoring the challenge for 2026! Their generous support enables us to provide the top three teams with a cash prize.
 
 ## References
 
