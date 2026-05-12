@@ -155,7 +155,7 @@ Submissions will be made as a github repository link to a public repository. The
 
 Prior to submitting, please download the docker image and test it with the simulator as the submission will be evaluated in the same way. Please also make sure that waypoints and visualization markers sent match the types in the example dummy model and are on the same ROS topics so that the base navigation system can correctly receive them.
 
-Please fill out the [Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSfcKWEV3ReuGEfGag0En706KDtgxjFDayE6dJIgWElQrXiDmw/viewform?usp=sharing&ouid=113649899278879140488) with a link to your Github repo.
+Please fill out the [Submission Form](https://docs.google.com/forms/d/e/1FAIpQLScdZAcw5S2nbfSKn8qB-kmNC3PEEQHTK64dU9Hqb5iKg0_jtA/viewform) with a link to your Github repo.
 
 
 ## Evaluation
