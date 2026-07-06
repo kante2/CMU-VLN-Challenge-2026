@@ -38,3 +38,20 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # Tmah 팀이 사용하는 docker-compose 파일 (0706 생성)
+  tmah_module:
+    build:
+      context: ../ai_module
+      dockerfile: docker/Dockerfile.tmah
+    container_name: iros2026_tmah_module
+    network_mode: host
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -1,0 +1,24 @@
+FROM zhangjicmu/ubuntu24_ros:ai_module
+
+# ---------------------------------------------------------------------------
+# (선택) 파이썬 인식 라이브러리 설치 자리.
+# 지금은 뼈대 단계라 주석 처리. 나중에 baseline 붙일 때 주석 풀고 추가.
+# 예)
+#   RUN pip3 install --no-cache-dir --break-system-packages \
+#       torch torchvision transformers pillow numpy
+#   # GroundingDINO / open VLM / API SDK 등
+# ---------------------------------------------------------------------------
+
+# tmah_vlm 소스만 워크스페이스에 복사
+COPY src/tmah_vlm /home/docker/ai_module/src/tmah_vlm
+
+# tmah_vlm 패키지만 빌드 (dummy 는 건드리지 않음)
+WORKDIR /home/docker/ai_module
+RUN /bin/bash -c "\
+    source /opt/ros/jazzy/setup.bash && \
+    colcon build \
+      --symlink-install \
+      --packages-select tmah_vlm"
+
+# 새 셸마다 워크스페이스 자동 source
+RUN echo "source /home/docker/ai_module/install/setup.bash" >> /home/docker/.bashrc

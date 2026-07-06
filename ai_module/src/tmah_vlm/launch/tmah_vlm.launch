@@ -1,0 +1,6 @@
+<launch>
+
+  <node pkg="tmah_vlm" exec="tmah_vlm" name="tmah_vlm" output="screen">
+  </node>
+
+</launch>
