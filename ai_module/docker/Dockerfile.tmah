@@ -1,24 +1,37 @@
 FROM zhangjicmu/ubuntu24_ros:ai_module
 
-# ---------------------------------------------------------------------------
-# (선택) 파이썬 인식 라이브러리 설치 자리.
-# 지금은 뼈대 단계라 주석 처리. 나중에 baseline 붙일 때 주석 풀고 추가.
-# 예)
-#   RUN pip3 install --no-cache-dir --break-system-packages \
-#       torch torchvision transformers pillow numpy
-#   # GroundingDINO / open VLM / API SDK 등
-# ---------------------------------------------------------------------------
+# apt/pip 설치를 위해 잠시 root 로 전환
+USER root
 
-# tmah_vlm 소스만 워크스페이스에 복사
+# 베이스 이미지에 pip 이 없으므로 apt 로 먼저 설치
+RUN apt-get update && \
+    apt-get install -y python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+# 파이썬 인식 라이브러리 설치
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+    "torch" "torchvision" \
+    "transformers>=4.44" \
+    "pillow" "numpy" "accelerate"
+
+# GroundingDINO-tiny 가중치를 빌드 시점에 미리 받아둠
+RUN python3 -c "\
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection; \
+m='IDEA-Research/grounding-dino-tiny'; \
+AutoProcessor.from_pretrained(m); \
+AutoModelForZeroShotObjectDetection.from_pretrained(m); \
+print('GroundingDINO weights cached.')" || echo "WARN: model pre-download skipped"
+
+# tmah_vlm 소스 복사
 COPY src/tmah_vlm /home/docker/ai_module/src/tmah_vlm
 
-# tmah_vlm 패키지만 빌드 (dummy 는 건드리지 않음)
+# tmah_vlm 패키지만 빌드
 WORKDIR /home/docker/ai_module
 RUN /bin/bash -c "\
     source /opt/ros/jazzy/setup.bash && \
-    colcon build \
-      --symlink-install \
-      --packages-select tmah_vlm"
+    colcon build --symlink-install --packages-select tmah_vlm"
 
-# 새 셸마다 워크스페이스 자동 source
 RUN echo "source /home/docker/ai_module/install/setup.bash" >> /home/docker/.bashrc
+
+# 원래 유저로 복귀 (베이스 이미지 기본 유저)
+USER docker

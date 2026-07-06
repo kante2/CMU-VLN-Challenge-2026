@@ -1,28 +1,16 @@
 #!/usr/bin/env python3
 """
-TMAH VLM Node — CMU VLN Challenge 2026
-======================================
+TMAH VLM Node — CMU VLN Challenge 2026  (Phase 1a)
+==================================================
 
-이 노드는 dummy_vlm 을 대체하는 뼈대(skeleton)입니다.
-지금은 '하드코딩 답 + 센서 구독 로그' 상태이고,
-파이프라인이 도는 것을 확인한 뒤 각 함수 안쪽 로직을
-실제 인식/추론(VLM, GroundingDINO, API 등)으로 채우면 됩니다.
+Phase 1a: object_reference 질문에 대해
+  현재 카메라 뷰 -> GroundingDINO 2D 검출 -> 박스 그려 파일 저장 + 로그
+까지 수행합니다. (3D 좌표화/waypoint 는 Phase 1b 에서)
 
---- 인터페이스 계약 (base 시스템과의 약속) ---
-[구독 / Inputs]
-  /challenge_question   std_msgs/String        질문 텍스트
-  /camera/image         sensor_msgs/Image      360 RGB (test-time 허용)
-  /registered_scan      sensor_msgs/PointCloud2 라이다 (map 좌표, test-time 허용)
-  /state_estimation     nav_msgs/Odometry      로봇 pose
-  # (개발용) /camera/semantic_image 도 있지만 test-time엔 안 나옴 → 의존 금지
-
-[발행 / Outputs]
-  /way_point_with_heading   geometry_msgs/Pose2D   이동 목표 (instruction/object)
-  /selected_object_marker   visualization_msgs/Marker  선택 객체 박스 (object)
-  /numerical_response       std_msgs/Int32         개수 답 (numerical)
+numerical / instruction 은 아직 stub 유지.
 """
 
-import math
+import threading
 
 import rclpy
 from rclpy.node import Node
@@ -33,6 +21,11 @@ from sensor_msgs.msg import Image, PointCloud2
 from geometry_msgs.msg import Pose2D
 from visualization_msgs.msg import Marker
 
+# perception 모듈
+from tmah_vlm.perception.image_utils import ros_image_to_pil
+from tmah_vlm.perception.query_parser import extract_target
+from tmah_vlm.perception.visualize import save_detection_image
+
 
 class TmahVLM(Node):
     def __init__(self):
@@ -41,13 +34,18 @@ class TmahVLM(Node):
         # --- 내부 상태 ---
         self.vehicle_x = 0.0
         self.vehicle_y = 0.0
-        self.latest_image = None          # 가장 최근 카메라 프레임 저장
-        self.latest_scan = None           # 가장 최근 포인트클라우드 저장
-        self.image_count = 0              # 센서 수신 확인용 카운터
+        self.latest_image = None
+        self.latest_scan = None
+        self.image_count = 0
         self.scan_count = 0
-        self.busy = False                 # 질문 처리 중 중복 방지
+        self.busy = False
 
-        # --- 구독 (Inputs) ---
+        # --- 검출기: 무거우니 백그라운드에서 로드 ---
+        self.detector = None
+        self.get_logger().info("Loading GroundingDINO in background...")
+        threading.Thread(target=self._load_detector, daemon=True).start()
+
+        # --- 구독 ---
         self.create_subscription(String, "/challenge_question",
                                  self.question_cb, 5)
         self.create_subscription(Odometry, "/state_estimation",
@@ -57,7 +55,7 @@ class TmahVLM(Node):
         self.create_subscription(PointCloud2, "/registered_scan",
                                  self.scan_cb, 5)
 
-        # --- 발행 (Outputs) ---
+        # --- 발행 ---
         self.waypoint_pub = self.create_publisher(
             Pose2D, "/way_point_with_heading", 5)
         self.marker_pub = self.create_publisher(
@@ -65,10 +63,16 @@ class TmahVLM(Node):
         self.numerical_pub = self.create_publisher(
             Int32, "/numerical_response", 5)
 
-        # 센서가 실제로 들어오는지 3초마다 로그 (파이프라인 헬스체크)
         self.create_timer(3.0, self.heartbeat)
-
         self.get_logger().info("TMAH VLM node started. Awaiting question...")
+
+    def _load_detector(self):
+        try:
+            from tmah_vlm.perception.detector import GroundingDINODetector
+            self.detector = GroundingDINODetector()
+            self.get_logger().info("GroundingDINO loaded. Ready to detect.")
+        except Exception as e:
+            self.get_logger().error(f"Failed to load detector: {e}")
 
     # ================= 콜백 =================
     def pose_cb(self, msg: Odometry):
@@ -84,25 +88,27 @@ class TmahVLM(Node):
         self.scan_count += 1
 
     def heartbeat(self):
+        ready = "ready" if self.detector is not None else "loading"
         self.get_logger().info(
             f"[health] images={self.image_count} scans={self.scan_count} "
-            f"pose=({self.vehicle_x:.2f}, {self.vehicle_y:.2f})")
+            f"pose=({self.vehicle_x:.2f}, {self.vehicle_y:.2f}) detector={ready}")
 
     def question_cb(self, msg: String):
         if self.busy:
-            self.get_logger().warn("Still processing previous question, ignoring.")
+            self.get_logger().warn("Busy, ignoring question.")
             return
         question = msg.data.strip()
         self.get_logger().info(f"Received question: {question}")
         self.busy = True
         try:
             self.dispatch(question)
+        except Exception as e:
+            self.get_logger().error(f"Error handling question: {e}")
         finally:
             self.busy = False
             self.get_logger().info("Awaiting question...")
 
     # ================= 디스패처 =================
-    # dummy 의 분류 로직을 그대로 옮김: 첫 단어로 질문 타입 판별
     def dispatch(self, question: str):
         q = question.lower()
         if q.startswith("find"):
@@ -112,79 +118,62 @@ class TmahVLM(Node):
         else:
             self.handle_instruction(question)
 
-    # ============ 질문 타입별 처리 (여기를 채워나감) ============
+    # ============ object_reference: Phase 1a (검출 + 시각화) ============
     def handle_object_reference(self, question: str):
-        """
-        TODO: 실제 구현
-          1) self.latest_image 로 후보 객체 검출 (GroundingDINO / VLM / API)
-          2) 공간관계 추론으로 정답 하나 선택
-          3) 3D 좌표/크기 추정 (registered_scan 활용)
-          4) publish_marker(...) + publish_waypoint(...)
-        지금은 하드코딩 값으로 파이프라인만 검증.
-        """
-        self.get_logger().info("[object_reference] (stub) publishing dummy marker + waypoint")
-        # object_list.txt 의 예시 sofa 값 재사용
-        self.publish_marker(obj_id=0, label="sofa",
-                            x=3.37, y=-2.09, z=0.50,
-                            l=2.86, w=1.20, h=1.02, heading=0.0)
-        self.publish_waypoint(3.37, -2.09, 0.0)
+        if self.detector is None:
+            self.get_logger().warn("Detector still loading, skipping.")
+            return
+        if self.latest_image is None:
+            self.get_logger().warn("No camera image yet, skipping.")
+            return
 
+        # 1) 현재 카메라 뷰
+        pil = ros_image_to_pil(self.latest_image)
+
+        # 2) 질문에서 대상 명사 추출
+        target = extract_target(question)
+        self.get_logger().info(f"[object_reference] target prompt = '{target}'")
+
+        # 3) GroundingDINO 검출
+        dets = self.detector.detect(pil, target)
+
+        # 4) 로그로 요약
+        self.get_logger().info(f"  detected {len(dets)} object(s):")
+        for i, d in enumerate(dets):
+            self.get_logger().info(
+                f"    #{i+1} {d.label} score={d.score:.2f} "
+                f"box=({d.box[0]:.0f},{d.box[1]:.0f},{d.box[2]:.0f},{d.box[3]:.0f}) "
+                f"center=({d.cx:.0f},{d.cy:.0f})")
+
+        # 5) 박스 그린 이미지 저장
+        try:
+            path = save_detection_image(pil, dets, target)
+            self.get_logger().info(f"  saved visualization -> {path}")
+        except Exception as e:
+            self.get_logger().error(f"  failed to save visualization: {e}")
+
+        # 6) (Phase 1b 예정) 3D 좌표화 + marker/waypoint 발행
+        #    지금은 2D 검출 확인만. 아직 발행 안 함.
+
+    # ============ 아직 stub ============
     def handle_numerical(self, question: str):
-        """
-        TODO: 실제 구현
-          탐색하며 이미지 수집 → 대상 객체 검출/카운트 → 정수 publish
-        """
-        answer = 1  # stub
-        self.get_logger().info(f"[numerical] (stub) publishing {answer}")
-        self.publish_numerical(answer)
+        self.get_logger().info("[numerical] (stub) publishing 1")
+        self.publish_numerical(1)
 
     def handle_instruction(self, question: str):
-        """
-        TODO: 실제 구현
-          질문을 landmark 시퀀스로 파싱 → 각 landmark 좌표화 →
-          순차 waypoint (도달 확인하며 다음으로)
-        지금은 현재 위치 살짝 앞으로 한 점만.
-        """
-        self.get_logger().info("[instruction] (stub) publishing single waypoint")
+        self.get_logger().info("[instruction] (stub) single waypoint")
         self.publish_waypoint(self.vehicle_x + 1.0, self.vehicle_y, 0.0)
 
     # ================= 발행 헬퍼 =================
-    def publish_waypoint(self, x: float, y: float, heading: float = 0.0):
-        msg = Pose2D()
-        msg.x = float(x)
-        msg.y = float(y)
-        msg.theta = float(heading)  # 올해는 heading 무시해도 됨
-        self.waypoint_pub.publish(msg)
-        self.get_logger().info(f"  -> waypoint ({x:.2f}, {y:.2f})")
+    def publish_waypoint(self, x, y, heading=0.0):
+        m = Pose2D()
+        m.x, m.y, m.theta = float(x), float(y), float(heading)
+        self.waypoint_pub.publish(m)
 
-    def publish_numerical(self, value: int):
-        msg = Int32()
-        msg.data = int(value)
-        self.numerical_pub.publish(msg)
-
-    def publish_marker(self, obj_id, label, x, y, z, l, w, h, heading):
-        m = Marker()
-        m.header.frame_id = "map"
-        m.header.stamp = self.get_clock().now().to_msg()
-        m.ns = label
-        m.id = int(obj_id)
-        m.action = Marker.ADD
-        m.type = Marker.CUBE
-        m.pose.position.x = float(x)
-        m.pose.position.y = float(y)
-        m.pose.position.z = float(z)
-        # heading(yaw) -> quaternion
-        m.pose.orientation.z = math.sin(heading / 2.0)
-        m.pose.orientation.w = math.cos(heading / 2.0)
-        m.scale.x = float(l)
-        m.scale.y = float(w)
-        m.scale.z = float(h)
-        m.color.a = 0.5
-        m.color.r = 0.0
-        m.color.g = 0.0
-        m.color.b = 1.0
-        self.marker_pub.publish(m)
-        self.get_logger().info(f"  -> marker '{label}' at ({x:.2f}, {y:.2f})")
+    def publish_numerical(self, value):
+        m = Int32()
+        m.data = int(value)
+        self.numerical_pub.publish(m)
 
 
 def main(args=None):

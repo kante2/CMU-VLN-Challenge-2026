@@ -12,7 +12,7 @@ docker exec -it iros2026_ai_module bash
 ros2 launch dummy_vlm dummy_vlm.launch
 
 
-* 참고 
+# 참고 
 더미는 커닝을 하는 구조이다.
 readObjectListFile() → data/object_list.txt에서 정답 객체 하나(좌표·크기·라벨)를 미리 읽어둠
 readWaypointFile() → data/waypoints.ply에서 정답 경로를 미리 읽어둠

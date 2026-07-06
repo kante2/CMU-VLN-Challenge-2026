@@ -48,10 +48,12 @@ services:
     network_mode: host
     stdin_open: true
     tty: true
+    volumes:
+      - ../ai_module/debug:/home/docker/ai_module/debug
     deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+        resources:
+          reservations:
+            devices:
+              - driver: nvidia
+                count: all
+                capabilities: [gpu]
