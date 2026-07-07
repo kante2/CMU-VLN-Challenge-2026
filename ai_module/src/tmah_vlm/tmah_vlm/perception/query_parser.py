@@ -1,46 +1,55 @@
 #!/usr/bin/env python3
 """
-질문 텍스트에서 "찾을 대상"을 뽑는 아주 단순한 파서 (Phase 1a 용).
+질문 -> GroundingDINO 검출용 "물체명" 추출 (최소 버전).
 
-지금은 규칙 기반의 최소 구현입니다. 나중에 LLM 이나 더 똑똑한 파싱으로
-교체할 예정 (그때 이 함수 시그니처만 유지하면 나머지는 안 바뀜).
+이전엔 색/공간관계까지 정규식으로 다 파싱했지만, 이제 그건 Qwen(selector)이
+원본 질문을 통째로 이해해서 처리한다. 그래서 여기선 "무엇을 검출할지"의
+핵심 명사구만 뽑는다. 규칙은 얇게 유지.
 
-예)
-  "Find the teal pillow on the sofa farthest from the window"
-    -> 대략 "pillow" (핵심 명사)
-지금은 완벽하지 않아도 됩니다. 검출이 되는지 보는 게 목적.
+반환:
+  {
+    "object": "pillow",           # GroundingDINO 프롬프트 (색/관계 제거)
+    "raw": "<원본 질문>",          # Qwen 에 그대로 넘길 원문
+  }
 """
 
 import re
 
-# object_reference 질문 앞에 흔히 붙는 군더더기
-_LEADING = re.compile(r"^\s*(find|locate|show me|where is|point to)\s+", re.I)
+_LEADING = re.compile(
+    r"^\s*(find|locate|show me|where is|point to|identify)\s+", re.I)
 _ARTICLES = re.compile(r"\b(the|a|an)\b", re.I)
 
-# 공간관계 이후는 버림 (핵심 명사만 남기려는 단순 휴리스틱)
-_SPATIAL_CUT = re.compile(
-    r"\b(on|in|at|near|next to|farthest|closest|between|above|below|behind|"
-    r"under|beside|that|which|with)\b", re.I)
+# 공간관계/수식어가 시작되는 지점에서 자른다 (핵심 명사만 남기기)
+_CUT = re.compile(
+    r"\b(on|in|at|near|next to|farthest|furthest|closest|nearest|between|"
+    r"above|below|behind|under|beside|that|which|with|to the|on the)\b", re.I)
+
+# 색 형용사 (검출 프롬프트에서 제거 -> 오검출 방지)
+_COLORS = re.compile(
+    r"\b(red|orange|yellow|green|blue|teal|cyan|purple|violet|pink|brown|"
+    r"black|white|gray|grey|beige|tan|gold|silver|maroon|navy)\b", re.I)
 
 
-def extract_target(question: str) -> str:
-    """
-    질문 -> GroundingDINO 프롬프트로 쓸 대상 문구.
-    지금은 대충 핵심 명사구만 남긴다.
-    """
+def extract_target(question: str) -> dict:
     q = question.strip()
-    q = _LEADING.sub("", q)              # "Find " 제거
+    raw = q
 
-    # 공간관계 단어가 처음 나오는 지점에서 자른다
-    m = _SPATIAL_CUT.search(q)
+    q_body = _LEADING.sub("", q)
+
+    # 공간관계 전까지만
+    m = _CUT.search(q_body)
     if m:
-        q = q[:m.start()]
+        q_body = q_body[:m.start()]
 
-    q = _ARTICLES.sub("", q)             # 관사 제거
-    q = re.sub(r"\s+", " ", q).strip(" .,")
+    q_body = _ARTICLES.sub("", q_body)
+    # 검출 프롬프트에서 색 제거 (형태만 남김)
+    obj = _COLORS.sub("", q_body)
+    obj = re.sub(r"\s+", " ", obj).strip(" .,")
 
-    # 너무 짧아지면 원래 질문에서 마지막 명사라도
-    if not q:
-        q = question.strip()
+    if not obj:
+        # 색 제거로 비면, 색 포함본이라도 사용
+        obj = re.sub(r"\s+", " ", q_body).strip(" .,")
+    if not obj:
+        obj = question.strip()
 
-    return q.lower()
+    return {"object": obj.lower(), "raw": raw}

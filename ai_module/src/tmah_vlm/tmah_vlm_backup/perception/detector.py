@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""GroundingDINO 기반 zero-shot 객체 검출기 (transformers 5.x 호환)."""
+"""
+GroundingDINO 기반 zero-shot 객체 검출기 (transformers 5.x 호환).
+
+사용 예:
+    det = GroundingDINODetector()
+    boxes = det.detect(pil_image, "pillow")
+"""
 
 from dataclasses import dataclass
 from typing import List
@@ -22,7 +28,7 @@ class GroundingDINODetector:
     def __init__(self,
                  model_id: str = "IDEA-Research/grounding-dino-tiny",
                  device: str = None,
-                 box_threshold: float = 0.30,
+                 box_threshold: float = 0.35,
                  text_threshold: float = 0.25):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.box_threshold = box_threshold
@@ -48,14 +54,16 @@ class GroundingDINODetector:
                                 return_tensors="pt").to(self.device)
         outputs = self.model(**inputs)
 
+        # transformers 5.x: box_threshold -> threshold
         results = self.processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
-            threshold=self.box_threshold,       # transformers 5.x
+            threshold=self.box_threshold,
             text_threshold=self.text_threshold,
-            target_sizes=[image.size[::-1]],
+            target_sizes=[image.size[::-1]],  # (height, width)
         )[0]
 
+        # 라벨은 버전에 따라 text_labels(문자열) 또는 labels(정수)
         labels = results.get("text_labels", results.get("labels", []))
 
         dets: List[Detection] = []
