@@ -10,7 +10,7 @@ iros2026_system — 시뮬레이터/autonomy (이미지 pull)
 iros2026_ai_module — ../ai_module/docker/Dockerfile 빌드
 iros2026_tmah_module — ../ai_module/docker/Dockerfile.tmah 빌드
 
-
+# ------------------------------------------------------------------------------
 
 A — 시뮬레이터/autonomy 실행 (터미널 A)
 docker exec -it iros2026_system bash

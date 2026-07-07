@@ -22,7 +22,7 @@ class GroundingDINODetector:
     def __init__(self,
                  model_id: str = "IDEA-Research/grounding-dino-tiny",
                  device: str = None,
-                 box_threshold: float = 0.30,
+                 box_threshold: float = 0.45,
                  text_threshold: float = 0.25):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.box_threshold = box_threshold
