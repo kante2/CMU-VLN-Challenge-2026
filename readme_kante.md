@@ -1,3 +1,17 @@
+
+# 컨테이너 생성 명령어
+
+cd /home/kante/CMU-VLN-Challenge-2026/docker
+xhost +
+docker compose -f compose_gpu.yml up --build -d
+이 한 줄로 아래 3개 컨테이너가 빌드/생성/실행됩니다:
+
+iros2026_system — 시뮬레이터/autonomy (이미지 pull)
+iros2026_ai_module — ../ai_module/docker/Dockerfile 빌드
+iros2026_tmah_module — ../ai_module/docker/Dockerfile.tmah 빌드
+
+
+
 A — 시뮬레이터/autonomy 실행 (터미널 A)
 docker exec -it iros2026_system bash
 컨테이너 안에서
