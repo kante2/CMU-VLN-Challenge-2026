@@ -1,0 +1,22 @@
+Panorama LiDAR Overlay Debug
+========================================
+image_topic: /camera/image
+scan_topic: /sensor_scan
+image_stamp: 1783519361.643501
+scan_stamp: 1783519361.643501
+sync_dt_sec: 0.000000
+scan_frame_raw: sensor_at_scan
+scan_frame_normalized: sensor
+tf_used: sensor->camera
+image_size_used: 1920x640
+forward_x: 960.0
+v_fov_deg: 120.0
+pitch_offset_deg: 0.0
+yaw_offset_deg: 0.0
+raw_points: 10619
+
+Saved files:
+  mode=optical
+    valid_projected_points: 10578
+    overlay: /home/docker/ai_module/debug/pano_overlay_20260708_140241_825_optical_vfov120p0_pitch0p0_yaw0p0.jpg
+    lidar_pano: /home/docker/ai_module/debug/lidar_pano_20260708_140241_825_optical_vfov120p0_pitch0p0_yaw0p0.jpg
