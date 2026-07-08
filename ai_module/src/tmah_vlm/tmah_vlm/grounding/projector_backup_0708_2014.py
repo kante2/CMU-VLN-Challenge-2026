@@ -24,6 +24,7 @@ import numpy as np
 import sensor_msgs_py.point_cloud2 as pc2
 
 from tmah_vlm import config
+from tmah_vlm.grounding.panorama import pixel_to_ray, ray_to_pixel
 
 
 def pointcloud_to_xyz(scan_msg):
@@ -58,106 +59,15 @@ def shrink_box(box, scale):
     return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
 
 
-def get_pano_forward_x(image_width):
-    """
-    panorama 이미지에서 로봇 정면이 위치한 x 픽셀.
-
-    config.PANO_FORWARD_X가 config.PANO_WIDTH 기준으로 들어가 있을 수 있으므로,
-    실제 image_width가 다르면 비율로 스케일링한다.
-    """
-    cfg_width = float(getattr(config, "PANO_WIDTH", image_width))
-    cfg_forward_x = float(getattr(config, "PANO_FORWARD_X", image_width / 2.0))
-
-    if cfg_width <= 1e-6:
-        return image_width / 2.0
-
-    return cfg_forward_x * float(image_width) / cfg_width
-
-
-def get_pano_vertical_fov_rad():
-    """
-    360 panorama의 vertical FOV.
-
-    현재 이미지가 1920x640, 즉 3:1 비율이므로 360x180 equirectangular(2:1)가 아니다.
-    우선 120도 가정이 더 자연스럽다.
-    config.PANO_V_FOV_DEG를 120.0으로 두고 사용한다.
-    """
-    return math.radians(float(getattr(config, "PANO_V_FOV_DEG", 120.0)))
-
-
-def get_pano_yaw_offset_rad():
-    """
-    projection 좌우 보정값.
-
-    overlay에서 전체 LiDAR 점이 좌우로 밀리면 config.PANO_YAW_OFFSET_DEG를 조정한다.
-    기본값 0도.
-    """
-    return math.radians(float(getattr(config, "PANO_YAW_OFFSET_DEG", 0.0)))
-
-
-def get_pano_pitch_offset_rad():
-    """
-    projection 상하 보정값.
-
-    overlay에서 전체 LiDAR 점이 위/아래로 밀리면 config.PANO_PITCH_OFFSET_DEG를 조정한다.
-    기본값 0도.
-    """
-    return math.radians(float(getattr(config, "PANO_PITCH_OFFSET_DEG", 0.0)))
-
-
-def pixel_to_camera_ray_pano(u, v, image_width, image_height):
-    """
-    panorama pixel을 camera optical frame ray로 변환한다.
-
-    camera optical frame convention:
-      x = right
-      y = down
-      z = forward
-
-    projection convention:
-      yaw   = atan2(x, z)
-      pitch = atan2(-y, sqrt(x^2 + z^2))
-      u = forward_x + yaw / 2pi * width
-      v = height/2 - pitch / vertical_fov * height
-    """
-    forward_x = get_pano_forward_x(image_width)
-    vertical_fov = get_pano_vertical_fov_rad()
-    yaw_offset = get_pano_yaw_offset_rad()
-    pitch_offset = get_pano_pitch_offset_rad()
-
-    yaw = ((float(u) - forward_x) / float(image_width)) * (2.0 * math.pi)
-    yaw = yaw - yaw_offset
-
-    pitch = ((float(image_height) / 2.0 - float(v)) / float(image_height)) * vertical_fov
-    pitch = pitch - pitch_offset
-
-    x = math.cos(pitch) * math.sin(yaw)
-    y = -math.sin(pitch)
-    z = math.cos(pitch) * math.cos(yaw)
-
-    ray = np.array([x, y, z], dtype=np.float64)
-    norm = np.linalg.norm(ray)
-
-    if norm < 1e-9:
-        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
-
-    return ray / norm
-
-
 def box_to_camera_ray(box, image_width, image_height):
-    """검출 박스 중심을 camera optical frame ray로 변환."""
+    """검출 박스 중심을 camera frame ray로 변환."""
     cx, cy = get_box_center(box)
-    return pixel_to_camera_ray_pano(cx, cy, image_width, image_height)
+    return pixel_to_ray(cx, cy, image_width, image_height)
 
 
 def project_camera_points_to_image(points_camera, image_width, image_height):
     """
-    camera optical frame point들을 360 panorama 이미지 픽셀로 투영한다.
-
-    camera optical frame convention:
-      x = right
-      y = down
-      z = forward
+    camera frame point들을 panorama 이미지 픽셀로 투영한다.
 
     반환:
       pixels: N x 2, 각 point의 (u, v)
@@ -167,27 +77,14 @@ def project_camera_points_to_image(points_camera, image_width, image_height):
         return np.empty((0, 2), dtype=np.float64), np.empty((0,), dtype=np.float64)
 
     points = np.asarray(points_camera, dtype=np.float64)
-
-    x = points[:, 0]
-    y = points[:, 1]
-    z = points[:, 2]
-
     ranges = np.linalg.norm(points, axis=1)
 
-    yaw = np.arctan2(x, z) + get_pano_yaw_offset_rad()
-    pitch = np.arctan2(-y, np.sqrt(x * x + z * z) + 1e-9) + get_pano_pitch_offset_rad()
+    pixels = []
+    for point in points:
+        px, py = ray_to_pixel(point, image_width, image_height)
+        pixels.append((px, py))
 
-    forward_x = get_pano_forward_x(image_width)
-    vertical_fov = get_pano_vertical_fov_rad()
-
-    u = forward_x + (yaw / (2.0 * math.pi)) * float(image_width)
-    v = (float(image_height) / 2.0) - (pitch / vertical_fov) * float(image_height)
-
-    # 360 panorama는 좌우가 이어져 있으므로 x 좌표는 wrap한다.
-    u = np.mod(u, float(image_width))
-
-    pixels = np.stack([u, v], axis=1)
-    return pixels.astype(np.float64), ranges.astype(np.float64)
+    return np.asarray(pixels, dtype=np.float64), ranges
 
 
 def make_box_candidate_mask(pixels, box, image_width):
@@ -731,7 +628,7 @@ def save_projection_overlay(image, box, scan_points_map, transformer, target_nam
         img.save(path, quality=90)
         return path
 
-    max_points = int(getattr(config, "DEBUG_PROJECTION_MAX_POINTS", 12000))
+    max_points = int(config.DEBUG_PROJECTION_MAX_POINTS)
     if len(pixels) > max_points:
         step = max(1, len(pixels) // max_points)
         pixels = pixels[::step]

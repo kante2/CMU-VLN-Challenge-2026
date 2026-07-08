@@ -1,75 +1,114 @@
 #!/usr/bin/env python3
 """
-검출 결과를 이미지에 그려서 파일로 저장하는 시각화 유틸.
+디버그 이미지 저장 유틸.
 
-GroundingDINO 가 뱉은 박스들을 원본 이미지 위에 그려 저장합니다.
-Phase 1a 목적: "지금 카메라 뷰에서 뭐가 검출되는지" 눈으로 확인.
+원본 카메라 이미지 위에 GroundingDINO 후보 박스를 그리고,
+VLM이 선택한 후보는 SELECTED로 표시한다.
 """
 
 import os
 from datetime import datetime
-from typing import List
 
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
-# detector.Detection 과 동일 필드를 가진 객체를 받는다고 가정
-# (label, score, box=(x1,y1,x2,y2))
+from tmah_vlm import config
 
 
-def draw_detections(image: PILImage.Image,
-                    detections: List,
-                    prompt: str = "") -> PILImage.Image:
-    """원본 PIL 이미지에 검출 박스를 그린 새 이미지를 반환."""
+def load_font(size):
+    try:
+        return ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            size,
+        )
+    except Exception:
+        return ImageFont.load_default()
+
+
+def safe_filename(text, max_len=40):
+    return "".join(c if c.isalnum() else "_" for c in text)[:max_len]
+
+
+def draw_detections(image, detections, prompt="", selected_index=-1):
     img = image.convert("RGB").copy()
     draw = ImageDraw.Draw(img)
-
-    # 기본 폰트 (컨테이너에 특정 폰트 없을 수 있어 fallback)
-    try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
-    except Exception:
-        font = ImageFont.load_default()
+    font = load_font(16)
 
     palette = [
-        (255, 80, 80), (80, 200, 120), (80, 140, 255),
-        (255, 190, 60), (200, 100, 255), (60, 220, 220),
+        (255, 80, 80),
+        (80, 200, 120),
+        (80, 140, 255),
+        (255, 190, 60),
+        (200, 100, 255),
+        (60, 220, 220),
     ]
 
-    for i, det in enumerate(detections):
+    for index, det in enumerate(detections):
         x1, y1, x2, y2 = det.box
-        color = palette[i % len(palette)]
-        # 박스
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-        # 라벨 텍스트
-        caption = f"{det.label} {det.score:.2f}"
-        tx, ty = x1, max(0, y1 - 20)
-        # 텍스트 배경
+        color = palette[index % len(palette)]
+        width = 5 if index == selected_index else 3
+
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
+
+        caption = f"#{index} {det.label} {det.score:.2f}"
+        if index == selected_index:
+            caption = "SELECTED " + caption
+
+        tx = x1
+        ty = max(24, y1 - 22)
+
         try:
             bbox = draw.textbbox((tx, ty), caption, font=font)
             draw.rectangle(bbox, fill=color)
         except Exception:
             pass
+
         draw.text((tx, ty), caption, fill=(0, 0, 0), font=font)
 
-    # 상단에 프롬프트/개수 표시
-    header = f"prompt='{prompt}'  detections={len(detections)}"
-    draw.rectangle([0, 0, img.width, 22], fill=(0, 0, 0))
-    draw.text((5, 3), header, fill=(255, 255, 255), font=font)
+    header = f"prompt='{prompt}'  detections={len(detections)}  selected={selected_index}"
+    draw.rectangle([0, 0, img.width, 24], fill=(0, 0, 0))
+    draw.text((5, 4), header, fill=(255, 255, 255), font=font)
 
     return img
 
 
-def save_detection_image(image: PILImage.Image,
-                         detections: List,
-                         prompt: str,
-                         out_dir: str = "/home/docker/ai_module/debug") -> str:
-    """박스 그린 이미지를 타임스탬프 파일명으로 저장하고 경로 반환."""
-    os.makedirs(out_dir, exist_ok=True)
-    annotated = draw_detections(image, detections, prompt)
+def save_detection_image(image, detections, prompt, selected_index=-1, out_dir=None):
+    if out_dir is None:
+        out_dir = config.DEBUG_DIR
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_prompt = "".join(c if c.isalnum() else "_" for c in prompt)[:30]
-    filename = f"det_{ts}_{safe_prompt}.jpg"
+    os.makedirs(out_dir, exist_ok=True)
+    annotated = draw_detections(image, detections, prompt, selected_index)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"det_{timestamp}_{safe_filename(prompt)}.jpg"
     path = os.path.join(out_dir, filename)
     annotated.save(path, quality=90)
+    return path
+
+
+def save_3d_result_text(question, selected_index, result, waypoint, out_dir=None):
+    if out_dir is None:
+        out_dir = config.DEBUG_DIR
+
+    os.makedirs(out_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(out_dir, f"target3d_{timestamp}.txt")
+
+    lines = []
+    lines.append(f"question: {question}")
+    lines.append(f"selected_index: {selected_index}")
+    lines.append(f"target_map_xyz: {result['point']}")
+    lines.append(f"camera_origin_map_xyz: {result['origin']}")
+    lines.append(f"ray_map_xyz: {result['ray']}")
+    lines.append(f"method: {result['method']}")
+    lines.append(f"matched_points: {result['n_matched']}")
+    lines.append(f"target_name: {result.get('target_name', '')}")
+    lines.append(f"cluster_policy: {result.get('cluster_policy', '')}")
+    lines.append(f"cluster_depth_m: {result.get('cluster_depth_m', '')}")
+    lines.append(f"cluster_error: {result.get('cluster_error', '')}")
+    lines.append(f"cluster_count: {result.get('cluster_count', '')}")
+    lines.append(f"waypoint: {waypoint}")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
     return path

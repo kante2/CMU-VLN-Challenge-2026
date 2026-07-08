@@ -1,0 +1,13 @@
+question: Find THE pillow
+selected_index: 0
+target_map_xyz: (3.6033835877822487, -1.746737889318276, 0.773593428676826)
+camera_origin_map_xyz: (1.6077814603466494, -4.710633790200864, 0.8501049102944385)
+ray_map_xyz: (0.558377833227106, 0.8293104864406039, -0.021408233001604018)
+method: bbox_ray_bundle_inner_depth_mode
+matched_points: 3
+target_name: pillow
+cluster_policy: bbox_ray_depth_mode
+cluster_depth_m: 3.573927918846912
+cluster_error: 0.19266907814949624
+cluster_count: 3
+waypoint: {'x': 3.1565297486673805, 'y': -2.41030525324473, 'heading': 0.9781388047081039}

@@ -1,0 +1,13 @@
+question: Find THE DOOR
+selected_index: 0
+target_map_xyz: (-1.7047422075009717, 4.8525386562163435, 1.2824180551995612)
+camera_origin_map_xyz: (1.614514271334081, -4.712149587607347, 0.8501049102949152)
+ray_map_xyz: (-0.3275531412450937, 0.9438691162528141, 0.04266182186221445)
+method: bbox_ray_bundle_inner_depth_mode
+matched_points: 4
+target_name: door
+cluster_policy: bbox_ray_depth_mode
+cluster_depth_m: 10.13348999254871
+cluster_error: 0.12220011272524925
+cluster_count: 3
+waypoint: {'x': -1.4424900757016115, 'y': 4.096745153090858, 'heading': 1.904786344592938}

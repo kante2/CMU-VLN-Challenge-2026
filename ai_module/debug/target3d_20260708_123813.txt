@@ -1,0 +1,13 @@
+question: Find teal pillow on the sofa farthest from the window
+selected_index: 0
+target_map_xyz: (2.327891795785551, -2.0598253174477255, 0.9177984222886862)
+camera_origin_map_xyz: (0.0, 0.0, 0.85)
+ray_map_xyz: (0.7487328324684798, -0.6625131147053521, 0.02180638500853178)
+method: bbox_ray_bundle_full_depth_mode
+matched_points: 13
+target_name: pillow
+cluster_policy: bbox_ray_depth_mode
+cluster_depth_m: 3.1091087432492825
+cluster_error: 0.6833993883391335
+cluster_count: 12
+waypoint: {'x': 1.7287630644965541, 'y': -1.5296887658461245, 'heading': -0.724379257461729}
