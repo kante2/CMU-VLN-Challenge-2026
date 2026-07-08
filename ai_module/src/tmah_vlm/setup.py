@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import find_packages, setup
 import os
 from glob import glob
 
@@ -7,7 +7,7 @@ package_name = "tmah_vlm"
 setup(
     name=package_name,
     version="0.0.1",
-    packages=[package_name],
+    packages=find_packages(),
     data_files=[
         ("share/ament_index/resource_index/packages",
             ["resource/" + package_name]),
@@ -26,6 +26,7 @@ setup(
         "console_scripts": [
             # `ros2 run tmah_vlm tmah_vlm` 로 실행됨
             "tmah_vlm = tmah_vlm.vlm_node:main",
+            "local_eval_node = tmah_vlm.evaluation.local_eval_node:main",
         ],
     },
 )
