@@ -3,4 +3,11 @@
   <node pkg="tmah_vlm" exec="tmah_vlm" name="tmah_vlm" output="screen">
   </node>
 
+  <node pkg="tmah_vlm" exec="scene_graph_json_markers" name="scene_graph_json_markers" output="screen">
+    <param name="graph_path" value="/home/docker/ai_module/debug/scene_graph_latest.json"/>
+    <param name="topic" value="/scene_graph_json_markers"/>
+    <param name="frame_id" value="map"/>
+    <param name="publish_period_sec" value="1.0"/>
+  </node>
+
 </launch>
