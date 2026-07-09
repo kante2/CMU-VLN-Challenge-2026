@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""numerical 질문 처리 (아직 stub -> 검출 개수 세기로 확장 예정)."""
+"""
+Numerical handler — "how many ..." / "count ..." 질문을 처리하는 Process 함수.
+
+아직 stub이다: 현재 시야에서 GroundingDINO 검출 개수만 센다 (탐색/이동 없음).
+vlm_node.py의 dispatch_question()이 이 파일의 numerical_process()를 호출한다.
+"""
 
 from std_msgs.msg import Int32
 
@@ -7,23 +12,51 @@ from tmah_vlm.perception.image_utils import ros_image_to_pil
 from tmah_vlm.perception.query_parser import extract_target
 
 
-def handle(node, question: str):
-    log = node.get_logger()
-    if node.detector is None or node.latest_image is None:
-        log.warn("[numerical] not ready, publishing 0")
-        _pub(node, 0)
+# ========================================
+# Process
+# ========================================
+
+def numerical_process(node, question):
+    if not check_input_ready(node):
+        publish_count(node, 0)
         return
 
-    # 검출 개수를 세는 간단 버전 (탐색 없이 현재 뷰만)
-    pil = ros_image_to_pil(node.latest_image)
-    obj = extract_target(question)["object"]
-    dets = node.detector.detect(pil, obj)
-    count = len(dets)
-    log.info(f"[numerical] '{obj}' count={count} (current view only)")
-    _pub(node, count)
+    image = prepare_image(node)
+    detect_prompt = parse_question(question)
+    count = count_in_current_view(node, image, detect_prompt)
+
+    node.get_logger().info(f"[Numerical] '{detect_prompt}' count={count} (current view only)")
+    publish_count(node, count)
 
 
-def _pub(node, n):
-    m = Int32()
-    m.data = int(n)
-    node.numerical_pub.publish(m)
+# ========================================
+# Steps
+# ========================================
+
+def check_input_ready(node):
+    if node.detector is None or node.latest_image is None:
+        node.get_logger().warn("[Numerical] not ready, publishing 0")
+        return False
+    return True
+
+
+def prepare_image(node):
+    return ros_image_to_pil(node.latest_image)
+
+
+def parse_question(question):
+    return extract_target(question)["object"]
+
+
+def count_in_current_view(node, image, detect_prompt):
+    return len(node.detector.detect(image, detect_prompt))
+
+
+# ========================================
+# Publish
+# ========================================
+
+def publish_count(node, count):
+    msg = Int32()
+    msg.data = int(count)
+    node.numerical_pub.publish(msg)

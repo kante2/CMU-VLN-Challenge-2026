@@ -96,23 +96,46 @@ class CoordinateTransformer:
         self.listener = TransformListener(self.buffer, node)
         self.warned_pairs = set()
 
-    def get_matrix(self, target_frame, source_frame):
-        """source_frame 좌표를 target_frame 좌표로 바꾸는 4x4 행렬을 반환한다."""
+    def get_matrix(self, target_frame, source_frame, stamp=None):
+        """
+        source_frame 좌표를 target_frame 좌표로 바꾸는 4x4 행렬을 반환한다.
+
+        stamp: 센서 데이터가 캡처된 시각(builtin_interfaces/Time, 즉 msg.header.stamp).
+          로봇이 회전 중일 때 stamp 없이 항상 "최신" TF를 쓰면, 센서 캡처 시각과
+          실제 TF lookup 시각(추론 등으로 지연된 처리 시각) 사이에 로봇이 돌아간 만큼
+          투영이 어긋난다. stamp를 넘기면 그 캡처 시각의 TF를 우선 사용한다.
+          None이면 기존처럼 최신 TF를 쓴다.
+        """
         target_frame = clean_frame(target_frame)
         source_frame = clean_frame(source_frame)
 
         if target_frame == source_frame:
             return np.eye(4, dtype=np.float64)
 
+        lookup_time = Time.from_msg(stamp) if stamp is not None else Time()
+
         try:
             tf_msg = self.buffer.lookup_transform(
                 target_frame,
                 source_frame,
-                Time(),
+                lookup_time,
             )
             return ros_transform_to_matrix(tf_msg.transform)
 
         except Exception as error:
+            # 캡처 시각 TF가 버퍼에 없으면(너무 오래됐거나 아직 안 들어왔으면)
+            # 최신 TF로 한 번 더 시도한다. 그것도 실패하면 static fallback.
+            if stamp is not None:
+                try:
+                    tf_msg = self.buffer.lookup_transform(
+                        target_frame,
+                        source_frame,
+                        Time(),
+                    )
+                    return ros_transform_to_matrix(tf_msg.transform)
+                except Exception:
+                    pass
+
             pair = (target_frame, source_frame)
             if pair not in self.warned_pairs:
                 self.warned_pairs.add(pair)
@@ -166,32 +189,32 @@ class CoordinateTransformer:
             f"No fallback TF path: {target_frame} <- {source_frame}"
         )
 
-    def transform_point(self, point_xyz, source_frame, target_frame):
+    def transform_point(self, point_xyz, source_frame, target_frame, stamp=None):
         """점 1개를 source_frame에서 target_frame으로 변환한다."""
         point = np.array([point_xyz[0], point_xyz[1], point_xyz[2], 1.0],
                          dtype=np.float64)
-        matrix = self.get_matrix(target_frame, source_frame)
+        matrix = self.get_matrix(target_frame, source_frame, stamp)
         transformed = matrix @ point
         return transformed[:3]
 
-    def transform_points(self, points_xyz, source_frame, target_frame):
+    def transform_points(self, points_xyz, source_frame, target_frame, stamp=None):
         """N x 3 점 배열을 source_frame에서 target_frame으로 변환한다."""
         if points_xyz is None or len(points_xyz) == 0:
             return np.empty((0, 3), dtype=np.float64)
 
         points = np.asarray(points_xyz, dtype=np.float64)
-        matrix = self.get_matrix(target_frame, source_frame)
+        matrix = self.get_matrix(target_frame, source_frame, stamp)
         ones = np.ones((points.shape[0], 1), dtype=np.float64)
         homogeneous = np.hstack([points, ones])
         transformed = (matrix @ homogeneous.T).T
         return transformed[:, :3]
 
-    def transform_direction(self, direction_xyz, source_frame, target_frame):
+    def transform_direction(self, direction_xyz, source_frame, target_frame, stamp=None):
         """
         방향 벡터를 source_frame에서 target_frame으로 변환한다.
         위치 이동 성분은 무시하고 회전만 적용한다.
         """
-        matrix = self.get_matrix(target_frame, source_frame)
+        matrix = self.get_matrix(target_frame, source_frame, stamp)
         rotation = matrix[:3, :3]
         direction = rotation @ np.asarray(direction_xyz, dtype=np.float64)
         norm = np.linalg.norm(direction)
@@ -199,6 +222,6 @@ class CoordinateTransformer:
             return direction
         return direction / norm
 
-    def get_frame_origin(self, frame_name, target_frame):
+    def get_frame_origin(self, frame_name, target_frame, stamp=None):
         """frame_name 원점이 target_frame 기준 어디인지 반환한다."""
-        return self.transform_point((0.0, 0.0, 0.0), frame_name, target_frame)
+        return self.transform_point((0.0, 0.0, 0.0), frame_name, target_frame, stamp)

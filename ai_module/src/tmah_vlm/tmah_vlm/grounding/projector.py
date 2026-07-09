@@ -13,9 +13,9 @@
   3D target으로 사용한다.
 
 역할 분리:
-  - panorama.py: 이미지 픽셀 <-> camera ray
   - tf/coordinate_transform.py: camera/sensor/map 좌표 변환
-  - projector.py: 2D box 기반 3D point 선택
+  - projector.py: 이미지 픽셀 <-> camera ray, 2D box 기반 3D point 선택
+  - bbox3d/estimator.py: 선택된 point들로 물체의 3D bounding box(크기) 추정
 """
 
 import math
@@ -24,6 +24,7 @@ import numpy as np
 import sensor_msgs_py.point_cloud2 as pc2
 
 from tmah_vlm import config
+from tmah_vlm.bbox3d.estimator import estimate_object_bbox
 
 
 def pointcloud_to_xyz(scan_msg):
@@ -78,11 +79,11 @@ def get_pano_vertical_fov_rad():
     """
     360 panorama의 vertical FOV.
 
-    현재 이미지가 1920x640, 즉 3:1 비율이므로 360x180 equirectangular(2:1)가 아니다.
-    우선 120도 가정이 더 자연스럽다.
-    config.PANO_V_FOV_DEG를 120.0으로 두고 사용한다.
+    이미지가 1920x640(3:1)이라 360x180 equirectangular(2:1)와는 다르지만,
+    test_pano_lidar_overlay.py로 LiDAR point를 이미지에 직접 투영해 실측 검증한 결과
+    180도가 실제 벽/천장 경계선과 맞는다 (120도는 어긋남). config.PANO_V_FOV_DEG 참고.
     """
-    return math.radians(float(getattr(config, "PANO_V_FOV_DEG", 120.0)))
+    return math.radians(float(getattr(config, "PANO_V_FOV_DEG", 180.0)))
 
 
 def get_pano_yaw_offset_rad():
@@ -447,26 +448,39 @@ def choose_depth_mode_bin(candidate_ranges, pixel_error, target_name=None):
     return best_item["indices"], info
 
 
-def make_target_from_center_ray_depth(box, image_size, depth_m, transformer):
+def weighted_centroid_target(points_camera_selected, pixel_error_selected, transformer, image_stamp=None):
     """
-    선택된 depth를 bbox center ray에 태워 최종 target을 만든다.
+    선택된 depth bin에 실제로 들어온 3D point들의 weighted centroid를 map target으로 쓴다.
 
-    point들의 3D 평균을 바로 쓰면 앞 선반/테이블 쪽으로 끌릴 수 있다.
-    그래서 bbox 내부 포인트들은 depth 추정용으로만 쓰고,
-    최종 방향은 detection bbox 중심 ray를 사용한다.
+    이전 방식은 "물체가 정확히 box 중심 ray 위에 있다"고 가정하고
+    ray * median_depth로 좌표를 재구성했다. 하지만 detection box가
+    물체 중심에서 살짝 벗어나 있거나 물체가 넓으면 실제 위치와 어긋난다.
+    depth bin 선택에 쓴 것과 같은 center_ray_weights를 그대로 재사용해서
+    (box 중심 ray에 가까운 point일수록 크게 반영) 실제 관측된 point들의
+    weighted 3D 평균을 쓰면 더 정확하다.
     """
-    image_width, image_height = image_size
-    ray_camera = box_to_camera_ray(box, image_width, image_height)
-    target_camera = ray_camera * float(depth_m)
-    target_map = transformer.transform_point(
-        target_camera,
+    weights = center_ray_weights(pixel_error_selected)
+    weight_sum = float(np.sum(weights))
+
+    if weight_sum < 1e-9:
+        centroid_camera = np.mean(points_camera_selected, axis=0)
+    else:
+        centroid_camera = np.sum(
+            points_camera_selected * weights[:, None], axis=0
+        ) / weight_sum
+
+    return transformer.transform_point(
+        centroid_camera,
         config.FRAME_CAMERA,
         config.FRAME_MAP,
+        stamp=image_stamp,
     )
-    return target_map
 
 
-def find_best_point_by_box_projection(origin_map, points_map, transformer, box, image_size, target_name=None):
+def find_best_point_by_box_projection(
+    origin_map, points_map, transformer, box, image_size, target_name=None,
+    image_stamp=None,
+):
     """
     selected 2D box를 ray bundle로 보고, 그 안의 거리 분포 mode로 3D target을 정한다.
 
@@ -478,8 +492,8 @@ def find_best_point_by_box_projection(origin_map, points_map, transformer, box, 
       1. PointCloud를 camera image로 투영
       2. selected bbox 안에 들어온 point만 수집
       3. bbox 영역의 depth histogram을 만들고 가장 많은 depth bin 선택
-      4. 선택된 bin의 median depth를 bbox center ray에 적용
-      5. 그 점을 map frame target으로 변환
+      4. 선택된 bin에 실제로 들어온 point들의 weighted centroid를 target으로 사용
+         (box 중심 ray 위에 있다고 가정하지 않고, 관측된 실제 3D 위치를 쓴다)
     """
     if points_map is None or len(points_map) == 0:
         return None, "no_scan", 0, {}
@@ -487,10 +501,14 @@ def find_best_point_by_box_projection(origin_map, points_map, transformer, box, 
     image_width, image_height = image_size
 
     try:
+        # points_map은 map frame(시간 무관)에 고정된 점들이다. 이걸 "이 이미지가
+        # 찍힌 순간의 camera view"로 다시 투영하는 것이므로 image_stamp를 써야 한다
+        # (scan_stamp를 쓰면 로봇이 회전 중일 때 이미지와 어긋난다).
         points_camera = transformer.transform_points(
             points_map,
             config.FRAME_MAP,
             config.FRAME_CAMERA,
+            stamp=image_stamp,
         )
     except Exception:
         return None, "camera_projection_tf_failed", 0, {}
@@ -507,6 +525,7 @@ def find_best_point_by_box_projection(origin_map, points_map, transformer, box, 
     valid_range = (ranges >= config.BBOX_MIN_DEPTH_M) & \
                   (ranges <= config.BBOX_MAX_DEPTH_M)
 
+    points_camera = points_camera[valid_range]
     pixels = pixels[valid_range]
     ranges = ranges[valid_range]
 
@@ -528,6 +547,7 @@ def find_best_point_by_box_projection(origin_map, points_map, transformer, box, 
     if matched_count == 0:
         return None, "no_bbox_projected_points", 0, {}
 
+    candidate_points_camera = points_camera[mask]
     candidate_pixels_xy = pixels[mask]
     candidate_ranges = ranges[mask]
     pixel_error = normalized_pixel_error(candidate_pixels_xy, box)
@@ -543,16 +563,25 @@ def find_best_point_by_box_projection(origin_map, points_map, transformer, box, 
 
     selected_depths = candidate_ranges[selected_indices]
     depth_m = float(np.median(selected_depths))
+    selected_points_camera = candidate_points_camera[selected_indices]
 
-    point_map = make_target_from_center_ray_depth(
-        box,
-        image_size,
-        depth_m,
+    point_map = weighted_centroid_target(
+        selected_points_camera,
+        pixel_error[selected_indices],
         transformer,
+        image_stamp=image_stamp,
     )
 
-    method_name = method + "_depth_mode"
+    # 같은 selected point 묶음으로 물체의 대략적인 3D 크기도 추정한다
+    # (RViz marker에 고정 0.4m 박스 대신 실제 크기를 쓰기 위함).
+    bbox_center, bbox_size = estimate_object_bbox(
+        selected_points_camera, transformer, image_stamp=image_stamp,
+    )
+
+    method_name = method + "_centroid_mode"
     depth_info["selected_depth_m"] = depth_m
+    depth_info["bbox_center"] = bbox_center
+    depth_info["bbox_size"] = bbox_size
     return point_map, method_name, matched_count, depth_info
 
 
@@ -600,13 +629,16 @@ def find_best_point_on_ray(origin_map, ray_map, points_map):
     return candidate_points[best_index], "fallback_lidar_ray_match", matched_count
 
 
-def box_to_3d(box, image_size, scan_points_map, transformer, target_name=None):
+def box_to_3d(box, image_size, scan_points_map, transformer, target_name=None, image_stamp=None):
     """
     2D box -> 3D map 좌표.
 
     image_size: PIL image.size, 즉 (width, height)
     scan_points_map: map frame으로 변환된 point cloud
     transformer: CoordinateTransformer 인스턴스
+    image_stamp: 이 box가 나온 이미지의 캡처 시각(msg.header.stamp).
+      로봇 회전 중 TF가 "최신" 값으로 어긋나는 걸 막기 위해 camera ray/origin은
+      이 시각의 TF를 우선 사용한다.
     """
     image_width, image_height = image_size
 
@@ -615,10 +647,12 @@ def box_to_3d(box, image_size, scan_points_map, transformer, target_name=None):
         ray_camera,
         config.FRAME_CAMERA,
         config.FRAME_MAP,
+        stamp=image_stamp,
     )
     origin_map = transformer.get_frame_origin(
         config.FRAME_CAMERA,
         config.FRAME_MAP,
+        stamp=image_stamp,
     )
 
     # 1순위: point cloud를 image box로 다시 투영해서 선택한다.
@@ -629,6 +663,7 @@ def box_to_3d(box, image_size, scan_points_map, transformer, target_name=None):
         box,
         image_size,
         target_name,
+        image_stamp=image_stamp,
     )
 
     # 2순위: box 내부 투영점이 없을 때만 기존 ray 방식 사용.
@@ -639,6 +674,9 @@ def box_to_3d(box, image_size, scan_points_map, transformer, target_name=None):
             scan_points_map,
         )
         cluster_info = {"policy": "ray_fallback"}
+
+    bbox_center = cluster_info.get("bbox_center")
+    bbox_size = cluster_info.get("bbox_size")
 
     return {
         "point": (float(point_map[0]), float(point_map[1]), float(point_map[2])),
@@ -653,6 +691,10 @@ def box_to_3d(box, image_size, scan_points_map, transformer, target_name=None):
         "cluster_count": cluster_info.get("cluster_count", 0),
         "cluster_weighted_count": cluster_info.get("cluster_weighted_count", -1.0),
         "cluster_min_error": cluster_info.get("cluster_min_error", -1.0),
+        # 물체의 대략적인 3D 크기. 추정 실패(ray fallback 등) 시 None -> 호출부에서
+        # config.BBOX3D_DEFAULT_SIZE_M 고정 박스로 대체한다.
+        "bbox_center": bbox_center,
+        "bbox_size": bbox_size,
     }
 
 
@@ -681,7 +723,9 @@ def approach_waypoint(target_xyz, robot_pose):
 # Debug: point cloud projection overlay
 # ========================================
 
-def save_projection_overlay(image, box, scan_points_map, transformer, target_name="object"):
+def save_projection_overlay(
+    image, box, scan_points_map, transformer, target_name="object", image_stamp=None,
+):
     """
     현재 PointCloud가 camera image 위에 어디로 투영되는지 저장한다.
 
@@ -718,6 +762,7 @@ def save_projection_overlay(image, box, scan_points_map, transformer, target_nam
         scan_points_map,
         config.FRAME_MAP,
         config.FRAME_CAMERA,
+        stamp=image_stamp,
     )
     pixels, ranges = project_camera_points_to_image(points_camera, width, height)
 

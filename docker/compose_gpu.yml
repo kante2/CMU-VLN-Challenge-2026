@@ -50,6 +50,7 @@ services:
     tty: true
     volumes:
       - ../ai_module/debug:/home/docker/ai_module/debug
+      - ../ai_module/src:/home/docker/ai_module/src
     deploy:
         resources:
           reservations:

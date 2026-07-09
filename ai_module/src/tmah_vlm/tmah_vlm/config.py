@@ -18,7 +18,15 @@ TOPIC_IMAGE = "/camera/image"
 TOPIC_SCAN = "/sensor_scan"
 
 TOPIC_WAYPOINT = "/way_point_with_heading"
+
+# 챌린지 쪽 visualizationTools/RViz가 이미 이 토픽을 Marker(단수) 타입으로 구독하고
+# 있어서(dummy_vlm도 동일하게 씀) 여기는 절대 MarkerArray로 바꾸면 안 된다.
+# 타입이 다르면 에러 없이 그냥 연결이 안 된다.
 TOPIC_MARKER = "/selected_object_marker"
+
+# 3D bbox wireframe은 challenge 쪽 계약이 없는 우리 전용 디버그 토픽이라 자유롭게 사용.
+TOPIC_MARKER_WIREFRAME = "/selected_object_marker_wireframe"
+
 TOPIC_NUMERICAL = "/numerical_response"
 
 # -----------------------------------------------------------------------------
@@ -45,7 +53,7 @@ FRAME_ALIASES = {
 # 형식: (parent, child, (x,y,z), (qx,qy,qz,qw))
 STATIC_TF_FALLBACKS = [
     ("map", "sensor", (0.0, 0.0, 0.75), (0.0, 0.0, 0.0, 1.0)),
-    ("sensor", "camera", (0.0, 0.0, 0.85), (-0.5, 0.5, -0.5, 0.5)),
+    ("sensor", "camera", (0.0, 0.0, 0.1), (-0.5, 0.5, -0.5, 0.5)),
 ]
 
 # -----------------------------------------------------------------------------
@@ -54,7 +62,11 @@ STATIC_TF_FALLBACKS = [
 PANO_WIDTH = 1920
 PANO_HEIGHT = 640
 PANO_H_FOV_DEG = 360.0
-PANO_V_FOV_DEG = 120.0
+
+# test_pano_lidar_overlay.py로 LiDAR point cloud를 카메라 이미지에 직접 겹쳐서
+# 실측 검증함: 120도로는 point band가 실제 벽/천장 경계선과 어긋났고,
+# 180도로 맞추니 경계선을 따라감. (2026-07-09)
+PANO_V_FOV_DEG = 180.0
 
 # 파노라마 이미지에서 로봇 정면이 위치한 x 픽셀.
 # 보통 중앙이 정면이다. 실제로 어긋나면 여기만 조정한다.
@@ -84,6 +96,25 @@ BBOX_MIN_CLUSTER_POINTS = 3
 BBOX_DEPTH_CLUSTER_GAP_M = 0.35
 BBOX_MIN_DEPTH_M = 0.25
 BBOX_MAX_DEPTH_M = 15.0
+
+# -----------------------------------------------------------------------------
+# 3D bounding box 크기 추정 (bbox3d/)
+# -----------------------------------------------------------------------------
+# 선택된 depth cluster의 실제 point 퍼짐으로 물체 크기를 추정한다.
+# point가 너무 적으면(노이즈 위험) 추정을 포기하고 BBOX3D_DEFAULT_SIZE_M 고정 박스로 표시한다.
+BBOX3D_MIN_POINTS = 8
+
+# 양 끝 percentile%를 잘라내고 그 사이 범위를 크기로 쓴다.
+# min/max를 그대로 쓰면 point 하나가 튀어도 박스가 확 커진다.
+BBOX3D_PERCENTILE = 5.0
+
+# 추정 크기의 하한/상한. 너무 작으면(포인트가 한 곳에 몰림) 안 보이고,
+# 너무 크면(배경 point 섞임) 비현실적이라 이 범위로 clip한다.
+BBOX3D_MIN_SIZE_M = 0.15
+BBOX3D_MAX_SIZE_M = 2.0
+
+# 크기 추정을 못 했을 때(fallback ray 경로 등) 쓰는 고정 크기.
+BBOX3D_DEFAULT_SIZE_M = 0.4
 
 # -----------------------------------------------------------------------------
 # Debug

@@ -1,0 +1,15 @@
+question: Find the chair
+selected_index: 0
+target_map_xyz: (6.777908580944252, -2.477198250283526, 0.5146664846539521)
+camera_origin_map_xyz: (5.534157746213855, -0.8426745751314364, 0.8502169506365165)
+ray_map_xyz: (0.5985427183989649, -0.782180193021076, -0.17303398480382334)
+method: bbox_ray_bundle_inner_centroid_mode
+matched_points: 42
+target_name: chair
+cluster_policy: bbox_ray_depth_mode
+cluster_depth_m: 2.0993934470242968
+cluster_error: 0.2276092248759754
+cluster_count: 22
+bbox_center: (6.8037239634379665, -2.4971452008995625, 0.5062086222215991)
+bbox_size: (0.15, 0.15, 0.4341713127751265)
+waypoint: {'x': 6.293515721877936, 'y': -1.8405165730808903, 'heading': -0.9204135625214334}

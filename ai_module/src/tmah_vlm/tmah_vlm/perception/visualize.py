@@ -106,6 +106,8 @@ def save_3d_result_text(question, selected_index, result, waypoint, out_dir=None
     lines.append(f"cluster_depth_m: {result.get('cluster_depth_m', '')}")
     lines.append(f"cluster_error: {result.get('cluster_error', '')}")
     lines.append(f"cluster_count: {result.get('cluster_count', '')}")
+    lines.append(f"bbox_center: {result.get('bbox_center', '')}")
+    lines.append(f"bbox_size: {result.get('bbox_size', '')}")
     lines.append(f"waypoint: {waypoint}")
 
     with open(path, "w", encoding="utf-8") as f:

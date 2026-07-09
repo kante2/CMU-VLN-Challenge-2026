@@ -48,9 +48,12 @@ class GroundingDINODetector:
         return prompt
 
     def detect(self, image, prompt):
-        """PIL image와 text prompt를 받아 Detection list 반환."""
+        """Process: prompt 정규화 -> 모델 추론 -> Detection list 조립."""
         text = self.normalize_prompt(prompt)
+        results = self.run_model(image, text)
+        return self.build_detections(results)
 
+    def run_model(self, image, text):
         inputs = self.processor(
             images=image,
             text=text,
@@ -60,7 +63,7 @@ class GroundingDINODetector:
         with torch.no_grad():
             outputs = self.model(**inputs)
 
-        results = self.processor.post_process_grounded_object_detection(
+        return self.processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
             threshold=self.box_threshold,
@@ -68,17 +71,14 @@ class GroundingDINODetector:
             target_sizes=[image.size[::-1]],
         )[0]
 
+    def build_detections(self, results):
+        """모델 raw 출력을 score 내림차순 Detection list로 정리한다."""
         labels = results.get("text_labels", results.get("labels", []))
 
-        detections = []
-        for score, label, box in zip(results["scores"], labels, results["boxes"]):
-            detections.append(
-                Detection(
-                    label=label,
-                    score=float(score),
-                    box=box.tolist(),
-                )
-            )
+        detections = [
+            Detection(label=label, score=float(score), box=box.tolist())
+            for score, label, box in zip(results["scores"], labels, results["boxes"])
+        ]
 
         detections.sort(key=lambda det: det.score, reverse=True)
         return detections

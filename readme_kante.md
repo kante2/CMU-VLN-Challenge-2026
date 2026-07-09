@@ -10,6 +10,15 @@ iros2026_system — 시뮬레이터/autonomy (이미지 pull)
 iros2026_ai_module — ../ai_module/docker/Dockerfile 빌드
 iros2026_tmah_module — ../ai_module/docker/Dockerfile.tmah 빌드
 
+# 권한 문제
+sudo chown -R kante:kante /home/kante/CMU-VLN-Challenge-2026/ai_module/debug
+
+# 시뮬 겹침 초기화
+pkill -9 -f autonomy_stack_mecanum_wheel_platform
+pkill -9 -f static_transform_publisher
+pkill -9 -f joy_node
+pkill -9 -f default_server_endpoint
+
 # ------------------------------------------------------------------------------
 docker start iros2026_system iros2026_ai_module iros2026_tmah_module
 

@@ -97,6 +97,7 @@ class QwenSelector:
         return 0
 
     def choose(self, image, detections, question):
+        """Process: 몽타주 만들기 -> prompt 구성 -> 모델 추론 -> 답 파싱."""
         num_candidates = len(detections)
         if num_candidates == 0:
             return -1
@@ -104,8 +105,13 @@ class QwenSelector:
             return 0
 
         montage = self.make_montage(image, detections)
+        prompt = self.build_prompt(num_candidates, question)
+        output_text = self.run_model(montage, prompt)
 
-        prompt = (
+        return self.parse_index(output_text, num_candidates)
+
+    def build_prompt(self, num_candidates, question):
+        return (
             f"The image shows {num_candidates} candidate objects, "
             f"each labeled with a number from #0 to #{num_candidates - 1}. "
             f"Question: \"{question}\". "
@@ -113,6 +119,8 @@ class QwenSelector:
             f"Reply with ONLY the number."
         )
 
+    def run_model(self, montage, prompt):
+        """montage 이미지 + prompt를 Qwen에 넣고 생성된 답변 텍스트를 반환한다."""
         messages = [{
             "role": "user",
             "content": [
@@ -139,13 +147,9 @@ class QwenSelector:
                 max_new_tokens=self.max_new_tokens,
             )
 
-        trimmed = []
-        for input_ids, output_ids in zip(inputs.input_ids, generated):
-            trimmed.append(output_ids[len(input_ids):])
+        trimmed = [
+            output_ids[len(input_ids):]
+            for input_ids, output_ids in zip(inputs.input_ids, generated)
+        ]
 
-        output_text = self.processor.batch_decode(
-            trimmed,
-            skip_special_tokens=True,
-        )[0]
-
-        return self.parse_index(output_text, num_candidates)
+        return self.processor.batch_decode(trimmed, skip_special_tokens=True)[0]
