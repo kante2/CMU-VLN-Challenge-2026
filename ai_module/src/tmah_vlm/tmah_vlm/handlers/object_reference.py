@@ -39,6 +39,7 @@ from tmah_vlm.grounding.projector import (
 from tmah_vlm.bbox3d.wireframe import wireframe_edge_points
 from tmah_vlm.graph.runtime import record_object_observation
 from tmah_vlm.helper.node_helpers import get_robot_pose, get_synced_scan_for_latest_image
+from tmah_vlm.sort3d.runtime import is_relation_query, try_sort3d_graph_fallback
 
 
 # ========================================
@@ -55,10 +56,15 @@ def object_reference_process(node, question):
     image, image_stamp = prepare_image(node)
     detect_prompt = parse_question(question)["object"]
 
+    if is_relation_query(question) and try_sort3d_graph_fallback(node, question):
+        return
+
     detections = detect_candidates(node, image, detect_prompt)
     log_detection_summary(node, detections)
 
     if len(detections) == 0:
+        if try_sort3d_graph_fallback(node, question):
+            return
         image_path = save_detection_image(image, detections, detect_prompt, -1)
         log.warn(f"[ObjectRef] no candidates, debug image saved: {image_path}")
         return
@@ -76,7 +82,7 @@ def object_reference_process(node, question):
 
     waypoint = make_waypoint(node, result["point"])
     publish_result(node, selected, result, waypoint)
-    record_object_observation(node, question, selected, result, image_stamp=image_stamp)
+    record_object_observation(node, question, selected, result, image_stamp=image_stamp, image=image)
 
     target_x, target_y, target_z = result["point"]
     log.info(

@@ -30,6 +30,10 @@ TOPIC_MARKER_WIREFRAME = "/selected_object_marker_wireframe"
 # 누적된 online scene graph 전체를 RViz에서 보기 위한 디버그 MarkerArray 토픽.
 TOPIC_SCENE_GRAPH_MARKERS = "/scene_graph_markers"
 
+# 저장된 scene_graph_latest.json을 다시 읽어서 RViz에 띄우는 전용 토픽.
+# live tmah_vlm graph publisher와 충돌하지 않게 별도 토픽으로 둔다.
+TOPIC_SCENE_GRAPH_JSON_MARKERS = "/scene_graph_json_markers"
+
 TOPIC_NUMERICAL = "/numerical_response"
 
 # -----------------------------------------------------------------------------
@@ -102,6 +106,17 @@ SEGMENTATION_MODEL_ID = "facebook/sam-vit-base"
 SPATIAL_NEAR_THRESHOLD_M = 1.5          # find_near 기본 반경
 SPATIAL_BETWEEN_CORRIDOR_M = 1.0        # find_between 기본 통로 폭(선분에서 이 거리 이내)
 SPATIAL_ABOVE_BELOW_MIN_DIFF_M = 0.1    # find_above/find_below 최소 높이차
+
+# -----------------------------------------------------------------------------
+# Object crop captioning (SORT3D-style)
+# -----------------------------------------------------------------------------
+# Hidden evaluation에서는 object_list.txt를 쓰지 않으므로, 관측된 object crop에서
+# caption을 만들어 scene graph에 저장한다. GPU OOM을 피하기 위해 CPU lazy-load가 기본.
+ENABLE_VLM_CAPTIONER = True
+CAPTION_MODEL_ID = "microsoft/Florence-2-base"
+CAPTION_DEVICE = "cpu"
+CAPTION_MAX_NEW_TOKENS = 64
+CAPTION_CROP_MARGIN_PX = 16
 
 # -----------------------------------------------------------------------------
 # 2D detection -> 3D target matching

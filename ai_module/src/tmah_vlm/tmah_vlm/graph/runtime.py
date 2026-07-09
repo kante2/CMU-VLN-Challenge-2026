@@ -30,6 +30,32 @@ def get_scene_graph(node):
     return node.scene_graph
 
 
+def get_vlm_captioner(node):
+    if not getattr(config, "ENABLE_VLM_CAPTIONER", False):
+        return None
+    if hasattr(node, "vlm_captioner_failed") and node.vlm_captioner_failed:
+        return None
+    if hasattr(node, "vlm_captioner") and node.vlm_captioner is not None:
+        return node.vlm_captioner
+
+    try:
+        from tmah_vlm.sort3d.vlm_captioner import FlorenceCaptioner
+        node.vlm_captioner = FlorenceCaptioner(
+            model_id=getattr(config, "CAPTION_MODEL_ID", "microsoft/Florence-2-base"),
+            device=getattr(config, "CAPTION_DEVICE", "cpu"),
+            max_new_tokens=getattr(config, "CAPTION_MAX_NEW_TOKENS", 64),
+        )
+        node.get_logger().info(
+            f"[Caption] VLM captioner loaded: {getattr(config, 'CAPTION_MODEL_ID', '')} "
+            f"on {getattr(config, 'CAPTION_DEVICE', 'cpu')}"
+        )
+        return node.vlm_captioner
+    except Exception as error:
+        node.vlm_captioner_failed = True
+        node.get_logger().warn(f"[Caption] VLM captioner unavailable, use rule captions: {error}")
+        return None
+
+
 def make_observation(question, detection, result, image_stamp=None):
     point = tuple(result["point"])
     bbox_center = tuple(result.get("bbox_center") or point)
@@ -52,7 +78,33 @@ def make_observation(question, detection, result, image_stamp=None):
     )
 
 
-def record_object_observation(node, question, detection, result, image_stamp=None):
+def maybe_update_vlm_caption(node, object_node, detection, image):
+    if image is None:
+        return
+    if object_node.caption_source == "vlm":
+        return
+
+    captioner = get_vlm_captioner(node)
+    if captioner is None:
+        return
+
+    try:
+        caption = captioner.caption_crop(
+            image,
+            getattr(detection, "box", (0.0, 0.0, image.width, image.height)),
+            margin_px=getattr(config, "CAPTION_CROP_MARGIN_PX", 16),
+        )
+        if caption:
+            object_node.caption = caption
+            object_node.caption_source = "vlm"
+            node.get_logger().info(
+                f"[Caption] object={object_node.object_id}, caption={caption}"
+            )
+    except Exception as error:
+        node.get_logger().warn(f"[Caption] VLM caption failed: {error}")
+
+
+def record_object_observation(node, question, detection, result, image_stamp=None, image=None):
     """
     Add one grounded object to the online HOV-SG style graph and save snapshots.
 
@@ -65,6 +117,7 @@ def record_object_observation(node, question, detection, result, image_stamp=Non
         graph = get_scene_graph(node)
         observation = make_observation(question, detection, result, image_stamp)
         object_node = graph.add_observation(observation)
+        maybe_update_vlm_caption(node, object_node, detection, image)
 
         latest_path = os.path.join(config.DEBUG_DIR, "scene_graph_latest.json")
         graph.save_json(latest_path)

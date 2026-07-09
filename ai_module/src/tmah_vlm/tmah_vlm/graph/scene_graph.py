@@ -90,11 +90,46 @@ class SceneGraph:
 
         object_node.add_observation(observation)
         self.recompute_edges()
+        self.update_captions()
         return object_node
 
     def recompute_edges(self):
         self.edges = compute_relation_edges(self.objects)
         return self.edges
+
+    def update_captions(self):
+        """
+        Persist SORT3D-lite captions on graph object nodes.
+
+        The captioner is rule-based and uses only object labels/geometry/nearby
+        context, so it is safe for hidden evaluation and does not require
+        object_list.txt or an external VLM.
+        """
+        try:
+            from tmah_vlm.sort3d.captioner import attach_rule_captions
+            from tmah_vlm.sort3d.objects import Sort3DObject
+        except Exception:
+            return
+
+        sort_objects = [
+            Sort3DObject(
+                object_id=object_id,
+                name=node.name,
+                center=node.center,
+                size=node.size,
+                caption=node.caption,
+                source="scene_graph",
+            )
+            for object_id, node in self.objects.items()
+        ]
+        attach_rule_captions(sort_objects)
+        captions = {obj.object_id: obj.caption for obj in sort_objects}
+        for object_id, caption in captions.items():
+            if object_id in self.objects:
+                node = self.objects[object_id]
+                if node.caption_source != "vlm":
+                    node.caption = caption
+                    node.caption_source = "rule"
 
     def find_merge_target(self, observation, room_id):
         obs_tokens = label_tokens(observation.label)
@@ -192,6 +227,7 @@ class SceneGraph:
         ]
         if not graph.edges:
             graph.recompute_edges()
+        graph.update_captions()
         graph._next_object_index = int(data.get("next_object_index", len(graph.objects)))
         graph.ensure_default_hierarchy()
         return graph

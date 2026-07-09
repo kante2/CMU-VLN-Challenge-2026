@@ -64,6 +64,8 @@ class ObjectNode:
     name: str
     center: tuple
     size: tuple
+    caption: str = ""
+    caption_source: str = "rule"
     embedding: list = field(default_factory=list)
     observations: list = field(default_factory=list)
 
@@ -84,6 +86,8 @@ class ObjectNode:
             "object_id": self.object_id,
             "room_id": self.room_id,
             "name": self.name,
+            "caption": self.caption,
+            "caption_source": self.caption_source,
             "center": list(self.center),
             "size": list(self.size),
             "embedding": list(self.embedding),
@@ -98,6 +102,8 @@ class ObjectNode:
             name=str(data.get("name", "")),
             center=tuple(data.get("center", (0.0, 0.0, 0.0))),
             size=tuple(data.get("size", (0.4, 0.4, 0.4))),
+            caption=str(data.get("caption", "")),
+            caption_source=str(data.get("caption_source", "rule")),
             embedding=list(data.get("embedding", [])),
         )
         node.observations = [

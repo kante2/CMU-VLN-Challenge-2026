@@ -63,6 +63,8 @@ def initialize_modules(node):
     node.detector = None
     node.selector = None
     node.segmenter = None
+    node.vlm_captioner = None
+    node.vlm_captioner_failed = False
 
     node.get_logger().info("Loading models in background...")
     model_thread = threading.Thread(target=load_models, args=(node,), daemon=True)
