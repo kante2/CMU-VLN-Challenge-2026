@@ -87,6 +87,14 @@ PANO_PITCH_OFFSET_DEG = 0.0
 SEGMENTATION_MODEL_ID = "facebook/sam-vit-base"
 
 # -----------------------------------------------------------------------------
+# Spatial reasoning toolbox (spatial_reasoning/relations.py, SORT-3D Module 4)
+# 기본값. LLM이 좌표 계산을 직접 하면 실수하므로, 미리 정의된 함수가 대신 계산한다.
+# -----------------------------------------------------------------------------
+SPATIAL_NEAR_THRESHOLD_M = 1.5          # find_near 기본 반경
+SPATIAL_BETWEEN_CORRIDOR_M = 1.0        # find_between 기본 통로 폭(선분에서 이 거리 이내)
+SPATIAL_ABOVE_BELOW_MIN_DIFF_M = 0.1    # find_above/find_below 최소 높이차
+
+# -----------------------------------------------------------------------------
 # 2D detection -> 3D target matching
 # -----------------------------------------------------------------------------
 RAY_MATCH_ANGLE_RAD = 0.15

@@ -738,7 +738,15 @@ def box_to_3d(
 
 
 def approach_waypoint(target_xyz, robot_pose):
-    """target 앞 APPROACH_STANDOFF_M 지점으로 이동할 waypoint 계산."""
+    """
+    target 앞 APPROACH_STANDOFF_M 지점으로 이동할 waypoint 계산.
+
+    heading은 "로봇 현재 위치 -> target" 방향이 아니라 "waypoint -> target"
+    방향으로 계산한다 (도착했을 때 target을 정면으로 바라보게 하려는 것이므로).
+    지금 waypoint가 로봇 현재 위치-target 직선 위에 있어서 두 방향이 수학적으로
+    같긴 하지만, 나중에 이 접근 경로 로직이 바뀌면 암묵적 가정이 깨질 수 있어
+    waypoint 기준으로 명시적으로 다시 계산한다.
+    """
     tx, ty, _ = target_xyz
     rx = robot_pose["x"]
     ry = robot_pose["y"]
@@ -746,7 +754,6 @@ def approach_waypoint(target_xyz, robot_pose):
     dx = tx - rx
     dy = ty - ry
     distance = math.hypot(dx, dy)
-    heading = math.atan2(dy, dx)
 
     if distance > config.APPROACH_STANDOFF_M:
         ratio = (distance - config.APPROACH_STANDOFF_M) / distance
@@ -755,6 +762,9 @@ def approach_waypoint(target_xyz, robot_pose):
     else:
         wx = rx
         wy = ry
+
+    # waypoint에 도착했을 때 target을 정면으로 보도록, waypoint 기준 방향으로 계산.
+    heading = math.atan2(ty - wy, tx - wx)
 
     return {"x": wx, "y": wy, "heading": heading}
 
