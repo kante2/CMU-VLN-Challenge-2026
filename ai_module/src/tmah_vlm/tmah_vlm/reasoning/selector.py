@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Qwen2.5-VL 기반 후보 선택기.
+Qwen2-VL 기반 후보 선택기.
 
 GroundingDINO가 만든 후보 박스 중에서 원본 질문에 가장 맞는 후보 번호를 고른다.
 문법을 단순하게 하기 위해 staticmethod, torch decorator를 쓰지 않는다.
+
+Qwen2.5-VL-3B-Instruct(~6.3GB)를 쓰다가 GroundingDINO+SAM이랑 같이 8GB GPU에
+못 들어가서(OOM) Qwen2-VL-2B-Instruct(~4GB)로 낮췄다. 프롬프트/처리 방식은
+2.5-VL과 거의 동일해서(같은 계열) 로직은 안 바뀌고 모델 클래스/ID만 다르다.
 """
 
 import re
@@ -14,7 +18,7 @@ from PIL import Image as PILImage, ImageDraw, ImageFont
 
 class QwenSelector:
     def __init__(self,
-                 model_id="Qwen/Qwen2.5-VL-3B-Instruct",
+                 model_id="Qwen/Qwen2-VL-2B-Instruct",
                  device=None,
                  max_new_tokens=64):
         if device is None:
@@ -23,14 +27,14 @@ class QwenSelector:
         self.device = device
         self.max_new_tokens = max_new_tokens
 
-        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(
             model_id,
             min_pixels=256 * 28 * 28,
             max_pixels=768 * 28 * 28,
         )
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_id,
             torch_dtype="auto",
             device_map=self.device,

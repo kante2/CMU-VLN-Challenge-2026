@@ -8,6 +8,7 @@ node를 인자로 받는 자유 함수라 handlers/*.py의 process(node, ...)와
 import time
 
 from tmah_vlm import config
+from tmah_vlm.grounding.projector import pointcloud_to_xyz
 
 
 def peek_pending_question(node):
@@ -101,6 +102,55 @@ def get_synced_scan_for_latest_image(node):
         node.get_logger().info(f"[Sync] image-scan dt={best_dt:.3f}s")
 
     return best_scan, best_dt
+
+
+def get_scan_points_in_map(node, log_tag="Helper"):
+    """image stamp와 가장 가까운 PointCloud2를 map frame으로 변환해서 반환한다.
+
+    handlers/object_reference.py와 handlers/numerical.py가 공용으로 쓴다
+    (원래 object_reference.py에만 있던 걸 옮김 — 둘 다 똑같은 sync+변환이 필요함).
+    log_tag는 로그 접두어만 다르게 하려는 용도(예: "ObjectRef", "Numerical").
+    """
+    log = node.get_logger()
+
+    if node.latest_scan is None:
+        log.warn(f"[{log_tag}] no point cloud yet")
+        return None
+
+    scan_msg, sync_dt = get_synced_scan_for_latest_image(node)
+
+    if scan_msg is None:
+        log.warn(f"[{log_tag}] no point cloud yet")
+        return None
+
+    if sync_dt is not None:
+        log.info(f"[{log_tag}] using scan closest to image stamp, dt={sync_dt:.3f}s")
+
+    try:
+        points = pointcloud_to_xyz(scan_msg)
+    except Exception as error:
+        log.error(f"[{log_tag}] point cloud parsing failed: {error}")
+        return None
+
+    source_frame = scan_msg.header.frame_id
+    if source_frame is None or source_frame == "":
+        source_frame = config.FRAME_SENSOR
+
+    try:
+        points_map = node.transformer.transform_points(
+            points,
+            source_frame,
+            config.FRAME_MAP,
+            stamp=scan_msg.header.stamp,
+        )
+        log.info(
+            f"[{log_tag}] point cloud: {len(points)} points, "
+            f"frame {source_frame} -> {config.FRAME_MAP}"
+        )
+        return points_map
+    except Exception as error:
+        log.error(f"[{log_tag}] point cloud TF failed: {error}")
+        return None
 
 
 def heartbeat(node):
