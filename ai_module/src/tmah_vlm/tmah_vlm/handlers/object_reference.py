@@ -41,7 +41,8 @@ from tmah_vlm.grounding.projector import (
 )
 from tmah_vlm.bbox3d.wireframe import wireframe_edge_points
 from tmah_vlm.graph.runtime import record_object_observation
-from tmah_vlm.helper.node_helpers import get_robot_pose, get_synced_scan_for_latest_image
+from tmah_vlm.helper.node_helpers import get_robot_pose, get_scan_points_in_map
+from tmah_vlm.object_filter.candidate_filter import filter_candidates_by_relations
 from tmah_vlm.sort3d.runtime import is_relation_query, try_sort3d_graph_fallback
 
 
