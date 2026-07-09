@@ -55,11 +55,12 @@ def initialize_state(node):
 
 
 def initialize_modules(node):
-    """TF 변환기와 VLM/Detector 모델을 준비한다."""
+    """TF 변환기와 VLM/Detector/Segmenter 모델을 준비한다."""
     node.transformer = CoordinateTransformer(node)
 
     node.detector = None
     node.selector = None
+    node.segmenter = None
 
     node.get_logger().info("Loading models in background...")
     model_thread = threading.Thread(target=load_models, args=(node,), daemon=True)
@@ -67,7 +68,7 @@ def initialize_modules(node):
 
 
 def load_models(node):
-    """GroundingDINO와 Qwen selector를 로드한다 (백그라운드 스레드에서 실행됨)."""
+    """GroundingDINO, Qwen selector, SAM segmenter를 로드한다 (백그라운드 스레드)."""
     try:
         from tmah_vlm.perception.detector import GroundingDINODetector
         node.detector = GroundingDINODetector(
@@ -84,6 +85,13 @@ def load_models(node):
         node.get_logger().info("Qwen selector loaded")
     except Exception as error:
         node.get_logger().error(f"Qwen selector load failed: {error}")
+
+    try:
+        from tmah_vlm.segmentation.segmenter import SAMSegmenter
+        node.segmenter = SAMSegmenter(model_id=config.SEGMENTATION_MODEL_ID)
+        node.get_logger().info("SAM segmenter loaded")
+    except Exception as error:
+        node.get_logger().error(f"SAM segmenter load failed: {error}")
 
     node.get_logger().info("Model loading finished")
 

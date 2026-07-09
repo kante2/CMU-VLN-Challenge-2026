@@ -107,13 +107,14 @@ def heartbeat(node):
     """현재 노드 상태 확인용 로그."""
     detector_state = "ok" if node.detector is not None else "loading"
     selector_state = "ok" if node.selector is not None else "loading"
+    segmenter_state = "ok" if node.segmenter is not None else "loading"
 
     node.get_logger().info(
         f"[Health] img={node.image_count}, scan={node.scan_count}, "
         f"pose=({node.robot['x']:.2f}, {node.robot['y']:.2f}, "
         f"yaw={node.robot['yaw']:.2f}), "
         f"sync_dt={node.last_sync_dt if node.last_sync_dt is not None else -1:.3f}, "
-        f"detector={detector_state}, selector={selector_state}"
+        f"detector={detector_state}, selector={selector_state}, segmenter={segmenter_state}"
     )
 
 

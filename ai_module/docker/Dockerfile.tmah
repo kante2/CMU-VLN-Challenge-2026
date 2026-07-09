@@ -35,6 +35,14 @@ AutoProcessor.from_pretrained(m); \
 Qwen2_5_VLForConditionalGeneration.from_pretrained(m, torch_dtype='auto'); \
 print('Qwen2.5-VL cached.')" || echo "WARN: qwen pre-download skipped"
 
+# 3) SAM (box-prompted segmentation, bbox 안 배경 point 오염 줄이는 데 사용)
+RUN python3 -c "\
+from transformers import SamModel, SamProcessor; \
+m='facebook/sam-vit-base'; \
+SamProcessor.from_pretrained(m); \
+SamModel.from_pretrained(m); \
+print('SAM cached.')" || echo "WARN: SAM pre-download skipped"
+
 # tmah_vlm 소스 복사
 COPY src/tmah_vlm /home/docker/ai_module/src/tmah_vlm
 

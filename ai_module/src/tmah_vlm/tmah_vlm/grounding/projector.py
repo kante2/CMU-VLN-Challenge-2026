@@ -216,6 +216,26 @@ def make_box_candidate_mask(pixels, box, image_width):
     return y_mask & (x_mask_normal | x_mask_wrap)
 
 
+def make_segmentation_candidate_mask(pixels, segmentation_mask):
+    """
+    투영된 pixel이 SAM segmentation mask(HxW bool) 안에 들어오는지 확인한다.
+
+    box 기반 판정과 달리 물체 실루엣만 정확히 담기 때문에, box 모서리에 섞여
+    들어오는 배경/다른 물체 point를 걸러낼 수 있다.
+    """
+    height, width = segmentation_mask.shape
+
+    u = pixels[:, 0].astype(np.int64)
+    v = pixels[:, 1].astype(np.int64)
+
+    inside_image = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+
+    result = np.zeros(len(pixels), dtype=bool)
+    idx = np.where(inside_image)[0]
+    result[idx] = segmentation_mask[v[idx], u[idx]]
+    return result
+
+
 def normalized_pixel_error(pixels, box):
     """
     box 중심과 후보 point 투영점 사이의 정규화된 거리.
@@ -479,7 +499,7 @@ def weighted_centroid_target(points_camera_selected, pixel_error_selected, trans
 
 def find_best_point_by_box_projection(
     origin_map, points_map, transformer, box, image_size, target_name=None,
-    image_stamp=None,
+    image_stamp=None, segmentation_mask=None,
 ):
     """
     selected 2D box를 ray bundle로 보고, 그 안의 거리 분포 mode로 3D target을 정한다.
@@ -490,8 +510,9 @@ def find_best_point_by_box_projection(
 
     현재 방식:
       1. PointCloud를 camera image로 투영
-      2. selected bbox 안에 들어온 point만 수집
-      3. bbox 영역의 depth histogram을 만들고 가장 많은 depth bin 선택
+      2. segmentation_mask가 있으면 그 실루엣 안, 없으면(또는 point가 너무 적으면)
+         selected bbox(내부 -> 전체 순으로) 안에 들어온 point를 수집
+      3. 그 영역의 depth histogram을 만들고 가장 많은 depth bin 선택
       4. 선택된 bin에 실제로 들어온 point들의 weighted centroid를 target으로 사용
          (box 중심 ray 위에 있다고 가정하지 않고, 관측된 실제 3D 위치를 쓴다)
     """
@@ -532,15 +553,27 @@ def find_best_point_by_box_projection(
     if len(pixels) == 0:
         return None, "no_valid_depth", 0, {}
 
-    # 1차: box를 줄인 내부 영역으로 depth mode를 본다.
-    inner_box = shrink_box(box, config.BBOX_INNER_SCALE)
-    mask = make_box_candidate_mask(pixels, inner_box, image_width)
-    method = "bbox_ray_bundle_inner"
+    mask = None
+    method = None
 
-    # 2차: 내부 영역에 점이 부족하면 전체 box를 사용한다.
-    if int(np.sum(mask)) < config.BBOX_MIN_POINTS:
-        mask = make_box_candidate_mask(pixels, box, image_width)
-        method = "bbox_ray_bundle_full"
+    # 0차: segmentation mask가 있으면 실루엣 안 point를 우선 쓴다 (box보다 정확함).
+    if segmentation_mask is not None:
+        mask = make_segmentation_candidate_mask(pixels, segmentation_mask)
+        method = "segmentation_mask"
+
+        if int(np.sum(mask)) < config.BBOX_MIN_POINTS:
+            mask = None  # 마스크 실패/물체가 너무 작음 -> box로 대체
+
+    if mask is None:
+        # 1차: box를 줄인 내부 영역으로 depth mode를 본다.
+        inner_box = shrink_box(box, config.BBOX_INNER_SCALE)
+        mask = make_box_candidate_mask(pixels, inner_box, image_width)
+        method = "bbox_ray_bundle_inner"
+
+        # 2차: 내부 영역에 점이 부족하면 전체 box를 사용한다.
+        if int(np.sum(mask)) < config.BBOX_MIN_POINTS:
+            mask = make_box_candidate_mask(pixels, box, image_width)
+            method = "bbox_ray_bundle_full"
 
     matched_count = int(np.sum(mask))
 
@@ -629,7 +662,10 @@ def find_best_point_on_ray(origin_map, ray_map, points_map):
     return candidate_points[best_index], "fallback_lidar_ray_match", matched_count
 
 
-def box_to_3d(box, image_size, scan_points_map, transformer, target_name=None, image_stamp=None):
+def box_to_3d(
+    box, image_size, scan_points_map, transformer, target_name=None,
+    image_stamp=None, segmentation_mask=None,
+):
     """
     2D box -> 3D map 좌표.
 
@@ -639,6 +675,8 @@ def box_to_3d(box, image_size, scan_points_map, transformer, target_name=None, i
     image_stamp: 이 box가 나온 이미지의 캡처 시각(msg.header.stamp).
       로봇 회전 중 TF가 "최신" 값으로 어긋나는 걸 막기 위해 camera ray/origin은
       이 시각의 TF를 우선 사용한다.
+    segmentation_mask: segmentation/segmenter.py가 만든 HxW bool mask.
+      있으면 box 대신 이 실루엣 안 point를 우선 사용한다 (없으면 box로 대체).
     """
     image_width, image_height = image_size
 
@@ -664,9 +702,10 @@ def box_to_3d(box, image_size, scan_points_map, transformer, target_name=None, i
         image_size,
         target_name,
         image_stamp=image_stamp,
+        segmentation_mask=segmentation_mask,
     )
 
-    # 2순위: box 내부 투영점이 없을 때만 기존 ray 방식 사용.
+    # 2순위: box/mask 내부 투영점이 없을 때만 기존 ray 방식 사용.
     if point_map is None:
         point_map, method, matched_count = find_best_point_on_ray(
             origin_map,
@@ -725,6 +764,7 @@ def approach_waypoint(target_xyz, robot_pose):
 
 def save_projection_overlay(
     image, box, scan_points_map, transformer, target_name="object", image_stamp=None,
+    segmentation_mask=None,
 ):
     """
     현재 PointCloud가 camera image 위에 어디로 투영되는지 저장한다.
@@ -733,14 +773,22 @@ def save_projection_overlay(
       - PointCloud 투영이 실제 물체 위치와 맞는지
       - bbox 안으로 들어오는 point가 TV가 아니라 앞 선반 쪽인지
       - PANO_FORWARD_X / camera TF / image-scan sync가 틀어졌는지
+      - segmentation mask가 실제 물체 실루엣과 맞는지, 그 안 point가 box보다 정확한지
     """
     import os
     from datetime import datetime
-    from PIL import ImageDraw
+    from PIL import Image as PILImage, ImageDraw
 
     os.makedirs(config.DEBUG_DIR, exist_ok=True)
 
     img = image.convert("RGB").copy()
+
+    # segmentation mask 실루엣을 반투명 마젠타로 먼저 깔아서 박스/point보다 아래에 보이게 한다.
+    if segmentation_mask is not None:
+        tint = PILImage.new("RGB", img.size, (255, 0, 255))
+        alpha = PILImage.fromarray((segmentation_mask.astype(np.uint8) * 70), mode="L")
+        img = PILImage.composite(tint, img, alpha)
+
     draw = ImageDraw.Draw(img)
     width, height = img.size
 
@@ -784,6 +832,10 @@ def save_projection_overlay(
 
     inside_full = make_box_candidate_mask(pixels, box, width)
     inside_inner = make_box_candidate_mask(pixels, inner_box, width)
+    inside_mask = (
+        make_segmentation_candidate_mask(pixels, segmentation_mask)
+        if segmentation_mask is not None else None
+    )
 
     # depth별 대략적인 점 크기. 가까운 점은 조금 크게 보이게 한다.
     for idx in range(len(pixels)):
@@ -796,7 +848,9 @@ def save_projection_overlay(
         depth = float(ranges[idx])
         radius = 2 if depth < 5.0 else 1
 
-        if inside_inner[idx]:
+        if inside_mask is not None and inside_mask[idx]:
+            color = (255, 0, 255)    # segmentation mask 안 point: 마젠타 (실제 3D 계산에 쓰인 point)
+        elif inside_inner[idx]:
             color = (255, 240, 40)   # inner bbox 안 point: 노랑
         elif inside_full[idx]:
             color = (255, 120, 40)   # bbox 안 point: 주황
@@ -805,11 +859,18 @@ def save_projection_overlay(
 
         draw.ellipse([u-radius, v-radius, u+radius, v+radius], fill=color)
 
-    header = (
-        f"projection overlay | target={target_name} | "
-        f"yellow=inner, orange=box, blue=outside | "
-        f"points={len(pixels)}"
-    )
+    if segmentation_mask is not None:
+        header = (
+            f"projection overlay | target={target_name} | "
+            f"magenta=segmentation mask, yellow=inner, orange=box, blue=outside | "
+            f"points={len(pixels)}"
+        )
+    else:
+        header = (
+            f"projection overlay | target={target_name} | "
+            f"yellow=inner, orange=box, blue=outside | "
+            f"points={len(pixels)}"
+        )
     draw.rectangle([0, 0, width, 24], fill=(0, 0, 0))
     draw.text((5, 4), header, fill=(255, 255, 255))
 

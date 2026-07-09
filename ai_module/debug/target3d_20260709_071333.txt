@@ -1,0 +1,15 @@
+question: Find the circle mirror
+selected_index: 0
+target_map_xyz: (4.992285758958327, 0.7716067746433026, 2.4791820261274276)
+camera_origin_map_xyz: (3.0874031115683, -4.5058633395585606, 0.8501993538054388)
+ray_map_xyz: (0.3222585869614811, 0.9090574133122469, 0.264128798944069)
+method: segmentation_mask_centroid_mode
+matched_points: 46
+target_name: circle mirror
+cluster_policy: bbox_ray_depth_mode
+cluster_depth_m: 5.84319491626891
+cluster_error: 0.6592690737731032
+cluster_count: 18
+bbox_center: (5.00145872856821, 0.7385630149866038, 2.4764931173473106)
+bbox_size: (0.7066683911777369, 0.15, 0.925200485069273)
+waypoint: {'x': 4.720649295520984, 'y': 0.019135092962687672, 'heading': 1.2243625946708423}
