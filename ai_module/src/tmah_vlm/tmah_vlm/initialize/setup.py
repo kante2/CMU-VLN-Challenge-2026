@@ -18,7 +18,7 @@ from std_msgs.msg import String, Int32
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, PointCloud2
 from geometry_msgs.msg import Pose2D
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
 
 from tmah_vlm import config
 from tmah_vlm.tf.coordinate_transform import CoordinateTransformer
@@ -29,6 +29,7 @@ from tmah_vlm.callback.sensor_callbacks import (
     scan_callback,
 )
 from tmah_vlm.helper.node_helpers import heartbeat
+from tmah_vlm.graph.visualizer import publish_scene_graph_markers
 
 
 def initialize_state(node):
@@ -52,6 +53,7 @@ def initialize_state(node):
     node.busy = False
     node.state_lock = threading.Lock()
     node.last_wait_log_time = 0.0
+    node.scene_graph = None
 
 
 def initialize_modules(node):
@@ -79,12 +81,15 @@ def load_models(node):
     except Exception as error:
         node.get_logger().error(f"GroundingDINO load failed: {error}")
 
-    try:
-        from tmah_vlm.reasoning.selector import QwenSelector
-        node.selector = QwenSelector()
-        node.get_logger().info("Qwen selector loaded")
-    except Exception as error:
-        node.get_logger().error(f"Qwen selector load failed: {error}")
+    if config.ENABLE_QWEN_SELECTOR:
+        try:
+            from tmah_vlm.reasoning.selector import QwenSelector
+            node.selector = QwenSelector()
+            node.get_logger().info("Qwen selector loaded")
+        except Exception as error:
+            node.get_logger().error(f"Qwen selector load failed: {error}")
+    else:
+        node.get_logger().info("Qwen selector disabled; using first detection candidate")
 
     try:
         from tmah_vlm.segmentation.segmenter import SAMSegmenter
@@ -144,6 +149,11 @@ def initialize_publishers(node):
         config.TOPIC_MARKER_WIREFRAME,
         5,
     )
+    node.scene_graph_marker_pub = node.create_publisher(
+        MarkerArray,
+        config.TOPIC_SCENE_GRAPH_MARKERS,
+        5,
+    )
 
     node.numerical_pub = node.create_publisher(
         Int32,
@@ -156,3 +166,7 @@ def initialize_timers(node):
     """주기적으로 돌아가는 loop."""
     node.main_timer = node.create_timer(0.2, node.main_control_loop)
     node.health_timer = node.create_timer(3.0, lambda: heartbeat(node))
+    node.scene_graph_marker_timer = node.create_timer(
+        1.0,
+        lambda: publish_scene_graph_markers(node),
+    )

@@ -37,6 +37,7 @@ from tmah_vlm.grounding.projector import (
     save_projection_overlay,
 )
 from tmah_vlm.bbox3d.wireframe import wireframe_edge_points
+from tmah_vlm.graph.runtime import record_object_observation
 from tmah_vlm.helper.node_helpers import get_robot_pose, get_synced_scan_for_latest_image
 
 
@@ -75,6 +76,7 @@ def object_reference_process(node, question):
 
     waypoint = make_waypoint(node, result["point"])
     publish_result(node, selected, result, waypoint)
+    record_object_observation(node, question, selected, result, image_stamp=image_stamp)
 
     target_x, target_y, target_z = result["point"]
     log.info(
@@ -331,6 +333,11 @@ def publish_waypoint(node, waypoint):
     msg.y = float(waypoint["y"])
     msg.theta = float(waypoint["heading"])
     node.waypoint_pub.publish(msg)
+    node.get_logger().info(
+        f"[ObjectRef] waypoint published: topic={config.TOPIC_WAYPOINT}, "
+        f"x={msg.x:.2f}, y={msg.y:.2f}, theta={msg.theta:.2f}, "
+        f"subscribers={node.waypoint_pub.get_subscription_count()}"
+    )
 
 
 # ========================================

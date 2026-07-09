@@ -16,7 +16,7 @@
 import re
 
 _LEADING = re.compile(
-    r"^\s*(find|locate|show me|where is|point to|identify)\s+", re.I)
+    r"^\s*(find|locate|show me|where is|point to|identify|how many)\s+", re.I)
 _ARTICLES = re.compile(r"\b(the|a|an)\b", re.I)
 
 # 공간관계/수식어가 시작되는 지점에서 자른다 (핵심 명사만 남기기)
@@ -28,6 +28,30 @@ _CUT = re.compile(
 _COLORS = re.compile(
     r"\b(red|orange|yellow|green|blue|teal|cyan|purple|violet|pink|brown|"
     r"black|white|gray|grey|beige|tan|gold|silver|maroon|navy)\b", re.I)
+
+# Challenge labels often include material/container modifiers that make
+# open-vocabulary detection brittle. Keep the full question for selection, but
+# ask the detector for the simpler visual object class.
+_DETECT_ALIASES = {
+    "potted plant": "plant",
+    "paper cup": "cup",
+    "computer monitor": "monitor",
+    "computer monitors": "monitor",
+    "file cabinet": "cabinet",
+    "projector screen": "screen",
+}
+
+
+def _normalize_detector_prompt(obj: str) -> str:
+    obj = obj.lower()
+    if obj in _DETECT_ALIASES:
+        return _DETECT_ALIASES[obj]
+
+    for phrase, alias in _DETECT_ALIASES.items():
+        if phrase in obj:
+            return alias
+
+    return obj
 
 
 def extract_target(question: str) -> dict:
@@ -52,4 +76,4 @@ def extract_target(question: str) -> dict:
     if not obj:
         obj = question.strip()
 
-    return {"object": obj.lower(), "raw": raw}
+    return {"object": _normalize_detector_prompt(obj), "raw": raw}

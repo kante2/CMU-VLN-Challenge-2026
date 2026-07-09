@@ -106,8 +106,11 @@ def get_synced_scan_for_latest_image(node):
 def heartbeat(node):
     """현재 노드 상태 확인용 로그."""
     detector_state = "ok" if node.detector is not None else "loading"
-    selector_state = "ok" if node.selector is not None else "loading"
-    segmenter_state = "ok" if node.segmenter is not None else "loading"
+    if not config.ENABLE_QWEN_SELECTOR:
+        selector_state = "disabled"
+    else:
+        selector_state = "ok" if node.selector is not None else "loading"
+    segmenter_state = "ok" if getattr(node, "segmenter", None) is not None else "loading"
 
     node.get_logger().info(
         f"[Health] img={node.image_count}, scan={node.scan_count}, "

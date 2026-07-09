@@ -27,6 +27,9 @@ TOPIC_MARKER = "/selected_object_marker"
 # 3D bbox wireframe은 challenge 쪽 계약이 없는 우리 전용 디버그 토픽이라 자유롭게 사용.
 TOPIC_MARKER_WIREFRAME = "/selected_object_marker_wireframe"
 
+# 누적된 online scene graph 전체를 RViz에서 보기 위한 디버그 MarkerArray 토픽.
+TOPIC_SCENE_GRAPH_MARKERS = "/scene_graph_markers"
+
 TOPIC_NUMERICAL = "/numerical_response"
 
 # -----------------------------------------------------------------------------
@@ -80,6 +83,12 @@ TEXT_THRESHOLD = 0.25
 PANO_YAW_OFFSET_DEG = 0.0
 PANO_PITCH_OFFSET_DEG = 0.0
 
+# Qwen selector is optional. On 8GB GPUs it can consume the remaining CUDA
+# memory after GroundingDINO loads, causing detection itself to fail with
+# CUBLAS/CUDA OOM. Keep it disabled for stable challenge runs; detection falls
+# back to candidate #0 when no selector is loaded.
+ENABLE_QWEN_SELECTOR = False
+
 # -----------------------------------------------------------------------------
 # Segmentation (SAM) — box 안 배경 point 오염을 줄이기 위한 pixel 단위 마스크.
 # 선택된 후보 1개에만 돌린다 (매 후보마다 돌리지 않음).
@@ -129,6 +138,13 @@ BBOX3D_MAX_SIZE_M = 2.0
 
 # 크기 추정을 못 했을 때(fallback ray 경로 등) 쓰는 고정 크기.
 BBOX3D_DEFAULT_SIZE_M = 0.4
+
+# -----------------------------------------------------------------------------
+# Online HOV-SG style scene graph (graph/)
+# -----------------------------------------------------------------------------
+# 같은 room 안에서 label이 호환되고 중심 거리가 이 값보다 가까우면 같은 object node로
+# 누적한다. 너무 작으면 같은 물체가 여러 노드로 쪼개지고, 너무 크면 다른 물체가 합쳐진다.
+SCENE_GRAPH_MERGE_DISTANCE_M = 0.75
 
 # -----------------------------------------------------------------------------
 # Debug
