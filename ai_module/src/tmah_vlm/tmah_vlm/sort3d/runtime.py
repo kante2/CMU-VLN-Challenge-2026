@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Runtime bridge from the live scene graph to SORT3D-lite reasoning."""
 
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, Pose2D
 from visualization_msgs.msg import Marker
 
 from tmah_vlm import config
-from tmah_vlm.bbox3d.wireframe import wireframe_edge_points
-from tmah_vlm.helper.node_helpers import get_robot_pose
+from tmah_vlm.geometry.bbox_wireframe import wireframe_edge_points
+from tmah_vlm.node.helpers import get_robot_pose
 from tmah_vlm.sort3d.pipeline import Sort3DLite
 
 
@@ -69,9 +69,16 @@ def publish_sort3d_result(node, target, waypoint):
     stamp = node.get_clock().now().to_msg()
     node.marker_pub.publish(make_sort3d_cube_marker(stamp, target))
     node.wireframe_marker_pub.publish(make_sort3d_wireframe_marker(stamp, target))
-
-    from tmah_vlm.handlers.object_reference import publish_waypoint
     publish_waypoint(node, waypoint)
+
+
+def publish_waypoint(node, waypoint):
+    # 접근 waypoint(dict)를 Pose2D로 발행한다.
+    msg = Pose2D()
+    msg.x = float(waypoint["x"])
+    msg.y = float(waypoint["y"])
+    msg.theta = float(waypoint["heading"])
+    node.waypoint_pub.publish(msg)
 
 
 def make_sort3d_cube_marker(stamp, target):

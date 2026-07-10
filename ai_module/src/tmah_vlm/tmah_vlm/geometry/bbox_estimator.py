@@ -3,14 +3,14 @@
 3D bounding box 크기 추정.
 
 지금까지는 물체 크기를 몰라서 RViz marker를 0.4m 고정 박스로 그렸다
-(handlers/object_reference.py publish_marker의 "현재는 3D 크기를 정확히 모르는
-단계라 고정 크기 박스로 표시한다" 주석). grounding/projector.py가 depth
+(t3_object_reference_solver/publish.py publish_object_marker의 "현재는 3D 크기를 정확히 모르는
+단계라 고정 크기 박스로 표시한다" 주석). geometry/projector.py가 depth
 histogram으로 이미 "이 물체에 해당하는" point 묶음을 골라두므로, 그 point들의
 실제 퍼짐(extent)을 쓰면 대략적인 크기를 알 수 있다.
 
 역할 분리:
-  grounding/projector.py: 2D box -> 어떤 point들이 물체에 해당하는지 선택
-  bbox3d/estimator.py:     그 point들 -> map frame 3D bounding box(중심, 크기)
+  geometry/projector.py: 2D box -> 어떤 point들이 물체에 해당하는지 선택
+  geometry/bbox_estimator.py:     그 point들 -> map frame 3D bounding box(중심, 크기)
 """
 
 import numpy as np
@@ -47,7 +47,7 @@ def estimate_object_bbox(points_camera_selected, transformer, image_stamp=None):
     """
     선택된 cluster의 camera-frame point들을 map frame으로 옮기고 bounding box를 계산한다.
 
-    points_camera_selected: grounding/projector.py의 find_best_point_by_box_projection()이
+    points_camera_selected: geometry/projector.py의 find_best_point_by_box_projection()이
       depth histogram으로 골라낸, 그 물체에 해당하는 point들 (camera frame).
     """
     if points_camera_selected is None or len(points_camera_selected) == 0:

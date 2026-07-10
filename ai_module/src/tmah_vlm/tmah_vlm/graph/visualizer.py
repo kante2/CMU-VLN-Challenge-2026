@@ -10,7 +10,7 @@ from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker, MarkerArray
 
 from tmah_vlm import config
-from tmah_vlm.bbox3d.wireframe import wireframe_edge_points
+from tmah_vlm.geometry.bbox_wireframe import wireframe_edge_points
 
 
 def publish_scene_graph_markers(node):

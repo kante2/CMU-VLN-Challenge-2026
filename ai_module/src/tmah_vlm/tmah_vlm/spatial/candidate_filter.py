@@ -11,16 +11,16 @@ relation_parser.py가 질문에서 관계절(between/near/closest/...)을 텍스
      (아직 영속적인 semantic map이 없어서 즉석으로 처리한다 — 나중에
      SORT-3D Module 1(instance-level mapping)이 생기면 여기를 map 조회로
      바꾸면 된다)
-  3. spatial_reasoning/relations.py의 결정론적 함수로 후보 필터링/정렬
+  3. spatial/relations.py의 결정론적 함수로 후보 필터링/정렬
      (VLM이 거리/방향을 직접 판단하면 부정확하므로)
 
-handlers/object_reference.py와 handlers/numerical.py가 공용으로 쓴다.
+t3_object_reference_solver와 t2_numerical_solver가 공용으로 쓴다.
 """
 
-from tmah_vlm.grounding.projector import box_to_3d
-from tmah_vlm.spatial_reasoning import relations as spatial_relations
-from tmah_vlm.object_filter.relation_parser import extract_relations, all_referenced_landmarks
-from tmah_vlm.helper.node_helpers import get_robot_pose
+from tmah_vlm.geometry.projector import box_to_3d
+from tmah_vlm.spatial import relations as spatial_relations
+from tmah_vlm.spatial.relation_parser import extract_relations, all_referenced_landmarks
+from tmah_vlm.node.helpers import get_robot_pose
 
 
 def localize_candidate_points(node, detections, image_size, scan_points_map, image_stamp):

@@ -89,9 +89,10 @@ PANO_PITCH_OFFSET_DEG = 0.0
 
 # Qwen selector is optional. On 8GB GPUs it can consume the remaining CUDA
 # memory after GroundingDINO loads, causing detection itself to fail with
-# CUBLAS/CUDA OOM. Keep it disabled for stable challenge runs; detection falls
-# back to candidate #0 when no selector is loaded.
-ENABLE_QWEN_SELECTOR = False
+# CUBLAS/CUDA OOM. If selector=loading never resolves in the heartbeat (GPU
+# OOM), set this back to False; detection falls back to candidate #0 when no
+# selector is loaded.
+ENABLE_QWEN_SELECTOR = True
 
 # -----------------------------------------------------------------------------
 # Segmentation (SAM) — box 안 배경 point 오염을 줄이기 위한 pixel 단위 마스크.
@@ -99,8 +100,14 @@ ENABLE_QWEN_SELECTOR = False
 # -----------------------------------------------------------------------------
 SEGMENTATION_MODEL_ID = "facebook/sam-vit-base"
 
+# SAM을 어느 device에서 돌릴지. GroundingDINO + Qwen2.5-VL이 이미 GPU를 거의 다
+# 써서(7.5GB GPU 기준 ~350MB만 남음) SAM 추론이 CUDA OOM으로 매번 실패했다.
+# 세그멘테이션은 쿼리당 1회라 CPU로 돌려도 몇 초면 되므로 기본을 "cpu"로 둔다.
+# GPU 여유가 충분한 환경이면 "cuda"로 바꿔도 된다.
+SEGMENTATION_DEVICE = "cpu"
+
 # -----------------------------------------------------------------------------
-# Spatial reasoning toolbox (spatial_reasoning/relations.py, SORT-3D Module 4)
+# Spatial reasoning toolbox (spatial/relations.py, SORT-3D Module 4)
 # 기본값. LLM이 좌표 계산을 직접 하면 실수하므로, 미리 정의된 함수가 대신 계산한다.
 # -----------------------------------------------------------------------------
 SPATIAL_NEAR_THRESHOLD_M = 1.5          # find_near 기본 반경

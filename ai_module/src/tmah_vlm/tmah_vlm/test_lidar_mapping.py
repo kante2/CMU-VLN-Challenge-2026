@@ -13,11 +13,11 @@ map frame에 등록해서, voxel grid로 dedup하며 계속 누적한다. 누적
   - /debug/lidar_map_cloud      (PointCloud2 display) -> 누적된 3D map
   - /debug/lidar_map_robot_pose (Marker display)       -> 로봇 현재 위치+heading
 
-TF는 tf/coordinate_transform.py의 CoordinateTransformer를 그대로 쓴다
+TF는 geometry/coordinate_transform.py의 CoordinateTransformer를 그대로 쓴다
 (캡처 시각 stamp 기반 lookup까지 이미 검증된 것 재사용 — 회전 중에도 안 어긋남).
 
 다음 단계 (여기엔 아직 없음, 이 스크립트로 지도 누적 자체가 검증된 다음 할 일):
-  - 이 누적 map 위에 handlers/object_reference.py가 검출한 물체의 3D 위치를
+  - 이 누적 map 위에 t3_object_reference_solver가 검출한 물체의 3D 위치를
     같이 얹어서 "탐지된 물체 그래프"를 만든다 (물체 label + 위치 + 지도 좌표).
   - 질문이 들어왔을 때 현재 시야가 아니라 이 그래프를 먼저 찾아보고,
     필요하면 그 물체 근처로 이동하게 한다.
@@ -42,8 +42,8 @@ from visualization_msgs.msg import Marker
 import sensor_msgs_py.point_cloud2 as pc2
 
 from tmah_vlm import config
-from tmah_vlm.grounding.projector import pointcloud_to_xyz
-from tmah_vlm.tf.coordinate_transform import CoordinateTransformer
+from tmah_vlm.geometry.projector import pointcloud_to_xyz
+from tmah_vlm.geometry.coordinate_transform import CoordinateTransformer
 
 # 이 테스트 스크립트만 쓰는 디버그 토픽(본 파이프라인 규격과 무관해서 자유롭게 정함).
 TOPIC_MAP_CLOUD = "/debug/lidar_map_cloud"

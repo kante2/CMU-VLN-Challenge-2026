@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
 """
-vlm_node.py의 main_control_loop()와 handlers/*.py가 공용으로 쓰는 node 상태 헬퍼.
+main_node.py의 main_control_loop()와 solver들(t1/t2/t3)이 공용으로 쓰는 node 상태 헬퍼.
 
-node를 인자로 받는 자유 함수라 handlers/*.py의 process(node, ...)와 같은 패턴이다.
+node를 인자로 받는 자유 함수라 solver들의 *_process(node, ...)와 같은 패턴이다.
 """
 
 import time
 
 from tmah_vlm import config
-from tmah_vlm.grounding.projector import pointcloud_to_xyz
+from tmah_vlm.geometry.projector import pointcloud_to_xyz
 
 
 def peek_pending_question(node):
-    """아직 처리하지 않은 질문을 확인한다."""
-    with node.state_lock:
+    """아직 처리하지 않은 질문을 확인한다.
+
+    질문 콜백(node/callbacks.py)이 `node.pending_question`에 넣어둔 값을
+    main_control_loop이 매 tick마다 이 함수로 들여다본다. 
+    값을 소비(clear)하지 않고 읽기만(peek) 하므로, 아직 처리할 준비가 안 됐으면 다음 tick에서 다시 볼 수 있다.
+    콜백 스레드와 제어 루프가 동시에 접근하므로 state_lock으로 보호한다.
+    """
+    with node.state_lock:  #<-- 
         return node.pending_question
 
 
 def ready_to_process(node, question):
-    """현재 질문을 처리할 준비가 됐는지 확인한다."""
+    """현재 질문을 처리할 준비가 됐는지(필요한 입력/모델이 다 준비됐는지) 확인한다.
+
+    준비가 안 됐으면 False를 반환해서 main_control_loop이 이번 질문을 처리하지 않고
+    다음 tick으로 미루게 한다. 판정 기준:
+      - 카메라 이미지는 무조건 있어야 한다(모든 처리의 기본 입력).
+      - "find ..." 형태의 질문은 GroundingDINO(detector)가 로드돼 있어야 한다.
+    """
     lower_question = question.lower()
 
     if node.latest_image is None:
@@ -32,7 +44,12 @@ def ready_to_process(node, question):
 
 
 def print_waiting_reason(node, question):
-    """준비가 덜 됐을 때 너무 자주 출력하지 않도록 3초에 한 번만 로그."""
+    """준비가 덜 됐을 때(ready_to_process가 False) 무엇을 기다리는지 로그로 알려준다.
+
+    제어 루프는 매 tick마다 돌기 때문에 그대로 찍으면 로그가 도배된다. 그래서
+    node.last_wait_log_time으로 마지막 출력 시각을 기억해 3초에 한 번만 출력한다.
+    ready_to_process와 같은 조건을 검사해서 부족한 항목만 골라 문자열로 합쳐 warn한다.
+    """
     now = time.time()
     if now - node.last_wait_log_time < 3.0:
         return
@@ -51,16 +68,26 @@ def print_waiting_reason(node, question):
 
 
 def get_robot_pose(node):
-    """handler에서 현재 로봇 pose를 읽기 위한 함수."""
+    """handler에서 현재 로봇 pose(x, y, yaw)를 읽기 위한 함수.
+
+    dict(node.robot)로 복사본을 돌려주는 이유: 원본 node.robot은 pose 콜백이 계속
+    덮어쓰므로, handler가 참조를 그대로 들고 있으면 처리 도중에 값이 바뀐다.
+    스냅샷을 떠서 처리 시작 시점의 pose를 고정한다.
+    """
     return dict(node.robot)
 
 
 def get_synced_scan_for_latest_image(node):
-    """latest_image의 header stamp와 가장 가까운 PointCloud2를 반환한다.
+    """latest_image의 촬영 시각과 시간적으로 가장 가까운 PointCloud2를 골라 반환한다.
+
+    카메라와 LiDAR는 서로 다른 주기로 들어오므로, "지금 이미지"에 맞는 scan은
+    최신 scan이 아니라 이미지 stamp에 가장 가까운 scan이다(로봇이 움직이면 그 차이만큼
+    투영이 밀린다). node.scan_buffer에 쌓인 최근 scan들을 순회하며 stamp 차이(dt)가
+    가장 작은 것을 찾는다.
 
     반환:
       scan_msg, dt_sec
-      dt_sec = abs(image_time - scan_time)
+      dt_sec = abs(image_time - scan_time)  (동기화 실패/불가 시 None)
     """
     if node.latest_image is None:
         return node.latest_scan, None
@@ -75,6 +102,8 @@ def get_synced_scan_for_latest_image(node):
     if image_time <= 0.0:
         return node.latest_scan, None
 
+    # 버퍼를 훑어 image_time과 dt가 최소인 scan을 선택한다.
+    # (list()로 복사: 순회 중 콜백이 scan_buffer에 append해도 안전하도록)
     best_scan = None
     best_dt = None
 
@@ -91,8 +120,10 @@ def get_synced_scan_for_latest_image(node):
     if best_scan is None:
         return node.latest_scan, None
 
+    # heartbeat 로그가 참고할 수 있게 마지막 동기화 오차를 노드에 기록한다.
     node.last_sync_dt = best_dt
 
+    # dt가 너무 크면(로봇이 그만큼 움직였을 수 있어) 투영이 부정확해질 수 있으므로 경고.
     if best_dt > config.SYNC_WARN_TIME_DIFF_SEC:
         node.get_logger().warn(
             f"[Sync] image-scan dt is large: {best_dt:.3f}s "
@@ -105,11 +136,18 @@ def get_synced_scan_for_latest_image(node):
 
 
 def get_scan_points_in_map(node, log_tag="Helper"):
-    """image stamp와 가장 가까운 PointCloud2를 map frame으로 변환해서 반환한다.
+    """image stamp와 가장 가까운 PointCloud2를 골라 map frame의 3D 점들로 변환해 반환한다.
 
-    handlers/object_reference.py와 handlers/numerical.py가 공용으로 쓴다
+    흐름: get_synced_scan_for_latest_image()로 동기화된 scan 선택
+        → pointcloud_to_xyz()로 (N,3) xyz 배열 파싱
+        → transformer.transform_points()로 sensor frame → map frame 변환.
+    변환에는 scan.header.stamp를 넘겨서 "그 scan을 찍은 시각"의 TF를 쓴다
+    (추론이 오래 걸려도 캡처 시점 기준으로 투영되도록 — 회전 중 밀림 방지).
+
+    t3_object_reference_solver와 t2_numerical_solver가 공용으로 쓴다
     (원래 object_reference.py에만 있던 걸 옮김 — 둘 다 똑같은 sync+변환이 필요함).
     log_tag는 로그 접두어만 다르게 하려는 용도(예: "ObjectRef", "Numerical").
+    실패 시(스캔 없음/파싱 실패/TF 실패) None을 반환한다.
     """
     log = node.get_logger()
 
@@ -132,6 +170,8 @@ def get_scan_points_in_map(node, log_tag="Helper"):
         log.error(f"[{log_tag}] point cloud parsing failed: {error}")
         return None
 
+    # 어느 frame의 점인지: 메시지에 frame_id가 있으면 그걸 쓰고,
+    # 비어 있으면 기본 센서 frame으로 가정한다.
     source_frame = scan_msg.header.frame_id
     if source_frame is None or source_frame == "":
         source_frame = config.FRAME_SENSOR
@@ -154,7 +194,13 @@ def get_scan_points_in_map(node, log_tag="Helper"):
 
 
 def heartbeat(node):
-    """현재 노드 상태 확인용 로그."""
+    """노드가 살아있고 무엇을 받고 있는지 주기적으로 찍는 상태 로그.
+
+    타이머로 주기 호출되며, 지금까지 받은 이미지/스캔 수, 현재 로봇 pose,
+    마지막 image-scan 동기화 오차(sync_dt), 그리고 각 모델(detector/selector/segmenter)의
+    로드 상태(ok/loading/disabled)를 한 줄로 출력한다. 모델이 계속 loading이면
+    로드 실패를, 카운트가 안 늘면 센서 토픽이 안 들어옴을 이 로그로 진단할 수 있다.
+    """
     detector_state = "ok" if node.detector is not None else "loading"
     if not config.ENABLE_QWEN_SELECTOR:
         selector_state = "disabled"
@@ -172,4 +218,8 @@ def heartbeat(node):
 
 
 def stamp_to_sec(stamp):
+    """ROS2 Time 메시지(sec + nanosec)를 float 초 단위로 합쳐서 반환한다.
+
+    이미지/스캔 stamp를 하나의 실수로 만들어 dt 비교(동기화)에 쓰기 위한 헬퍼.
+    """
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9

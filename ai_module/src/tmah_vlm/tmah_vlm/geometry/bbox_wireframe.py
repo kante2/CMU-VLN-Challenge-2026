@@ -4,7 +4,7 @@ axis-aligned 3D box(center, size) -> 테두리(wireframe) 선분 좌표.
 
 RViz Marker(LINE_LIST)로 그리면 반투명 CUBE보다 물체 경계가 뚜렷하게 보이고,
 뒤에 있는 point cloud/mesh를 가리지 않는다. ROS 메시지 타입은 모르는
-순수 geometry 유틸이고, 실제 Marker 메시지 조립은 handlers/object_reference.py에서 한다.
+순수 geometry 유틸이고, 실제 Marker 메시지 조립은 t3_object_reference_solver/publish.py에서 한다.
 """
 
 

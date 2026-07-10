@@ -52,28 +52,31 @@ setfacl -R -d -m u:1001:rwx  ai_module/debug
   `ros2 run tf2_ros tf2_echo sensor camera`로 라이브 TF 실측해서 확인함 (0.85는 틀린 값이었음,
   회전 쿼터니언은 원래 맞았음). fallback이라 평소엔 안 쓰이지만 live TF 준비 안 된 순간엔 이 값이 씀.
 
-**회전 중 TF 어긋나는 버그** (`tf/coordinate_transform.py`)
+**회전 중 TF 어긋나는 버그** (`geometry/coordinate_transform.py`, 구 `tf/`)
 - 원인: `get_matrix()`가 항상 `Time()`(=최신)으로 TF 조회. GroundingDINO+Qwen 추론에
   수백ms~수초 걸리는데, 그 사이 로봇이 회전하면 "센서 캡처 시각"이 아니라 "추론 끝난 시각"의
   TF를 써서 투영이 밀림 (정지 상태에선 안 드러남).
 - 수정: `get_matrix`/`transform_point`/`transform_points`/`transform_direction`/
   `get_frame_origin`에 `stamp` 파라미터 추가. 스캔 관련은 `scan_msg.header.stamp`, camera ray
   관련은 `image_stamp` 사용. 캡처 시각 TF가 없으면 최신 TF → static fallback 순으로 degrade.
-  `handlers/object_reference.py`의 `prepare_image()`가 이미지와 stamp를 같은 스냅샷에서
-  같이 꺼내는 것도 이 때문(콜백이 계속 최신값으로 덮어쓰므로 따로 읽으면 어긋남).
+  `t3_object_reference_solver/t3_object_reference.py`의 `grab_camera_image()`(구
+  `prepare_image()`)가 이미지와 stamp를 같은 스냅샷에서 같이 꺼내는 것도 이 때문
+  (콜백이 계속 최신값으로 덮어쓰므로 따로 읽으면 어긋남).
 
-**좌표 재구성 방식 개선** (`grounding/projector.py`)
+**좌표 재구성 방식 개선** (`geometry/projector.py`, 구 `grounding/`)
 - 기존: "box 중심 ray * median depth"로 좌표 재구성 (물체가 정확히 ray 위에 있다고 가정).
 - 변경: `weighted_centroid_target()`이 선택된 depth cluster의 **실제 3D point들의 weighted
   centroid**를 사용 (가중치는 depth bin 선택에 쓰던 `center_ray_weights` 재사용).
 
-## 3D bounding box 크기 추정 — `bbox3d/` (2026-07-09 신규)
+## 3D bounding box 크기 추정 — `geometry/bbox_*` (2026-07-09 신규, 07-10 `geometry/`로 이동)
 
 RViz marker가 원래 크기를 몰라서 고정 0.4m 큐브였음. 이제:
-- `bbox3d/estimator.py`: 선택된 cluster point들의 5~95 percentile 범위로 robust 크기 추정
-  (min/max 그대로 쓰면 이상치 point 하나에 박스가 확 커짐). `config.BBOX3D_*`로 튜닝
-  (`MIN_POINTS`, `PERCENTILE`, `MIN_SIZE_M`/`MAX_SIZE_M`, 추정 실패 시 `DEFAULT_SIZE_M`).
-- `bbox3d/wireframe.py`: center+size → 12개 모서리 `LINE_LIST` 좌표(24점) 생성.
+- `geometry/bbox_estimator.py`(구 `bbox3d/estimator.py`): 선택된 cluster point들의 5~95
+  percentile 범위로 robust 크기 추정 (min/max 그대로 쓰면 이상치 point 하나에 박스가 확 커짐).
+  `config.BBOX3D_*`로 튜닝 (`MIN_POINTS`, `PERCENTILE`, `MIN_SIZE_M`/`MAX_SIZE_M`,
+  추정 실패 시 `DEFAULT_SIZE_M`).
+- `geometry/bbox_wireframe.py`(구 `bbox3d/wireframe.py`): center+size → 12개 모서리
+  `LINE_LIST` 좌표(24점) 생성.
 
 ## RViz marker 토픽 — `/selected_object_marker`는 절대 `MarkerArray`로 바꾸지 말 것
 
@@ -86,26 +89,87 @@ LaserScan/PointCloud2 미스매치 때와 같은 패턴). `ros2 topic info <topi
 
 현재 구조: `/selected_object_marker`는 `Marker`(CUBE, 초록) 그대로 유지, wireframe은
 별도 토픽 `/selected_object_marker_wireframe`(`Marker`, `LINE_LIST`)로 분리해서 발행.
+발행 코드는 `t3_object_reference_solver/publish.py`의 `publish_object_marker()`
+(구 `handlers/object_reference.py`의 `publish_marker()`).
 
-## 코드 구조 리팩터링 (2026-07-09)
+## 코드 구조 리팩터링 (2026-07-09~10)
 
-폴더를 기능별로 분리하고, 클래스 메서드 대신 **`node`를 인자로 받는 자유 함수** 패턴으로
-통일함 (다른 프로젝트의 C++ 스타일 — Process 함수가 이름 있는 함수들을 flat하게 순서대로
-호출하는 패턴 — 을 참고).
+`ai_module/src/tmah_vlm/tmah_vlm/` 전체 구조. 클래스 메서드 대신 **`node`를 인자로 받는
+자유 함수** 패턴 (C++ 스타일 — Process 함수가 이름 있는 함수들을 flat하게 순서대로 호출).
+전체 개요는 저장소 루트 `readme_kante.md`의 "tmah_vlm 코드 구조" 섹션 참고.
 
-- `initialize/setup.py` — `TmahVLM.__init__()`이 부르는 `initialize_state/modules/
-  subscribers/publishers/timers` + `load_models`
-- `callback/sensor_callbacks.py` — 센서/질문 콜백 (최신값 저장만)
-- `helper/node_helpers.py` — `main_control_loop`와 `handlers/*.py`가 공용으로 쓰는
-  상태 조회 함수 (`get_robot_pose`, `get_synced_scan_for_latest_image`, `heartbeat` 등)
-- `handlers/*.py` — 진입점 함수명 통일: `handle` → `object_reference_process` /
-  `numerical_process` / `instruction_process` (파일 이름 = 함수 이름 접두어)
-- `vlm_node.py`는 이제 이 함수들을 부르는 "조립"만 함 (453줄 → 171줄)
-- 죽은 코드 삭제: `grounding/panorama.py`, `grounding/projector_backup_0708_2014.py`
-  (아무 데서도 안 쓰던 파일)
+**진입점 / 질문 흐름**
+- `main_node.py`(구 `vlm_node.py`) — 조립 + `main_control_loop` + `dispatch_question`만.
+  질문은 `node/callbacks.py`의 `question_callback`이 저장만 → 0.2초 타이머
+  `main_control_loop`이 꺼내 → `dispatch_question`이 첫 단어로 분기(find / how many·count / 그 외).
 
-새 기능 추가할 때는 이 패턴 유지: 폴더 하나 = 기능 하나, 함수는 `node`를 명시적으로 받고,
-진입점은 `<파일이름>_process(node, ...)` 형태로.
+**질문 유형별 solver (구 `handlers/`)** — 폴더 하나 = 유형 하나
+- `t1_instruction_solver/`(instruction_process, stub) / `t2_numerical_solver/`
+  (numerical_process) / `t3_object_reference_solver/`(object_reference_process + `publish.py`)
+- 각 `*_process`는 **조건문 + 함수 호출만** 나열 (함수 이름 = 파이프라인 순서).
+- **context 구조체 + 출력-인자 스타일**: `node/context.py`의 `make_*_context()` 팩토리 함수가
+  작업변수를 다 담은 ctx(SimpleNamespace 구조체 — 클래스 아님)를 질문마다 새로 만들고, 각 스텝
+  함수는 ctx를 받아 **자기 필드 하나만 채운다**(return 대신 인자
+  업데이트) → 다음 함수가 그 필드를 읽어 씀. `x = get_something(node)`처럼 함수 안에서 값을
+  뽑아 쓰지 않고, 중간값(예: robot_pose)도 ctx 필드로 올려 전용 스텝으로 분리한다.
+
+**노드 뼈대 → `node/` (07-10에 4개 1-파일 폴더를 통합)**
+- `node/setup.py`(구 `initialize/setup.py`, 초기화·모델 백그라운드 로딩)
+- `node/callbacks.py`(구 `callback/sensor_callbacks.py`, 센서/질문 콜백 — 저장만)
+- `node/helpers.py`(구 `helper/node_helpers.py`, solver 공용 상태조회:
+  `get_robot_pose`, `get_synced_scan_for_latest_image`, `heartbeat` 등)
+- `node/context.py`(solver별 ctx 생성 함수 `make_*_context()`, SimpleNamespace 반환)
+
+**도메인 폴더 (07-10: 1-파일 폴더 9개를 4개로 통합, top-level 15개 → 9개)**
+- `perception/` = 구 perception + segmentation(segmenter) + reasoning(selector) — 2D 인식
+- `geometry/` = 구 tf + grounding + bbox3d — 3D 기하 (`coordinate_transform`, `projector`,
+  `bbox_estimator`, `bbox_wireframe`)
+- `spatial/` = 구 spatial_reasoning + object_filter — 공간관계 파싱·필터
+- `graph/`, `sort3d/` = 파일 많은 진짜 서브시스템이라 그대로 유지
+
+**새 기능 추가 규칙**: 폴더 하나 = 도메인 하나, 함수는 `node`를 명시적으로 받고, solver
+진입점은 `<파일이름>_process(node, question)` + ctx(출력-인자) 패턴 유지.
+
+죽은 코드 삭제(07-09): `grounding/panorama.py`, `grounding/projector_backup_0708_2014.py`.
+
+주의: 구조가 크게 바뀌었으니 컨테이너에서 `colcon build --symlink-install` 한 번 재실행 후
+`ros2 launch tmah_vlm tmah_vlm.launch`로 확인할 것.
+
+## SAM 세그멘테이션 핑크가 안 나오던 문제 (2026-07-10, 해결됨)
+
+증상: 오버레이 디버그 이미지(`proj_*.jpg`)에 세그멘테이션 실루엣(마젠타/핑크)이 안 뜨고,
+3D method가 `segmentation_mask_*`가 아니라 `bbox_ray_bundle_*`(폴백)로 떨어짐. heartbeat엔
+`segmenter=ok`라 정상처럼 보임. 원인이 2개 겹쳐 있었고 **둘 다 별개**로 잡아야 했음.
+
+### 1. GPU Out of Memory (진짜 원인)
+7.52GB GPU에 GroundingDINO + Qwen2.5-VL이 이미 ~6.2GB 상주. SAM 로드는 되지만
+**추론(`segment()`) 시점에 768MB를 못 잡아 매 호출 CUDA OOM** → 예외 → 마스크 None →
+핑크 없음 + ray 폴백. `segment_selected_object`가 예외를 조용히 삼켜 로그로만 티가 났음
+(진단용으로 성공/미로딩/예외+traceback을 매 쿼리 찍도록 로그 보강해둠).
+→ **SAM만 CPU로** 돌려 해결: `config.SEGMENTATION_DEVICE = "cpu"` 추가 →
+`node/setup.py`의 `SAMSegmenter(device=config.SEGMENTATION_DEVICE)`로 전달.
+세그멘테이션은 쿼리당 1회라 CPU로 ~4.5초는 감수 가능. GPU 여유 생기면 `"cuda"`로 되돌리면 됨.
+확인법: 로드 시 `SAM segmenter loaded (device=cpu)`, 쿼리 시 `[ObjectRef] segmentation mask ok: ...px`,
+method가 `segmentation_mask_centroid_mode`, 오버레이 범례에 `magenta=segmentation mask`.
+
+### 2. `install/`이 stale 복사본 — 오늘 수정이 하나도 안 돌고 있었음
+`--symlink-install`인데도 `install/.../site-packages/`에 예전 plain-build 때의 `tmah_vlm/`
+**복사 디렉터리**(구조: `handlers/`, `vlm_node.py` = 리팩터 전)가 남아 egg-link(→build)를
+가리고 있었음. 그래서 노드가 하루 종일 Jul-9 옛 코드를 돌렸고 오늘 수정이 전혀 반영 안 됨.
+→ **클린 재빌드**로 해결: `rm -rf build/tmah_vlm install/tmah_vlm && colcon build --symlink-install --packages-select tmah_vlm`
+
+**중요(CLAUDE.md 기존 설명 정정)**: 이 환경의 `--symlink-install`은 python 모듈을 **복사본으로**
+깐다(`build/tmah_vlm/tmah_vlm/*.py`가 symlink 아님, `readlink`로 확인). 즉 "재빌드 없이 즉시 반영"은
+**안 맞음** — src 수정 후엔 매번 `colcon build --symlink-install --packages-select tmah_vlm` 필요.
+
+### 3. orphan 프로세스가 GPU를 물고 안 죽음
+`pkill`이나 창 닫기로 노드를 죽이면 launch가 띄운 자식 python 프로세스가 init으로 reparent돼
+살아남아 GPU(~6GB)를 계속 점유 → 다음 실행이 무조건 OOM("Process NNN has 6.19 GiB in use").
+→ 재시작 전 반드시 확인·정리:
+```bash
+docker exec iros2026_tmah_module bash -lc "nvidia-smi --query-compute-apps=pid,used_memory --format=csv"
+# 남은 pid 있으면 명시적으로: kill -9 <pid> (pkill로 안 죽는 경우 있음)
+```
 
 ## 알 수 없는 파일 변경 — 미해결
 

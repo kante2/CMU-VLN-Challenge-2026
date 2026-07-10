@@ -2,8 +2,8 @@
 """
 센서/질문 콜백 — 전부 "최신값 저장"만 한다. 무거운 VLM 추론은 여기서 절대 안 돈다.
 
-initialize/setup.py의 initialize_subscribers()가 이 함수들을 구독 콜백으로 등록한다.
-(node를 인자로 받는 자유 함수라 handlers/*.py의 handle(node, ...)와 같은 패턴이다.)
+node/setup.py의 initialize_subscribers()가 이 함수들을 구독 콜백으로 등록한다.
+(node를 인자로 받는 자유 함수라 solver들의 *_process(node, ...)와 같은 패턴이다.)
 """
 
 import math

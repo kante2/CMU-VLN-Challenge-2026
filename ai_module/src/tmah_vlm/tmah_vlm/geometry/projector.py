@@ -13,9 +13,9 @@
   3D target으로 사용한다.
 
 역할 분리:
-  - tf/coordinate_transform.py: camera/sensor/map 좌표 변환
+  - geometry/coordinate_transform.py: camera/sensor/map 좌표 변환
   - projector.py: 이미지 픽셀 <-> camera ray, 2D box 기반 3D point 선택
-  - bbox3d/estimator.py: 선택된 point들로 물체의 3D bounding box(크기) 추정
+  - geometry/bbox_estimator.py: 선택된 point들로 물체의 3D bounding box(크기) 추정
 """
 
 import math
@@ -24,7 +24,7 @@ import numpy as np
 import sensor_msgs_py.point_cloud2 as pc2
 
 from tmah_vlm import config
-from tmah_vlm.bbox3d.estimator import estimate_object_bbox
+from tmah_vlm.geometry.bbox_estimator import estimate_object_bbox
 
 
 def pointcloud_to_xyz(scan_msg):
@@ -675,7 +675,7 @@ def box_to_3d(
     image_stamp: 이 box가 나온 이미지의 캡처 시각(msg.header.stamp).
       로봇 회전 중 TF가 "최신" 값으로 어긋나는 걸 막기 위해 camera ray/origin은
       이 시각의 TF를 우선 사용한다.
-    segmentation_mask: segmentation/segmenter.py가 만든 HxW bool mask.
+    segmentation_mask: perception/segmenter.py가 만든 HxW bool mask.
       있으면 box 대신 이 실루엣 안 point를 우선 사용한다 (없으면 box로 대체).
     """
     image_width, image_height = image_size
