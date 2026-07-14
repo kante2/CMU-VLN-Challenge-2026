@@ -4,12 +4,12 @@
 import json
 import re
 
-from tmah_vlm.sort3d.actions import go_between, go_near
-from tmah_vlm.sort3d.captioner import attach_rule_captions
-from tmah_vlm.sort3d.filters import filter_relevant_objects
-from tmah_vlm.sort3d.object_list import load_object_list
-from tmah_vlm.sort3d.objects import Sort3DObject, normalize_text
-from tmah_vlm.sort3d.toolbox import SpatialToolbox
+from tmah_vlm.sort3d.reasoning.actions import go_between, go_near
+from tmah_vlm.sort3d.caption.captioner import attach_rule_captions
+from tmah_vlm.sort3d.reasoning.filters import filter_relevant_objects
+from tmah_vlm.sort3d.data.object_list import load_object_list
+from tmah_vlm.sort3d.data.objects import Sort3DObject, normalize_text
+from tmah_vlm.sort3d.reasoning.toolbox import SpatialToolbox
 
 
 class Sort3DLite:
@@ -62,15 +62,25 @@ class Sort3DLite:
     def relevant_objects(self, instruction):
         return filter_relevant_objects(self.objects, instruction)
 
-    def select_target(self, instruction):
+    def select_target(self, instruction, robot_pose=None):
         """
         Deterministic first-pass selector for common challenge phrases.
+
+        robot_pose(dict: x/y/z/yaw)는 left/right/behind 판정의 기준(viewer_point/yaw)으로
+        쓰인다. 안 넘기면 원점(0,0,0)/yaw=0을 기준으로 판정한다(호출부인
+        sort3d/runtime.py가 항상 실제 로봇 pose를 넘겨준다).
 
         Returns a dict with candidate ids and the tool that was used. This is a
         fallback and a scaffold for plugging in an LLM tool-calling planner.
         """
         text = normalize_text(instruction)
         relevant, terms = self.relevant_objects(text)
+
+        viewer_point = (
+            (robot_pose["x"], robot_pose["y"], robot_pose.get("z", 0.0))
+            if robot_pose else (0.0, 0.0, 0.0)
+        )
+        viewer_yaw = robot_pose["yaw"] if robot_pose else 0.0
 
         relation_args = self._parse_relation_args(text, terms)
 
@@ -93,19 +103,19 @@ class Sort3DLite:
             ids = self.toolbox.furthest_from(target, anchor)
             return self._result("furthest_from", ids[:1], terms, relevant)
 
-        for relation, method in [
-            ("near", self.toolbox.find_near),
-            ("on", self.toolbox.find_above),
-            ("above", self.toolbox.find_above),
-            ("below", self.toolbox.find_below),
-            ("left of", self.toolbox.find_left),
-            ("right of", self.toolbox.find_right),
-            ("behind", self.toolbox.find_behind),
+        for relation, tool_name, method in [
+            ("near", "find_near", lambda t, a: self.toolbox.find_near(t, a)),
+            ("on", "find_above", lambda t, a: self.toolbox.find_above(t, a)),
+            ("above", "find_above", lambda t, a: self.toolbox.find_above(t, a)),
+            ("below", "find_below", lambda t, a: self.toolbox.find_below(t, a)),
+            ("left of", "find_left", lambda t, a: self.toolbox.find_left(t, a, viewer_point)),
+            ("right of", "find_right", lambda t, a: self.toolbox.find_right(t, a, viewer_point)),
+            ("behind", "find_behind", lambda t, a: self.toolbox.find_behind(t, a, viewer_yaw)),
         ]:
             if relation in text and len(terms) >= 2:
                 target, anchor = relation_args[:2] if len(relation_args) >= 2 else terms[:2]
                 ids = method(target, anchor)
-                return self._result(method.__name__, ids, terms, relevant)
+                return self._result(tool_name, ids, terms, relevant)
 
         ids = [obj.object_id for obj in relevant if terms and terms[0] in obj.text_blob()]
         if not ids and relevant:

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Runtime bridge from the live scene graph to SORT3D-lite reasoning."""
+"""Runtime bridge from the live scene graph to SORT3D-lite reasoning.
 
-from geometry_msgs.msg import Point, Pose2D
-from visualization_msgs.msg import Marker
+marker/waypoint 발행은 sort3d/publish.py로 분리했다.
+"""
 
-from tmah_vlm import config
-from tmah_vlm.geometry.bbox_wireframe import wireframe_edge_points
-from tmah_vlm.node.helpers import get_robot_pose
+from tmah_vlm.common.helpers import get_robot_pose
 from tmah_vlm.sort3d.pipeline import Sort3DLite
+from tmah_vlm.sort3d.publish import publish_sort3d_result
 
 
 RELATION_WORDS = (
@@ -40,7 +39,8 @@ def try_sort3d_graph_fallback(node, question):
         log.info("[SORT3D] graph fallback skipped: scene graph is empty")
         return False
 
-    selection = sort3d.select_target(question)
+    robot_pose = get_robot_pose(node)
+    selection = sort3d.select_target(question, robot_pose)
     candidate_ids = selection.get("candidate_ids", [])
     if not candidate_ids:
         log.info(f"[SORT3D] graph fallback found no target: {selection}")
@@ -51,7 +51,7 @@ def try_sort3d_graph_fallback(node, question):
         log.info(f"[SORT3D] graph fallback target missing: {selection}")
         return False
 
-    waypoint = sort3d.action_for_selection(selection, get_robot_pose(node))
+    waypoint = sort3d.action_for_selection(selection, robot_pose)
     if waypoint is None:
         log.info(f"[SORT3D] graph fallback could not make waypoint: {selection}")
         return False
@@ -63,62 +63,3 @@ def try_sort3d_graph_fallback(node, question):
         f"{waypoint['y']:.2f}, {waypoint['heading']:.2f})"
     )
     return True
-
-
-def publish_sort3d_result(node, target, waypoint):
-    stamp = node.get_clock().now().to_msg()
-    node.marker_pub.publish(make_sort3d_cube_marker(stamp, target))
-    node.wireframe_marker_pub.publish(make_sort3d_wireframe_marker(stamp, target))
-    publish_waypoint(node, waypoint)
-
-
-def publish_waypoint(node, waypoint):
-    # 접근 waypoint(dict)를 Pose2D로 발행한다.
-    msg = Pose2D()
-    msg.x = float(waypoint["x"])
-    msg.y = float(waypoint["y"])
-    msg.theta = float(waypoint["heading"])
-    node.waypoint_pub.publish(msg)
-
-
-def make_sort3d_cube_marker(stamp, target):
-    marker = Marker()
-    marker.header.frame_id = config.FRAME_MAP
-    marker.header.stamp = stamp
-    marker.ns = "sort3d_selected_object"
-    marker.id = 0
-    marker.type = Marker.CUBE
-    marker.action = Marker.ADD
-    marker.pose.position.x = float(target.center[0])
-    marker.pose.position.y = float(target.center[1])
-    marker.pose.position.z = float(target.center[2])
-    marker.pose.orientation.w = 1.0
-    marker.scale.x = float(target.size[0])
-    marker.scale.y = float(target.size[1])
-    marker.scale.z = float(target.size[2])
-    marker.color.a = 0.75
-    marker.color.r = 1.0
-    marker.color.g = 0.4
-    marker.color.b = 0.05
-    return marker
-
-
-def make_sort3d_wireframe_marker(stamp, target):
-    marker = Marker()
-    marker.header.frame_id = config.FRAME_MAP
-    marker.header.stamp = stamp
-    marker.ns = "sort3d_selected_object"
-    marker.id = 1
-    marker.type = Marker.LINE_LIST
-    marker.action = Marker.ADD
-    marker.pose.orientation.w = 1.0
-    marker.scale.x = 0.025
-    marker.color.a = 1.0
-    marker.color.r = 1.0
-    marker.color.g = 0.8
-    marker.color.b = 0.0
-    marker.points = [
-        Point(x=float(x), y=float(y), z=float(z))
-        for x, y, z in wireframe_edge_points(target.center, target.size)
-    ]
-    return marker

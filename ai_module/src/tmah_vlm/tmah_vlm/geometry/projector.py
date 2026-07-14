@@ -24,7 +24,7 @@ import numpy as np
 import sensor_msgs_py.point_cloud2 as pc2
 
 from tmah_vlm import config
-from tmah_vlm.geometry.bbox_estimator import estimate_object_bbox
+from tmah_vlm.perception.lidar.bbox_estimator import estimate_object_bbox
 
 
 def pointcloud_to_xyz(scan_msg):

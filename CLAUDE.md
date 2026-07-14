@@ -102,28 +102,31 @@ LaserScan/PointCloud2 미스매치 때와 같은 패턴). `ros2 topic info <topi
 - `main_node.py`(구 `vlm_node.py`) — 조립 + `main_control_loop` + `dispatch_question`만.
   질문은 `node/callbacks.py`의 `question_callback`이 저장만 → 0.2초 타이머
   `main_control_loop`이 꺼내 → `dispatch_question`이 첫 단어로 분기(find / how many·count / 그 외).
+  (07-13에 `node/` 폴더 자체가 해체됐음 — 아래 "2차 코드 구조 리팩터링" 섹션 참고.
+  `question_callback`은 이제 `common/callback.py`, `main_timer` 등록은 `main_node.py`의
+  `main()` 함수로 옮김.)
 
 **질문 유형별 solver (구 `handlers/`)** — 폴더 하나 = 유형 하나
 - `t1_instruction_solver/`(instruction_process, stub) / `t2_numerical_solver/`
   (numerical_process) / `t3_object_reference_solver/`(object_reference_process + `publish.py`)
 - 각 `*_process`는 **조건문 + 함수 호출만** 나열 (함수 이름 = 파이프라인 순서).
-- **context 구조체 + 출력-인자 스타일**: `node/context.py`의 `make_*_context()` 팩토리 함수가
+- **context 구조체 + 출력-인자 스타일**: `context/context.py`(구 `node/context.py`)의 `make_*_context()` 팩토리 함수가
   작업변수를 다 담은 ctx(SimpleNamespace 구조체 — 클래스 아님)를 질문마다 새로 만들고, 각 스텝
   함수는 ctx를 받아 **자기 필드 하나만 채운다**(return 대신 인자
   업데이트) → 다음 함수가 그 필드를 읽어 씀. `x = get_something(node)`처럼 함수 안에서 값을
   뽑아 쓰지 않고, 중간값(예: robot_pose)도 ctx 필드로 올려 전용 스텝으로 분리한다.
 
-**노드 뼈대 → `node/` (07-10에 4개 1-파일 폴더를 통합)**
-- `node/setup.py`(구 `initialize/setup.py`, 초기화·모델 백그라운드 로딩)
-- `node/callbacks.py`(구 `callback/sensor_callbacks.py`, 센서/질문 콜백 — 저장만)
-- `node/helpers.py`(구 `helper/node_helpers.py`, solver 공용 상태조회:
-  `get_robot_pose`, `get_synced_scan_for_latest_image`, `heartbeat` 등)
-- `node/context.py`(solver별 ctx 생성 함수 `make_*_context()`, SimpleNamespace 반환)
+**노드 뼈대 → `node/` (07-10에 4개 1-파일 폴더를 통합, 07-13에 다시 해체됨 — 아래 2차 리팩터링 섹션 참고)**
+- ~~`node/setup.py`~~ → `common/initialize.py`
+- ~~`node/callbacks.py`~~ → `common/callback.py` + `perception/camera/callback.py` + `perception/lidar/callback.py`
+- ~~`node/helpers.py`~~ → `common/helpers.py` + `context/helpers.py`
+- ~~`node/context.py`~~ → `context/context.py`
 
-**도메인 폴더 (07-10: 1-파일 폴더 9개를 4개로 통합, top-level 15개 → 9개)**
+**도메인 폴더 (07-10: 1-파일 폴더 9개를 4개로 통합, top-level 15개 → 9개. 07-13에 perception/geometry 다시 일부 변경됨)**
 - `perception/` = 구 perception + segmentation(segmenter) + reasoning(selector) — 2D 인식
-- `geometry/` = 구 tf + grounding + bbox3d — 3D 기하 (`coordinate_transform`, `projector`,
-  `bbox_estimator`, `bbox_wireframe`)
+  (07-13에 `perception/camera/`로 이동, `perception/lidar/`도 신설 — 아래 참고)
+- `geometry/` = 구 tf + grounding + bbox3d — 3D 기하 (`coordinate_transform`, `projector`;
+  `bbox_estimator`/`bbox_wireframe`는 07-13에 `perception/lidar/`로 이동)
 - `spatial/` = 구 spatial_reasoning + object_filter — 공간관계 파싱·필터
 - `graph/`, `sort3d/` = 파일 많은 진짜 서브시스템이라 그대로 유지
 
@@ -147,7 +150,7 @@ LaserScan/PointCloud2 미스매치 때와 같은 패턴). `ros2 topic info <topi
 핑크 없음 + ray 폴백. `segment_selected_object`가 예외를 조용히 삼켜 로그로만 티가 났음
 (진단용으로 성공/미로딩/예외+traceback을 매 쿼리 찍도록 로그 보강해둠).
 → **SAM만 CPU로** 돌려 해결: `config.SEGMENTATION_DEVICE = "cpu"` 추가 →
-`node/setup.py`의 `SAMSegmenter(device=config.SEGMENTATION_DEVICE)`로 전달.
+`common/initialize.py`(구 `node/setup.py`)의 `SAMSegmenter(device=config.SEGMENTATION_DEVICE)`로 전달.
 세그멘테이션은 쿼리당 1회라 CPU로 ~4.5초는 감수 가능. GPU 여유 생기면 `"cuda"`로 되돌리면 됨.
 확인법: 로드 시 `SAM segmenter loaded (device=cpu)`, 쿼리 시 `[ObjectRef] segmentation mask ok: ...px`,
 method가 `segmentation_mask_centroid_mode`, 오버레이 범례에 `magenta=segmentation mask`.
@@ -162,6 +165,18 @@ method가 `segmentation_mask_centroid_mode`, 오버레이 범례에 `magenta=seg
 깐다(`build/tmah_vlm/tmah_vlm/*.py`가 symlink 아님, `readlink`로 확인). 즉 "재빌드 없이 즉시 반영"은
 **안 맞음** — src 수정 후엔 매번 `colcon build --symlink-install --packages-select tmah_vlm` 필요.
 
+**추가(2026-07-13)**: 위 클린 재빌드(`rm -rf build/tmah_vlm install/tmah_vlm && colcon build ...`)가
+`PermissionError: ... hook/ament_prefix_path.ps1`류 에러로 실패할 수 있음. 원인: `build/`, `install/`
+(bind mount 아닌 컨테이너 내부 파일)이 이전에 `root`로 빌드된 적이 있어 `root` 소유로 남아있는데,
+`docker exec`는 기본으로 `docker`(uid 1001) 유저로 들어가서 덮어쓸 권한이 없음.
+→ 재빌드 전에 root로 한 번 지우고 소유권 정리:
+```bash
+docker exec -u root iros2026_tmah_module bash -lc \
+  "rm -rf /home/docker/ai_module/build/tmah_vlm /home/docker/ai_module/install/tmah_vlm && \
+   chown -R docker:docker /home/docker/ai_module/build /home/docker/ai_module/install"
+```
+그다음 평소처럼 (uid 1001로) `colcon build --symlink-install --packages-select tmah_vlm` 실행.
+
 ### 3. orphan 프로세스가 GPU를 물고 안 죽음
 `pkill`이나 창 닫기로 노드를 죽이면 launch가 띄운 자식 python 프로세스가 init으로 reparent돼
 살아남아 GPU(~6GB)를 계속 점유 → 다음 실행이 무조건 OOM("Process NNN has 6.19 GiB in use").
@@ -170,6 +185,50 @@ method가 `segmentation_mask_centroid_mode`, 오버레이 범례에 `magenta=seg
 docker exec iros2026_tmah_module bash -lc "nvidia-smi --query-compute-apps=pid,used_memory --format=csv"
 # 남은 pid 있으면 명시적으로: kill -9 <pid> (pkill로 안 죽는 경우 있음)
 ```
+
+## 2차 코드 구조 리팩터링 — `node/` 해체, `perception/`을 camera·lidar로 분리 (2026-07-13)
+
+목적: `node/` 안에 성격이 다른 코드(초기화, 콜백, 상태조회, ctx생성)가 한 폴더에 섞여있었고,
+`helpers`라는 이름도 무슨 함수가 들어있는지 헷갈렸음. 센서 종류(camera/lidar)별로 나눠서
+어떤 코드가 어느 센서를 다루는지 파일 위치만 보고 알 수 있게 재구조화.
+
+**새 구조**
+- `common/`(구 `node/`) — 특정 센서에 안 속하는 노드 뼈대·수명주기.
+  - `initialize.py`(구 `node/setup.py`) — 초기화·모델 백그라운드 로딩·구독/발행 등록.
+  - `callback.py`(구 `node/callbacks.py`의 일부) — `question_callback`, `pose_callback`
+    (센서별 콜백은 아래 `perception/*/callback.py`로 이동).
+  - `helpers.py`(구 `node/helpers.py`의 일부) — **"get 계열"** 공용 상태 조회:
+    `get_robot_pose`, `get_synced_scan_for_latest_image`, `get_scan_points_in_map`,
+    `heartbeat`, `stamp_to_sec`.
+- `context/`(신규) — 질문 처리 흐름 관련.
+  - `context.py`(구 `node/context.py`, 내용 그대로) — solver별 ctx 생성 함수 `make_*_context()`.
+  - `helpers.py`(구 `node/helpers.py`의 나머지) — **"질문 텍스트/처리 준비 판단"**:
+    `peek_pending_question`, `ready_to_process`, `print_waiting_reason`.
+- `perception/camera/`(구 `perception/`의 기존 6개 파일 그대로 이동) — `detector.py`,
+  `image_utils.py`, `query_parser.py`, `segmenter.py`, `selector.py`, `visualize.py` +
+  `callback.py`(구 `node/callbacks.py`의 `image_callback`).
+- `perception/lidar/`(신규, 구 `geometry/bbox_*.py` 이동) — `bbox_estimator.py`,
+  `bbox_wireframe.py` + `callback.py`(구 `node/callbacks.py`의 `scan_callback`).
+- `geometry/`에는 `coordinate_transform.py`, `projector.py`만 남음 — camera/lidar ray를
+  같이 다루는 공통 기하코드라 perception 밑으로 안 내리고 그대로 유지하기로 결정.
+
+**의사결정 메모**
+- 처음엔 "센서에 안 속하는 공용 인프라" 폴더 이름을 `global/`로 하려 했으나, **`global`은
+  파이썬 예약어라 `from tmah_vlm.global.callback import ...` 같은 dotted import가 SyntaxError
+  가 남**. `common/`으로 변경.
+- `main_control_loop`용 `create_timer(0.2, ...)` 등록 위치를 `TmahVLM.__init__`에서
+  `main_node.py`의 `main()` 함수로 옮김 (`node = TmahVLM(); node.create_timer(0.2,
+  node.main_control_loop)`). `health_timer`/`scene_graph_marker_timer`는 여전히
+  `common/initialize.py`의 `initialize_timers()` 안에 있음 — `main_control_loop`만 예외.
+
+**적용 방법**: `git mv`로 히스토리 유지하며 이동, 전체 import 22곳을 새 경로로 수정,
+`py_compile` + 자체 스크립트로 모든 `tmah_vlm.*` import 경로/심볼 존재 여부 교차검증 완료.
+
+주의: 구조가 또 한 번 크게 바뀌었으니 컨테이너에서 클린 재빌드
+(`rm -rf build/tmah_vlm install/tmah_vlm && colcon build --symlink-install --packages-select tmah_vlm`,
+권한 에러 나면 위 "SAM 세그멘테이션" 섹션의 07-13 추가 항목 참고) 후
+`ros2 launch tmah_vlm tmah_vlm.launch`로 확인할 것. 저장소 루트 `readme_kante.md`의
+"tmah_vlm 코드 구조" 섹션도 아직 이 변경 전 내용이라 별도로 갱신 필요.
 
 ## 알 수 없는 파일 변경 — 미해결
 

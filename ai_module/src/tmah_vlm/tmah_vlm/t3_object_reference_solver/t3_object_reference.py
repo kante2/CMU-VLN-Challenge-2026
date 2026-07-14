@@ -11,10 +11,10 @@ process는 조건문 + 함수 호출만 나열한다 — 함수 이름을 위에
 채우고, 다음 함수가 그 필드를 읽어 이어서 쓴다. 실제 로직은 각 함수 안에 있다.
 """
 
-from tmah_vlm.node.context import make_object_ref_context
-from tmah_vlm.perception.image_utils import ros_image_to_pil
-from tmah_vlm.perception.query_parser import extract_target
-from tmah_vlm.perception.visualize import save_detection_image, save_3d_result_text
+from tmah_vlm.context.context import make_object_ref_context
+from tmah_vlm.perception.camera.image_utils import ros_image_to_pil
+from tmah_vlm.perception.camera.query_parser import extract_target
+from tmah_vlm.perception.camera.visualize import save_detection_image, save_3d_result_text
 from tmah_vlm.geometry.projector import (
     box_to_3d,
     approach_waypoint,
@@ -22,7 +22,7 @@ from tmah_vlm.geometry.projector import (
 )
 from tmah_vlm import config
 from tmah_vlm.graph.runtime import record_object_observation
-from tmah_vlm.node.helpers import get_robot_pose, get_scan_points_in_map
+from tmah_vlm.common.helpers import get_robot_pose, get_scan_points_in_map
 from tmah_vlm.spatial.candidate_filter import filter_candidates_by_relations
 from tmah_vlm.sort3d.runtime import is_relation_query, try_sort3d_graph_fallback
 from tmah_vlm.t3_object_reference_solver.publish import publish_object_result

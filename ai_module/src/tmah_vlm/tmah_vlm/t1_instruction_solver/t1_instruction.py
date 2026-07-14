@@ -12,8 +12,8 @@ process는 조건문 + 함수 호출만 나열한다. 각 스텝 함수는 ctx(m
 
 from geometry_msgs.msg import Pose2D
 
-from tmah_vlm.node.context import make_instruction_context
-from tmah_vlm.node.helpers import get_robot_pose
+from tmah_vlm.context.context import make_instruction_context
+from tmah_vlm.common.helpers import get_robot_pose
 
 
 # ========================================

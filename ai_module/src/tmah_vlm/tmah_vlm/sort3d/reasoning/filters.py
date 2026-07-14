@@ -3,7 +3,7 @@
 
 import re
 
-from tmah_vlm.sort3d.objects import normalize_text
+from tmah_vlm.sort3d.data.objects import normalize_text
 
 
 STOPWORDS = {

@@ -14,11 +14,11 @@ process는 조건문 + 함수 호출만 나열한다. 각 스텝 함수는 ctx(m
 
 from std_msgs.msg import Int32
 
-from tmah_vlm.node.context import make_numerical_context
-from tmah_vlm.perception.image_utils import ros_image_to_pil
-from tmah_vlm.perception.query_parser import extract_target
+from tmah_vlm.context.context import make_numerical_context
+from tmah_vlm.perception.camera.image_utils import ros_image_to_pil
+from tmah_vlm.perception.camera.query_parser import extract_target
 from tmah_vlm.spatial.candidate_filter import filter_candidates_by_relations
-from tmah_vlm.node.helpers import get_scan_points_in_map
+from tmah_vlm.common.helpers import get_scan_points_in_map
 
 
 # ========================================

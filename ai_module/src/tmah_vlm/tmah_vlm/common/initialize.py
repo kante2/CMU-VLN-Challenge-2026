@@ -4,7 +4,8 @@ TmahVLM 노드 초기화 — TmahVLM.__init__()이 순서대로 호출하는 ini
 
   initialize_state       -> 계속 들고 있어야 하는 최신 상태값 초기화
   initialize_modules      -> TF 변환기 준비 + GroundingDINO/Qwen 백그라운드 로딩(load_models)
-  initialize_subscribers  -> ROS subscriber 등록 (콜백 로직은 node/callbacks.py)
+  initialize_subscribers  -> ROS subscriber 등록 (콜백 로직은 common/callback.py,
+                             perception/camera/callback.py, perception/lidar/callback.py)
   initialize_publishers   -> ROS publisher 등록
   initialize_timers       -> 주기 실행 timer 등록
 
@@ -22,13 +23,10 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from tmah_vlm import config
 from tmah_vlm.geometry.coordinate_transform import CoordinateTransformer
-from tmah_vlm.node.callbacks import (
-    question_callback,
-    pose_callback,
-    image_callback,
-    scan_callback,
-)
-from tmah_vlm.node.helpers import heartbeat
+from tmah_vlm.common.callback import question_callback, pose_callback
+from tmah_vlm.perception.camera.callback import image_callback
+from tmah_vlm.perception.lidar.callback import scan_callback
+from tmah_vlm.common.helpers import heartbeat
 from tmah_vlm.graph.visualizer import publish_scene_graph_markers
 
 
@@ -74,7 +72,7 @@ def initialize_modules(node):
 def load_models(node):
     """GroundingDINO, Qwen selector, SAM segmenter를 로드한다 (백그라운드 스레드)."""
     try:
-        from tmah_vlm.perception.detector import GroundingDINODetector
+        from tmah_vlm.perception.camera.detector import GroundingDINODetector
         node.detector = GroundingDINODetector(
             box_threshold=config.BOX_THRESHOLD,
             text_threshold=config.TEXT_THRESHOLD,
@@ -85,7 +83,7 @@ def load_models(node):
 
     if config.ENABLE_QWEN_SELECTOR:
         try:
-            from tmah_vlm.perception.selector import QwenSelector
+            from tmah_vlm.perception.camera.selector import QwenSelector
             node.selector = QwenSelector()
             node.get_logger().info("Qwen selector loaded")
         except Exception as error:
@@ -94,7 +92,7 @@ def load_models(node):
         node.get_logger().info("Qwen selector disabled; using first detection candidate")
 
     try:
-        from tmah_vlm.perception.segmenter import SAMSegmenter
+        from tmah_vlm.perception.camera.segmenter import SAMSegmenter
         node.segmenter = SAMSegmenter(
             model_id=config.SEGMENTATION_MODEL_ID,
             device=config.SEGMENTATION_DEVICE,
@@ -107,7 +105,8 @@ def load_models(node):
 
 
 def initialize_subscribers(node):
-    """ROS subscriber 목록. 실제 콜백 로직은 node/callbacks.py에 있다."""
+    """ROS subscriber 목록. 실제 콜백 로직은 common/callback.py,
+    perception/camera/callback.py, perception/lidar/callback.py에 있다."""
     node.question_sub = node.create_subscription(
         String,
         config.TOPIC_QUESTION,
@@ -168,8 +167,7 @@ def initialize_publishers(node):
 
 
 def initialize_timers(node):
-    """주기적으로 돌아가는 loop."""
-    node.main_timer = node.create_timer(0.2, node.main_control_loop)
+    """주기적으로 돌아가는 loop. main_control_loop 타이머는 main_node.py에서 등록한다."""
     node.health_timer = node.create_timer(3.0, lambda: heartbeat(node))
     node.scene_graph_marker_timer = node.create_timer(
         1.0,

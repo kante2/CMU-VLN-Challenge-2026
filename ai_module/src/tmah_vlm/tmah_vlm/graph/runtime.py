@@ -39,7 +39,7 @@ def get_vlm_captioner(node):
         return node.vlm_captioner
 
     try:
-        from tmah_vlm.sort3d.vlm_captioner import FlorenceCaptioner
+        from tmah_vlm.sort3d.caption.vlm_captioner import FlorenceCaptioner
         node.vlm_captioner = FlorenceCaptioner(
             model_id=getattr(config, "CAPTION_MODEL_ID", "microsoft/Florence-2-base"),
             device=getattr(config, "CAPTION_DEVICE", "cpu"),

@@ -20,7 +20,7 @@ t3_object_reference_solver와 t2_numerical_solver가 공용으로 쓴다.
 from tmah_vlm.geometry.projector import box_to_3d
 from tmah_vlm.spatial import relations as spatial_relations
 from tmah_vlm.spatial.relation_parser import extract_relations, all_referenced_landmarks
-from tmah_vlm.node.helpers import get_robot_pose
+from tmah_vlm.common.helpers import get_robot_pose
 
 
 def localize_candidate_points(node, detections, image_size, scan_points_map, image_stamp):

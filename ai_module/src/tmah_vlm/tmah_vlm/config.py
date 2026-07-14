@@ -104,7 +104,7 @@ SEGMENTATION_MODEL_ID = "facebook/sam-vit-base"
 # 써서(7.5GB GPU 기준 ~350MB만 남음) SAM 추론이 CUDA OOM으로 매번 실패했다.
 # 세그멘테이션은 쿼리당 1회라 CPU로 돌려도 몇 초면 되므로 기본을 "cpu"로 둔다.
 # GPU 여유가 충분한 환경이면 "cuda"로 바꿔도 된다.
-SEGMENTATION_DEVICE = "cpu"
+SEGMENTATION_DEVICE = "cuda"
 
 # -----------------------------------------------------------------------------
 # Spatial reasoning toolbox (spatial/relations.py, SORT-3D Module 4)
