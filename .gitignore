@@ -4,3 +4,6 @@
 
 __pycache__/
 *.pyc
+
+# Unity environment assets (too large for GitHub)
+unity_env_models/*.zip
