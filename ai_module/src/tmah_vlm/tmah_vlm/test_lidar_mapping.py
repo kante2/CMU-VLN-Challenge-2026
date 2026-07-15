@@ -10,6 +10,29 @@ LiDAR 기반 지도(map) 누적 + 자율 탐색(frontier exploration) 테스트 
               로봇이 미탐사 공간을 스스로 돌아다니게 한다. 이동은 기존 base
               autonomy(waypointConverter -> localPlanner -> pathFollower)가 처리하므로
               여기선 "어디로 갈지"만 정해서 /way_point_with_heading으로 넘긴다.
+  (3) 복귀  : 더 갈 frontier가 없으면(=탐색 완료) 시작 지점(home)으로 돌아오고 끝낸다.
+
+페이즈: EXPLORING(frontier 탐색) -> RETURNING(원점 복귀) -> DONE(대기, 맵은 유지).
+복귀를 시작하면 탐색으로 되돌아가지 않는다(돌아가는 길은 이미 본 공간이라 왔다갔다 방지).
+
+--------------------------------------------------------------------------
+완료 조건 (헷갈리기 쉬운 부분이라 여기 요약. 상세는 각 함수 주석 참고)
+--------------------------------------------------------------------------
+"완료"는 2단계이고, 3D voxel 매핑 자체엔 완료 개념이 없다(노드가 살아있는 한 계속 누적).
+
+  [워밍업]  grid_free >= MIN_EXPLORE_FREE_CELLS 가 될 때까지는 판정 자체를 안 한다.
+            (시작 직후엔 TF가 아직 준비 안 돼 스캔이 버려지고 격자가 비어 있는데,
+             그걸 'frontier 0개 = 완료'로 오판하면 로봇이 영영 목표를 못 받는다.)
+        |
+  [1단계] 탐색 완료  : select_frontier_goal()이 None을 NO_FRONTIER_CONFIRM번 "연속"
+                       반환 -> start_return_home(). 제어주기가 1초라 약 5초.
+                       (한 번 None이라고 바로 끝내면 노이즈로 조기 종료된다.)
+        |
+  [2단계] 최종 완료  : 원점까지 REACH_THRESH_M 안으로 도착 -> DONE.
+                       (또는 RETURN_TIMEOUT_S 초과 시 포기하고 DONE.)
+
+주의: "완료"는 "지도 100%"가 아니라 "쫓아갈 만한 미탐사 경계가 없음"이다. blacklist가
+쌓이거나(실패 지점) 격자 범위(±GRID_HALF_EXTENT_M) 밖이면 갈 곳이 남아도 완료로 뜬다.
 
 이건 TARE 같은 무거운 탐사 플래너 없이, 이 테스트 스크립트 안에서 자족적으로 도는
 가벼운 frontier 탐색이다. "먼저 스크립트로 검증 -> 잘 되면 본 파이프라인에 통합"
@@ -86,8 +109,8 @@ SMALL_FRONTIER_CELLS = 2       # 큰 게 없을 때 문/좁은 통로(작은 fro
 BLACKLIST_RADIUS_M = 1.5       # 실패한 목표 근처는 당분간 다시 안 고름.
 MIN_EXPLORE_FREE_CELLS = 200   # free 셀이 이만큼 쌓이기 전엔 완료 판정 보류.
                                # (시작 직후 TF 준비 전 빈 격자로 '완료' 오판되는 것 방지)
-NO_FRONTIER_CONFIRM = 5        # frontier가 이만큼 연속 tick 없을 때만 '완료' 로그(노이즈 방지).
-                               # 래치 아님 — 이후 frontier 생기면 자동 재개.
+NO_FRONTIER_CONFIRM = 5        # frontier가 이만큼 연속 tick 없으면 탐색 완료로 보고 복귀 시작.
+RETURN_TIMEOUT_S = 90.0        # 원점 복귀를 이 시간 안에 못 하면 포기하고 대기.
 
 
 class LidarMappingNode(Node):
@@ -129,7 +152,11 @@ class LidarMappingNode(Node):
         self.goal_best_dist = np.inf
         self.goal_last_progress_time = 0.0
         self.blacklist = []               # 실패한 목표 world xy 리스트
-        self.no_frontier_count = 0        # 연속 no-frontier tick 수 (완료 로그 판정용)
+        self.no_frontier_count = 0        # 연속 no-frontier tick 수 (탐색 완료 판정용)
+
+        # 페이즈: EXPLORING(탐색) -> RETURNING(원점 복귀) -> DONE(대기)
+        self.phase = "EXPLORING"
+        self.home_xy = None               # 시작 지점(복귀 목표). 첫 pose에서 기록.
 
         qos_sensor = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -346,9 +373,24 @@ class LidarMappingNode(Node):
         self._mark(self.grid_free, cells)
 
     def compute_frontier(self):
-        """free 이면서 4-이웃에 unknown이 있는 셀 = frontier."""
+        """frontier = "지금까지 본 빈 공간"과 "아직 못 본 공간"이 맞닿은 셀.
+
+        격자 각 칸은 3가지 상태 중 하나다 (free/occ 두 bool의 조합으로 표현):
+          free_only : 관측했고 비어 있음    (grid_free 이고 grid_occ 아님)
+          occupied  : 벽/장애물             (grid_occ)      <- 여기선 못 지나감
+          unknown   : 아직 한 번도 못 봄    (free도 occ도 아님)
+
+        frontier는 "free_only 이면서 4-이웃 중에 unknown이 있는 칸"이다. 즉 내가 서 있을
+        수 있는 빈 공간의 가장자리인데 그 너머는 아직 모르는 곳 -> 저기로 가면 새 공간이
+        보인다. 그래서 탐색은 "frontier로 계속 가는 것"이고, 반대로 frontier가 하나도
+        없다 = 더 볼 게 없다 = 탐색 완료다.
+
+        벽에 붙은 free 칸은 이웃이 occupied라서 frontier가 아니다(넘어갈 수 없으니 당연).
+        열린 문/센서 사거리 끝처럼 unknown과 직접 맞닿은 곳만 frontier가 된다.
+        """
         free_only = self.grid_free & ~self.grid_occ
         unknown = ~self.grid_free & ~self.grid_occ
+        # 상/하/좌/우로 한 칸씩 밀어서 OR -> "이웃에 unknown이 하나라도 있나"를 한 번에 계산.
         neigh = np.zeros_like(unknown)
         neigh[:-1, :] |= unknown[1:, :]
         neigh[1:, :] |= unknown[:-1, :]
@@ -357,14 +399,24 @@ class LidarMappingNode(Node):
         return free_only & neigh
 
     def select_frontier_goal(self, robot_xy):
-        """frontier 덩어리 중 가장 좋은 것의 대표점을 world xy로 반환. 없으면 None.
+        """다음에 갈 frontier 목표를 world xy로 반환. 갈 곳이 없으면 None.
 
-        점수 = 덩어리 크기 / (1 + 로봇까지 거리) — 크고 가까운 곳 선호.
-        blacklist(실패 지점) 근처는 제외.
+        ★ 이 함수가 None을 반환하는 것이 곧 "탐색 완료" 판정의 근거다
+          (exploration_tick이 이게 NO_FRONTIER_CONFIRM번 연속되면 복귀를 시작한다).
+
+        None이 되는 경우는 셋 중 하나 — 하나라도 아니면 탐색은 계속된다:
+          1. frontier 셀이 아예 0개        : 본 빈 공간의 모든 경계가 벽이거나 이미 다 봄.
+          2. 남은 덩어리가 전부 너무 작음  : SMALL_FRONTIER_CELLS 미만은 노이즈로 무시.
+          3. 남은 덩어리가 전부 blacklist  : 가려다 실패(타임아웃/막힘)한 지점 근처.
+
+        고르는 기준: 점수 = 덩어리 크기 / (1 + 로봇까지 거리) -> 크고 가까운 곳을 선호.
+        단 2단계로 본다. 큰 덩어리(>=MIN_FRONTIER_CELLS)를 우선 노리되, 그런 게 하나도
+        없으면 작은 덩어리(>=SMALL_FRONTIER_CELLS)라도 노린다. 문/좁은 통로의 frontier는
+        몇 칸밖에 안 돼서, 큰 것만 고집하면 옆방으로 못 넘어가고 조기 종료돼 버린다.
         """
         frontier = self.compute_frontier()
         if not frontier.any():
-            return None
+            return None  # (1) 미탐사 경계 자체가 없음 -> 완료 후보
 
         num, labels = cv2.connectedComponents(frontier.astype(np.uint8))
         # 2단계 선택: 우선 큰 덩어리(>=MIN_FRONTIER_CELLS), 없으면 문/좁은통로 같은
@@ -375,14 +427,14 @@ class LidarMappingNode(Node):
             pts = np.argwhere(labels == lbl)          # (P,2) = [ix, iy]
             n = len(pts)
             if n < SMALL_FRONTIER_CELLS:
-                continue
+                continue  # (2) 너무 작은 덩어리 = 노이즈로 보고 버림
             centroid = pts.mean(axis=0)
             # centroid에 가장 가까운 실제 frontier 셀로 스냅(목표가 격자 안 유효점이 되도록).
             target_cell = pts[np.argmin(((pts - centroid) ** 2).sum(axis=1))]
             goal_xy = self.cell_to_world(target_cell)
 
             if self._is_blacklisted(goal_xy):
-                continue
+                continue  # (3) 전에 가려다 실패한 곳 -> 다시 시도해봐야 또 막힘
 
             dist = float(np.linalg.norm(goal_xy - robot_xy))
             score = n / (1.0 + dist)
@@ -401,18 +453,37 @@ class LidarMappingNode(Node):
         return False
 
     def exploration_tick(self):
-        """탐색 상태 기계: 목표 감시(도착/막힘/타임아웃) + 없으면 새 목표 선정."""
+        """페이즈 상태기계: EXPLORING -> RETURNING(원점 복귀) -> DONE. 1초마다 호출.
+
+        읽는 순서:
+          1) home 기록 (첫 pose = 시작 지점 = 나중에 돌아올 곳)
+          2) 페이즈 분기 (DONE이면 아무것도 안 함 / RETURNING이면 복귀만)
+          3) EXPLORING: 워밍업 대기 -> 현재 목표 감시 -> 없으면 새 frontier 목표 선정
+             -> 그것도 없으면(연속 N회) 탐색 완료로 보고 복귀 시작
+        """
         if self.latest_pose is None:
             return
 
+        robot_xy = np.array([self.latest_pose.position.x, self.latest_pose.position.y])
+        now = time.time()
+
+        # 시작 지점을 home으로 기록해 둔다(탐색이 끝나면 여기로 돌아온다).
+        if self.home_xy is None:
+            self.home_xy = robot_xy.copy()
+            self.get_logger().info(f"🏠 home 기록: ({self.home_xy[0]:.1f}, {self.home_xy[1]:.1f})")
+
+        if self.phase == "DONE":
+            return
+        if self.phase == "RETURNING":
+            self.return_home_tick(robot_xy, now)
+            return
+
+        # ===== 이하 EXPLORING =====
         # 시작 직후 TF 준비 전엔 스캔이 버려져 2D 격자가 비어 있다. 이때 frontier가
         # 0개라고 '완료'로 판정하면 로봇이 목표를 못 받는다. 맵이 어느 정도 찰 때까지 대기.
         if int(self.grid_free.sum()) < MIN_EXPLORE_FREE_CELLS:
             self.get_logger().info("맵 채우는 중... (탐색 대기)", throttle_duration_sec=3.0)
             return
-
-        robot_xy = np.array([self.latest_pose.position.x, self.latest_pose.position.y])
-        now = time.time()
 
         # 현재 목표가 있으면 진행 상황을 보고, 도착/타임아웃/막힘이 아니면 그대로 유지한다.
         if self.current_goal is not None:
@@ -439,16 +510,22 @@ class LidarMappingNode(Node):
                 self.publish_waypoint(self.current_goal, robot_xy)
                 return
 
-        # 목표가 없으면 새로 고른다.
+        # 목표가 없으면(= 방금 도착했거나 포기했으면) 새 frontier 목표를 고른다.
         goal = self.select_frontier_goal(robot_xy)
+
+        # ★ 탐색 완료 판정 지점 ★
+        # goal이 None = "지금 갈 만한 미탐사 경계가 없다". 하지만 한 번 None이라고 바로
+        # 끝내면 안 된다 — 로봇이 벽을 보고 있는 순간이나 스캔 노이즈로 frontier가 잠깐
+        # 사라질 수 있고, 그걸 완료로 받으면 실제론 절반도 안 훑고 끝나버린다.
+        # 그래서 NO_FRONTIER_CONFIRM번 "연속"으로 None일 때만 진짜 완료로 인정한다.
         if goal is None:
-            # 래치하지 않는다 — 노이즈/순간적 frontier 소실을 완료로 오판하지 않도록
-            # 연속 카운트로만 로그를 찍고, 이후 frontier가 생기면 자동 재개된다.
             self.no_frontier_count += 1
-            if self.no_frontier_count == NO_FRONTIER_CONFIRM:
-                self.get_logger().info("🎉 탐색 완료: frontier 없음 (새로 생기면 자동 재개).")
+            if self.no_frontier_count >= NO_FRONTIER_CONFIRM:
+                self.get_logger().info("🎉 탐색 완료: 더 이상 frontier 없음 → 원점 복귀 시작")
+                self.start_return_home(robot_xy, now)  # -> 여기서 페이즈가 RETURNING으로 바뀐다
             return
 
+        # 목표를 찾았으면 연속 카운트를 리셋한다(완료 판정은 '연속'일 때만 유효하므로).
         self.no_frontier_count = 0
         self.current_goal = goal
         self.goal_start_time = now
@@ -457,6 +534,52 @@ class LidarMappingNode(Node):
         self.get_logger().info(f"🚩 new goal ({goal[0]:.1f}, {goal[1]:.1f}), dist {self.goal_best_dist:.1f}m, "
                                f"blacklist {len(self.blacklist)}")
         self.publish_waypoint(goal, robot_xy)
+
+    def start_return_home(self, robot_xy, now):
+        """탐색 완료 -> 원점(시작 지점) 복귀 페이즈로 전환."""
+        self.phase = "RETURNING"
+        self.current_goal = self.home_xy.copy()
+        self.goal_start_time = now
+        self.goal_best_dist = float(np.linalg.norm(self.home_xy - robot_xy))
+        self.goal_last_progress_time = now
+        self.get_logger().info(
+            f"🏠 복귀 목표 ({self.home_xy[0]:.1f}, {self.home_xy[1]:.1f}), "
+            f"남은 거리 {self.goal_best_dist:.1f}m"
+        )
+        self.publish_waypoint(self.current_goal, robot_xy)
+
+    def return_home_tick(self, robot_xy, now):
+        """원점까지 이동 감시. 도착하면 DONE, 너무 오래 걸리면 포기하고 DONE.
+
+        돌아가는 길은 이미 탐색한 공간이라 새 frontier가 거의 안 생긴다. 그래서
+        복귀를 시작하면 탐색으로 되돌아가지 않고 복귀에 커밋한다(왔다갔다 방지).
+        집은 반드시 가야 하므로 blacklist는 쓰지 않고, 막히면 재발행으로 재시도한다.
+        """
+        dist = float(np.linalg.norm(self.current_goal - robot_xy))
+
+        if dist < self.goal_best_dist - STUCK_EPS_M:
+            self.goal_best_dist = dist
+            self.goal_last_progress_time = now
+
+        if dist < REACH_THRESH_M:
+            self.get_logger().info("🏁 원점 복귀 완료 — 매핑/탐색 종료. (맵은 계속 유지)")
+            self.phase = "DONE"
+            self.current_goal = None
+            return
+
+        if now - self.goal_start_time > RETURN_TIMEOUT_S:
+            self.get_logger().warn(f"⏱️ 복귀 타임아웃 (남은 거리 {dist:.1f}m) — 포기하고 대기.")
+            self.phase = "DONE"
+            self.current_goal = None
+            return
+
+        if now - self.goal_last_progress_time > STUCK_TIME_S:
+            # 복귀 중 막힘: 포기하지 않고 진행 타이머만 리셋해 계속 재시도한다.
+            self.get_logger().warn(f"🧱 복귀 중 막힘 (남은 거리 {dist:.1f}m) — 재시도.",
+                                   throttle_duration_sec=3.0)
+            self.goal_last_progress_time = now
+
+        self.publish_waypoint(self.current_goal, robot_xy)
 
     def publish_waypoint(self, goal_xy, robot_xy):
         """목표점을 Pose2D(/way_point_with_heading)로 발행 + RViz 목표 마커."""
@@ -512,6 +635,8 @@ class LidarMappingNode(Node):
             r = self.grid_n - 1 - c[1]
             cv2.circle(img, (int(c[0]), int(r)), size, color, -1)
 
+        if self.home_xy is not None:
+            dot(self.home_xy, (0, 255, 255), 3)          # 노랑 = home(원점)
         if self.latest_pose is not None:
             dot(np.array([self.latest_pose.position.x, self.latest_pose.position.y]), (255, 120, 0), 3)
         if self.current_goal is not None:

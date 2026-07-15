@@ -58,6 +58,11 @@ from tmah_vlm.question_process.dispatch import (
     ready_to_process,
     print_waiting_reason,
 )
+# 문장 → 미션 분기를 main_control_loop 안에 인라인으로 두기로 해서, solver 진입점을
+# 여기서 직접 import 한다 (예전엔 dispatch.py가 이 세 개를 import 했다).
+from tmah_vlm.t1_instruction_solver.t1_instruction import instruction_process
+from tmah_vlm.t2_numerical_solver.t2_numerical import numerical_process
+from tmah_vlm.t3_object_reference_solver.t3_object_reference import object_reference_process
 
 
 # ========================================
@@ -137,13 +142,13 @@ class TmahVLM(Node): # <- TmahVLM클래스는 ROS2 Node(상속받을 클래스) 
 
             # 일부 질문에 하드하게 된 부분이 있어서 수정할 필요가 있어보임,
             if lower_question.startswith("find"):
-                object_reference_process(node, question)
+                object_reference_process(self, question)
                 # t3 object_reference_solver -저 물체를 찾아서 정확한 3D 위치를 짚기
             elif lower_question.startswith("how many") or lower_question.startswith("count"):
-                numerical_process(node, question)
+                numerical_process(self, question)
                 # t2 numerical_solver -개수를 세라
             else:
-                instruction_process(node, question)
+                instruction_process(self, question)
                 # t1 instruction_solver -그 외 질문(아직 stub)
 
 
