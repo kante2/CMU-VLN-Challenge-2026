@@ -114,18 +114,26 @@ def record_object_observation(node, question, detection, result, image_stamp=Non
     log = node.get_logger()
 
     try:
+        # 1. 노드에 누적 중인 scene graph를 가져온다(없으면 여기서 최초 생성).
         graph = get_scene_graph(node)
+        # 2. 이번에 찾은 물체(라벨·3D위치·bbox 등)를 그래프가 먹을 관측(observation) 형태로 변환.
         observation = make_observation(question, detection, result, image_stamp)
+        # 3. 그래프에 관측 추가 — 같은 위치의 기존 물체면 병합, 새 물체면 노드 추가. 그 노드를 돌려받음.
         object_node = graph.add_observation(observation)
+        # 4. (옵션) VLM 캡셔너로 해당 물체 crop에 설명 캡션을 달아둔다(다음 관계추론 품질용).
         maybe_update_vlm_caption(node, object_node, detection, image)
 
+        # 5. 갱신된 그래프를 JSON으로 저장(다음 질문의 PROCESS 3 fallback이 이 파일을 읽음).
         latest_path = os.path.join(config.DEBUG_DIR, "scene_graph_latest.json")
         graph.save_json(latest_path)
+        # 6. 사람이 보기 위한 그래프 시각화 이미지를 렌더링해 저장(디버그용).
         image_path = os.path.join(config.DEBUG_DIR, "scene_graph_latest.jpg")
         render_scene_graph(latest_path, image_path)
 
+        # 7. HOV-SG 스타일 레이아웃(폴더 단위 산출물)도 함께 덤프.
         layout_dir = os.path.join(config.DEBUG_DIR, "scene_graph")
         graph.save_hovsg_layout(layout_dir)
+        # 8. RViz용 scene graph 마커 발행(노드/엣지 시각화).
         publish_scene_graph_markers(node)
 
         log.info(
@@ -135,5 +143,6 @@ def record_object_observation(node, question, detection, result, image_stamp=Non
         )
         return object_node
     except Exception as error:
+        # scene graph 갱신 실패는 로그만 남기고 삼킨다 — 네비게이션(발행)은 이미 끝났으므로 절대 안 깨뜨림.
         log.warn(f"[SceneGraph] update failed: {error}")
         return None

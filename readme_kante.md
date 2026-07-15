@@ -50,6 +50,17 @@ D - 키보드 컨트롤 하는 방법
 RVIZ에 뜨고 있음, 
 
 
+# 매핑 파일 제작중
+docker exec -it iros2026_tmah_module bash
+cd /home/docker/ai_module && source /opt/ros/jazzy/setup.bash \
+  && colcon build --symlink-install --packages-select tmah_vlm
+source install/setup.bash
+python3 src/tmah_vlm/tmah_vlm/test_lidar_mapping.py
+
+ --> /debug/lidar_map_cloud
+
+export DISPLAY=:1 && rviz2
+
 # ==============================================================================
 # tmah_vlm 코드 구조 (2026-07 리팩토링 완료)
 # ==============================================================================

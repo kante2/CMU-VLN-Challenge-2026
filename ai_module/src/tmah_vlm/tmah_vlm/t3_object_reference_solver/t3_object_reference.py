@@ -80,7 +80,7 @@ def object_reference_process(node, question):
     compute_approach_waypoint(ctx)            # PROCESS 9-b: 접근 waypoint 계산 → ctx.waypoint
 
     publish_object_result(node, ctx)          # PROCESS 9-c: marker(CUBE+wireframe) + waypoint 발행
-    record_observation_in_graph(node, ctx)
+    record_observation_in_graph(node, ctx)    # t3로 물체 하나를 찾을 때마다, 그 결과(라벨·3D위치·bbox)를 scene graph에 노드로 추가 (runtime.py)
     log_final_target(node, ctx)
     save_object_debug_outputs(node, ctx)
 
