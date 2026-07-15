@@ -1,5 +1,83 @@
 # CMU-VLN-Challenge-2026
 
+<!-- ============================================================================
+     이 파일 위쪽(이 섹션)은 "현재 구조/파이프라인"의 단일 진실이다.
+     아래 날짜별 섹션들은 그 시점의 디버깅 기록이라 옛 경로(perception/·geometry/·
+     node/·context/ 등)를 그대로 쓰고 있다 — 경로가 헷갈리면 항상 이 섹션을 먼저 믿을 것.
+     ============================================================================ -->
+
+## 현재 코드 구조 & 파이프라인 (최신 = 2026-07-14 3차 리팩터링, 여기부터 읽기)
+
+경로: `ai_module/src/tmah_vlm/tmah_vlm/`. 더 자세한 트리는 저장소 루트 `readme_kante.md`.
+
+**설계 원칙(전 파일 공통)**: 클래스 메서드 대신 **`node`를 첫 인자로 받는 자유 함수**.
+solver 진입점은 `<파일이름>_process(node, question)`. 각 process는 **조건문 + 함수 호출만**
+나열하고(함수 이름을 위→아래로 읽으면 그게 파이프라인 순서), 각 스텝 함수는 질문마다 새로
+만든 **ctx(SimpleNamespace 구조체)** 를 받아 **자기 필드 하나만 채운다**(return 대신 인자
+업데이트) → 다음 함수가 그 필드를 읽어 이어 씀. 상수는 전부 `config.py`.
+
+### 질문 하나가 처리되는 전체 흐름
+
+```
+/challenge_question (문장)
+   │
+   │ ① common/callback.py  question_callback()      → node.pending_question 에 "저장만"
+   │    (모든 센서 콜백도 최신값 저장만 — 무거운 VLM 추론은 콜백에서 절대 안 함)
+   ▼
+   ② main_node.py  main_control_loop()  (config.MAIN_LOOP_PERIOD_SEC 타이머)
+   │    peek_pending_question / ready_to_process  (question_process/dispatch.py)
+   ▼
+   ③ question_process/dispatch.py  dispatch_question()   ← 문장 첫 단어로 미션 분기(핵심 지점)
+   │    ├─ "find ..."            → t3_object_reference_solver.object_reference_process()
+   │    ├─ "how many/count ..."  → t2_numerical_solver.numerical_process()
+   │    └─ 그 외                  → t1_instruction_solver.instruction_process()
+   ▼
+   ④ solver process()  = ctx 생성 → 센서 스텝 → 추론 스텝 → 발행     (아래 t3 예시)
+```
+
+**t3(find)의 파이프라인** (t2/t1은 이 부분집합):
+```
+make_object_ref_context(q)                     # question_process/context.py : 작업변수 ctx 생성
+─ 센서 (sensor_process/sensor_process.py 공용 스텝) ─
+grab_camera_image        → ctx.image, image_stamp        # 카메라 최신 프레임 스냅샷
+extract_target_object    → ctx.detect_prompt             # question_process/query_parser.py
+detect_candidate_boxes   → ctx.detections                # GroundingDINO 2D 박스 (sensor_process/detector.py)
+load_scan_points_in_map  → ctx.scan_points_map           # image에 동기화된 LiDAR → map frame (scan_transform)
+─ 추론/선택 (reasoning/ + solver 로직) ─
+narrow_candidates_by_relation → ctx.candidate_indices    # reasoning/spatial : 공간관계로 후보 좁힘
+pick_final_candidate     → ctx.selected                  # Qwen 시각 선택 (sensor_process/selector.py)
+─ 센서 3D (sensor_process) ─
+segment_selected_object  → ctx.segmentation_mask         # SAM 마스크 (sensor_process/segmenter.py)
+estimate_target_3d_pose  → ctx.result                    # seg에 맞는 LiDAR ray → 3D 위치/크기 (projector.py)
+compute_approach_waypoint→ ctx.waypoint
+─ 발행 ─
+publish_object_result(node, ctx)                         # nav_publish.py : marker(CUBE+wireframe) + waypoint
+record_observation_in_graph                              # reasoning/graph : scene graph에 누적(다음 관계질문용)
+```
+※ 공간관계 질문은 검출 전에 누적 scene graph(reasoning/sort3d)로 먼저 풀어보고, 되면 조기 종료.
+
+### 폴더 = 기능 (top-level 7개)
+
+| 폴더/파일 | 역할 |
+|---|---|
+| `main_node.py` | 진입점. 조립 + main_control_loop + main() 만 |
+| `config.py` | 토픽·프레임·임계값·상수 전부. 환경 바뀌면 여기부터 |
+| `nav_publish.py` | nav/challenge 발행 전부 (waypoint / marker / count) |
+| `common/` | 센서 무관 노드 뼈대: initialize, callback(question·pose), helpers(get_robot_pose/heartbeat) |
+| `question_process/` | 문장→미션: dispatch(분기+준비판단), query_parser(질문→검출어), context(ctx 생성) |
+| `sensor_process/` | 카메라→2Dbox→seg→LiDAR변환→ray→3D. **sensor_process.py = 공용 센서 스텝 흐름파일** + detector/segmenter/selector/image_utils/coordinate_transform/projector/scan_transform/bbox_*/visualize/callback |
+| `reasoning/` | 누적 관측 기반 추론: spatial(관계 파싱·필터), graph(scene graph), sort3d(SORT3D-lite fallback) |
+| `t1/t2/t3_*_solver/` | 질문 유형별 process (find / count / 그 외) |
+
+**규칙 요약**: 센서 공용 스텝은 solver마다 재정의하지 말고 `sensor_process/sensor_process.py`에서
+import. 발행은 전부 `nav_publish.py`. 새 상수는 `config.py`. 새 기능은 "폴더 하나 = 기능 하나"
++ `node` 자유함수 + ctx(출력-인자) 패턴 유지.
+
+> 구조가 바뀌면 컨테이너에서 클린 재빌드 후 `ros2 launch tmah_vlm tmah_vlm.launch` 로 확인
+> (재빌드/권한 절차는 아래 "SAM 세그멘테이션" 섹션 07-13 항목, 최신 이동 내역은 "3차 리팩터링" 섹션).
+
+---
+
 ## tmah_module 디버그 이미지 저장 안 되던 문제 (2026-07-08~09, 해결됨)
 
 증상: `ai_module/debug`에 결과 이미지가 안 쌓임. 원인이 3개 겹쳐 있었음.
@@ -229,6 +307,47 @@ docker exec iros2026_tmah_module bash -lc "nvidia-smi --query-compute-apps=pid,u
 권한 에러 나면 위 "SAM 세그멘테이션" 섹션의 07-13 추가 항목 참고) 후
 `ros2 launch tmah_vlm tmah_vlm.launch`로 확인할 것. 저장소 루트 `readme_kante.md`의
 "tmah_vlm 코드 구조" 섹션도 아직 이 변경 전 내용이라 별도로 갱신 필요.
+
+## 3차 코드 구조 리팩터링 — 기능 단위 재편, top-level 10 → 7 (2026-07-14)
+
+목적: t1~t3 solver 외 top-level 폴더(`common`/`context`/`geometry`/`perception`/`spatial`/
+`graph`/`sort3d`)가 너무 많아 코드 흐름이 안 보였음. **동작 변경 없이(pure move/rename)**
+기능 단위로 다시 묶어 질문 하나가 처리되는 흐름을 파일 위치만으로 따라갈 수 있게 함.
+(위 07-13 "2차 리팩터링" 및 그 이전 섹션의 경로 설명은 이 변경으로 낡음 — 아래가 최신.)
+
+**새 구조 (top-level)**
+- `common/` — 센서 무관 노드 뼈대: `initialize`, `callback`(question/pose), `helpers`
+  (get_robot_pose/heartbeat/stamp_to_sec).
+- `question_process/`(신규) — 문장 → 미션 선택. `dispatch.py`(구 `main_node.dispatch_question`
+  + 구 `context/helpers`의 peek/ready/print_waiting), `query_parser.py`(구
+  `perception/camera/query_parser`), `context.py`(구 `context/context`, make_*_context).
+- `sensor_process/`(신규) — 카메라→2Dbox→seg→LiDAR변환→ray→3D 위치. 구
+  `perception/camera/*`(query_parser 제외) + `perception/lidar/bbox_*` + `geometry/*`
+  + `common/scan_transform` + 두 콜백을 합친 `callback.py`를 전부 이 아래로 이동.
+  **흐름파일 `sensor_process/sensor_process.py`** 신설: t2/t3에 흩어져 중복되던 공용 센서 스텝
+  (grab_camera_image / detect_candidate_boxes / load_scan_points_in_map /
+  segment_selected_object / estimate_target_3d_pose)을 파이프라인 순서로 모아 두 solver가
+  import해서 씀(solver 파일이 얇아짐).
+- `nav_publish.py`(신규, top-level 단일 파일) — 세 solver에 흩어졌던 waypoint/marker/count
+  발행을 통일. `t3_object_reference_solver/publish.py`는 삭제. (scene graph 마커 발행은
+  추론 디버그 시각화라 `reasoning/graph/visualizer.py`에 그대로 둠.)
+- `reasoning/`(신규 부모) — `spatial/`·`graph/`·`sort3d/`를 이 아래로 이동(내부 구조 그대로).
+  `reasoning/sort3d/reasoning/`(sort3d 내부 하위폴더)는 경로로 구분되니 그대로 둠.
+- 없어진 폴더: `context/`, `geometry/`, `perception/`.
+
+**부수 변경**
+- 흩어진 상수 → `config.py` 흡수: `MARKER_CUBE_RGBA`/`MARKER_WIREFRAME_RGBA`/
+  `MARKER_WIREFRAME_LINE_WIDTH_M`, `INSTRUCTION_FORWARD_DISTANCE_M`,
+  `MAIN_LOOP_PERIOD_SEC`/`HEALTH_TIMER_PERIOD_SEC`/`SCENE_GRAPH_MARKER_PERIOD_SEC`.
+- `setup.py` 엔트리포인트: `scene_graph_json_markers`가 `tmah_vlm.reasoning.graph.json_marker_node:main`
+  로 갱신(`tmah_vlm = ...main_node:main`은 그대로). launch는 console-script 이름만 참조라 수정 없음.
+- `main_node.py` 상단 docstring, 저장소 루트 `readme_kante.md` 구조 섹션 갱신 완료.
+
+**검증(완료)**: 모든 이동 `git mv`(히스토리 유지). import 90곳 sed 일괄 갱신 후
+`py_compile` + AST 교차검증 스크립트(모듈/심볼 존재)로 확인. 컨테이너에서 클린 재빌드
+(`colcon build --symlink-install --packages-select tmah_vlm`) 성공, install source 후
+main_node/json_marker_node 포함 핵심 15개 모듈 `importlib.import_module` 전부 OK.
+남은 것: `ros2 launch`로 실 센서 런타임(find/how many 각 1건) 최종 확인.
 
 ## 알 수 없는 파일 변경 — 미해결
 

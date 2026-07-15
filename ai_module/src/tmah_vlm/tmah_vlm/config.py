@@ -104,7 +104,7 @@ SEGMENTATION_MODEL_ID = "facebook/sam-vit-base"
 # 써서(7.5GB GPU 기준 ~350MB만 남음) SAM 추론이 CUDA OOM으로 매번 실패했다.
 # 세그멘테이션은 쿼리당 1회라 CPU로 돌려도 몇 초면 되므로 기본을 "cpu"로 둔다.
 # GPU 여유가 충분한 환경이면 "cuda"로 바꿔도 된다.
-SEGMENTATION_DEVICE = "cuda"
+SEGMENTATION_DEVICE = "cpu"
 
 # -----------------------------------------------------------------------------
 # Spatial reasoning toolbox (spatial/relations.py, SORT-3D Module 4)
@@ -167,6 +167,29 @@ BBOX3D_DEFAULT_SIZE_M = 0.4
 # 같은 room 안에서 label이 호환되고 중심 거리가 이 값보다 가까우면 같은 object node로
 # 누적한다. 너무 작으면 같은 물체가 여러 노드로 쪼개지고, 너무 크면 다른 물체가 합쳐진다.
 SCENE_GRAPH_MERGE_DISTANCE_M = 0.75
+
+# -----------------------------------------------------------------------------
+# nav 발행 (nav_publish.py) — RViz marker / waypoint 상수
+# -----------------------------------------------------------------------------
+# 선택 물체 CUBE marker 색 (r, g, b, a). 챌린지 visualizationTools가 구독하는 초록 반투명.
+MARKER_CUBE_RGBA = (0.1, 0.9, 0.2, 0.7)
+
+# bbox wireframe(LINE_LIST) 색 (r, g, b, a)과 선 굵기(m).
+MARKER_WIREFRAME_RGBA = (1.0, 1.0, 1.0, 1.0)
+MARKER_WIREFRAME_LINE_WIDTH_M = 0.02
+
+# -----------------------------------------------------------------------------
+# Solver 파라미터
+# -----------------------------------------------------------------------------
+# t1 instruction stub: 로봇 정면으로 이 거리(m)만큼 앞을 waypoint로 찍는다.
+INSTRUCTION_FORWARD_DISTANCE_M = 1.0
+
+# -----------------------------------------------------------------------------
+# 타이머 주기 (초)
+# -----------------------------------------------------------------------------
+MAIN_LOOP_PERIOD_SEC = 0.2            # main_control_loop
+HEALTH_TIMER_PERIOD_SEC = 3.0         # heartbeat
+SCENE_GRAPH_MARKER_PERIOD_SEC = 1.0   # scene graph marker 발행
 
 # -----------------------------------------------------------------------------
 # Debug

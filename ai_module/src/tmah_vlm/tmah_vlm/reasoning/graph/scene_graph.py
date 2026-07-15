@@ -14,8 +14,8 @@ import os
 import re
 from datetime import datetime
 
-from tmah_vlm.graph.edges import RelationEdge, compute_relation_edges
-from tmah_vlm.graph.nodes import FloorNode, ObjectNode, ObjectObservation, RoomNode
+from tmah_vlm.reasoning.graph.edges import RelationEdge, compute_relation_edges
+from tmah_vlm.reasoning.graph.nodes import FloorNode, ObjectNode, ObjectObservation, RoomNode
 
 
 def normalize_label(text):
@@ -106,8 +106,8 @@ class SceneGraph:
         object_list.txt or an external VLM.
         """
         try:
-            from tmah_vlm.sort3d.caption.captioner import attach_rule_captions
-            from tmah_vlm.sort3d.data.objects import Sort3DObject
+            from tmah_vlm.reasoning.sort3d.caption.captioner import attach_rule_captions
+            from tmah_vlm.reasoning.sort3d.data.objects import Sort3DObject
         except Exception:
             return
 

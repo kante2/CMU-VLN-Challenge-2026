@@ -13,6 +13,12 @@ import numpy as np
 from PIL import Image as PILImage
 from sensor_msgs.msg import Image as RosImage
 
+def grab_camera_image(node, ctx):
+    # 최신 ROS 이미지를 PIL로 변환하고 캡처 시각(stamp)을 같은 스냅샷에서 함께 꺼낸다.
+    # (콜백이 latest_image를 계속 갱신하므로 이미지와 stamp를 따로 읽으면 어긋난다.)
+    image_msg = node.latest_image
+    ctx.image = ros_image_to_pil(image_msg)
+    ctx.image_stamp = image_msg.header.stamp
 
 def ros_image_to_numpy(msg: RosImage) -> np.ndarray:
     """sensor_msgs/Image -> HxWx3 (RGB) numpy uint8 배열."""
@@ -40,6 +46,7 @@ def ros_image_to_numpy(msg: RosImage) -> np.ndarray:
 
 
 def ros_image_to_pil(msg: RosImage) -> PILImage.Image:
+    # GroundingDINO가 사용할 수 있는 RGB 형식의 PIL 이미지로 바꾸는 함수
     """sensor_msgs/Image -> PIL.Image (RGB). GroundingDINO 입력용."""
     arr = ros_image_to_numpy(msg)
     return PILImage.fromarray(arr, mode="RGB")

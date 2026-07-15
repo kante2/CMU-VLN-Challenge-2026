@@ -12,6 +12,6 @@ Floor and room segmentation can be replaced later with stronger HOV-SG style
 logic without changing the object-reference handler.
 """
 
-from tmah_vlm.graph.scene_graph import SceneGraph
+from tmah_vlm.reasoning.graph.scene_graph import SceneGraph
 
 __all__ = ["SceneGraph"]

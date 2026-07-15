@@ -3,7 +3,7 @@
 
 import re
 
-from tmah_vlm.sort3d.data.objects import Sort3DObject
+from tmah_vlm.reasoning.sort3d.data.objects import Sort3DObject
 
 
 _OBJECT_LINE = re.compile(

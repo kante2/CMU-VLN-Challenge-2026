@@ -17,9 +17,9 @@ relation_parser.py가 질문에서 관계절(between/near/closest/...)을 텍스
 t3_object_reference_solver와 t2_numerical_solver가 공용으로 쓴다.
 """
 
-from tmah_vlm.geometry.projector import box_to_3d
-from tmah_vlm.spatial import relations as spatial_relations
-from tmah_vlm.spatial.relation_parser import extract_relations, all_referenced_landmarks
+from tmah_vlm.sensor_process.projector import box_to_3d
+from tmah_vlm.reasoning.spatial import relations as spatial_relations
+from tmah_vlm.reasoning.spatial.relation_parser import extract_relations, all_referenced_landmarks
 from tmah_vlm.common.helpers import get_robot_pose
 
 

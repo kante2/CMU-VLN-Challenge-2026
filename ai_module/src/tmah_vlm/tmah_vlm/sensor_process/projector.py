@@ -13,7 +13,7 @@
   3D target으로 사용한다.
 
 역할 분리:
-  - geometry/coordinate_transform.py: camera/sensor/map 좌표 변환
+  - sensor_process/coordinate_transform.py: camera/sensor/map 좌표 변환
   - projector.py: 이미지 픽셀 <-> camera ray, 2D box 기반 3D point 선택
   - geometry/bbox_estimator.py: 선택된 point들로 물체의 3D bounding box(크기) 추정
 """
@@ -24,7 +24,7 @@ import numpy as np
 import sensor_msgs_py.point_cloud2 as pc2
 
 from tmah_vlm import config
-from tmah_vlm.perception.lidar.bbox_estimator import estimate_object_bbox
+from tmah_vlm.sensor_process.bbox_estimator import estimate_object_bbox
 
 
 def pointcloud_to_xyz(scan_msg):

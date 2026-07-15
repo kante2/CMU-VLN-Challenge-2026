@@ -22,7 +22,7 @@ setup(
     entry_points={
         "console_scripts": [
             "tmah_vlm = tmah_vlm.main_node:main",
-            "scene_graph_json_markers = tmah_vlm.graph.json_marker_node:main",
+            "scene_graph_json_markers = tmah_vlm.reasoning.graph.json_marker_node:main",
         ],
     },
 )

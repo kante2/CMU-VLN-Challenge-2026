@@ -5,7 +5,7 @@ from geometry_msgs.msg import Point, Pose2D
 from visualization_msgs.msg import Marker
 
 from tmah_vlm import config
-from tmah_vlm.perception.lidar.bbox_wireframe import wireframe_edge_points
+from tmah_vlm.sensor_process.bbox_wireframe import wireframe_edge_points
 
 
 def publish_sort3d_result(node, target, waypoint):

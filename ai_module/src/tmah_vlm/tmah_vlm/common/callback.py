@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 질문/로봇 pose 콜백 — 특정 센서(카메라/lidar)에 속하지 않는 공용 콜백.
-카메라 콜백은 perception/camera/callback.py, lidar 콜백은 perception/lidar/callback.py에 있다.
+카메라 콜백은 sensor_process/callback.py에 있다.
 
 전부 "최신값 저장"만 한다. 무거운 VLM 추론은 여기서 절대 안 돈다.
 common/initialize.py의 initialize_subscribers()가 이 함수들을 구독 콜백으로 등록한다.

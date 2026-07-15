@@ -17,8 +17,8 @@ import math
 
 import numpy as np
 
-from tmah_vlm.spatial import relations as spatial_relations
-from tmah_vlm.sort3d.reasoning.filters import objects_named
+from tmah_vlm.reasoning.spatial import relations as spatial_relations
+from tmah_vlm.reasoning.sort3d.reasoning.filters import objects_named
 
 
 def _as_list(value):

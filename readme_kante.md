@@ -66,47 +66,63 @@ solver가 "검출 → 선택 → 3D 위치 → 발행"까지 처리한다.
 /challenge_question (문장 수신)
         │
         ▼
-① node/callbacks.py  question_callback()      ← 문장을 node.pending_question에 "저장만"
+① common/callback.py  question_callback()     ← 문장을 node.pending_question에 "저장만"
         │                                         (무거운 VLM 추론 절대 안 함)
         ▼
-② main_node.py  main_control_loop()  (0.2초 타이머)
-        │        - pending 질문 꺼내고 준비됐는지 확인
+② main_node.py  main_control_loop()  (config.MAIN_LOOP_PERIOD_SEC 타이머)
+        │        - pending 질문 꺼내고 준비됐는지 확인 (question_process/dispatch.py)
         ▼
-③ main_node.py  dispatch_question()           ← 문장 첫 단어로 분기하는 핵심 지점
+③ question_process/dispatch.py  dispatch_question()   ← 문장 첫 단어로 분기하는 핵심 지점
         │
         ├─ "find ..."               → t3_object_reference_solver  object_reference_process()
         ├─ "how many/count ..."     → t2_numerical_solver         numerical_process()
         └─ 그 외                     → t1_instruction_solver       instruction_process()
 ```
 
-- **문장이 들어오는 곳**: `node/callbacks.py` 의 `question_callback` (저장만)
-- **문장이 갈라지는 곳**: `main_node.py` 의 `dispatch_question` (첫 단어 하드코딩 분기 — 개선 시 여기)
+- **문장이 들어오는 곳**: `common/callback.py` 의 `question_callback` (저장만)
+- **문장이 갈라지는 곳**: `question_process/dispatch.py` 의 `dispatch_question` (첫 단어 분기 — 개선 시 여기)
 - **문장별 실제 로직**: 세 solver의 `*_process`
 
-## 폴더 트리 (도메인별로 묶음)
+## 폴더 트리 (기능 단위로 묶음)
 
 ```
 tmah_vlm/
-├── main_node.py     진입점. 조립 + main_control_loop + dispatch_question 만 담당
-├── config.py        토픽명/프레임명/임계값 전부 모음. 환경 바뀌면 여기부터 확인
+├── main_node.py     진입점. 조립 + main_control_loop + main() 만 담당
+├── config.py        토픽명/프레임명/임계값/상수 전부 모음. 환경 바뀌면 여기부터 확인
+├── nav_publish.py   nav/challenge로 나가는 발행 전부 (waypoint / marker / count)
 │
-├── node/            노드 뼈대·수명주기 (도메인 로직 아님)
-│   ├── setup.py       __init__이 부르는 initialize_* (상태/모델/구독/발행/타이머) + 모델 백그라운드 로딩
-│   ├── callbacks.py   센서/질문 콜백 — 전부 "최신값 저장"만
-│   ├── helpers.py     solver 공용 상태조회 (pending 확인, robot pose, image-scan 동기화, heartbeat)
-│   └── context.py     solver별 작업변수 ctx 생성 함수 make_*_context() (SimpleNamespace 구조체 반환)
+├── common/          센서 무관 노드 뼈대·수명주기 (도메인 로직 아님)
+│   ├── initialize.py  __init__이 부르는 initialize_* (상태/모델/구독/발행/타이머) + 모델 백그라운드 로딩
+│   ├── callback.py    question_callback · pose_callback — "최신값 저장"만
+│   └── helpers.py     solver 공용 상태조회 (robot pose, heartbeat, stamp_to_sec)
+│
+├── question_process/  문장 → 미션 선택 + 구조체 생성
+│   ├── dispatch.py     dispatch_question(분기) + peek/ready/print_waiting(처리 준비 판단)
+│   ├── query_parser.py 질문 문장 → GroundingDINO 검출어 추출
+│   └── context.py      solver별 작업변수 ctx 생성 make_*_context() (SimpleNamespace 구조체)
 │
 ├── t1_instruction_solver/      그 외 질문 (instruction_process, 아직 stub: 앞 1m 직진)
 ├── t2_numerical_solver/        "how many/count" (numerical_process, 현재 시야 개수 세기)
-├── t3_object_reference_solver/ "find" (object_reference_process) + publish.py (marker/waypoint 발행)
+├── t3_object_reference_solver/ "find" (object_reference_process)
 │
-├── perception/     2D 인식: image_utils(ROS→PIL), query_parser(검출어 추출),
-│                   detector(GroundingDINO), visualize(디버그 저장), segmenter(SAM), selector(Qwen 시각선택)
-├── geometry/       3D 기하: coordinate_transform(TF), projector(2D→3D 재투영),
-│                   bbox_estimator(3D박스 크기), bbox_wireframe(모서리 좌표)
-├── spatial/        공간관계: relations(결정론적 관계함수), candidate_filter(관계로 후보 좁히기), relation_parser
-├── graph/          누적 scene graph 구축/렌더/시각화 (관계 질문의 근거)
-└── sort3d/         SORT3D-lite 추론 (scene graph 기반 관계 질문 fallback)
+├── sensor_process/  카메라 → 2Dbox → segmentation → LiDAR 좌표변환 → ray → 3D 위치
+│   ├── sensor_process.py  ★ 흐름파일 — 공용 센서 스텝을 파이프라인 순서로 모음
+│   │                        (grab_camera_image → detect_candidate_boxes →
+│   │                         load_scan_points_in_map → segment_selected_object →
+│   │                         estimate_target_3d_pose). t2/t3가 여기서 가져다 씀
+│   ├── detector.py / segmenter.py / selector.py   GroundingDINO / SAM / Qwen
+│   ├── image_utils.py     ROS Image → PIL + grab_camera_image
+│   ├── coordinate_transform.py  TF (map↔sensor↔camera)
+│   ├── projector.py       2D↔3D 재투영, segmentation에 맞는 LiDAR ray → 3D 위치/크기
+│   ├── scan_transform.py  image stamp에 동기화된 scan → map frame 점군
+│   ├── bbox_estimator.py / bbox_wireframe.py   3D 박스 크기 / 모서리 좌표
+│   ├── visualize.py       디버그 오버레이/이미지/텍스트 저장
+│   └── callback.py        image_callback · scan_callback — "최신값 저장"만
+│
+└── reasoning/       누적 관측 기반 공간/관계 추론 (한 부모로 묶음)
+    ├── spatial/       공간관계: relations(결정론적 관계함수), candidate_filter, relation_parser
+    ├── graph/         누적 scene graph 구축/렌더/시각화 (관계 질문의 근거)
+    └── sort3d/        SORT3D-lite 추론 (scene graph 기반 관계 질문 fallback)
 ```
 
 ## solver 코드 스타일 규칙 (새 기능 추가 시 이 패턴 유지)
@@ -126,23 +142,31 @@ def object_reference_process(node, question):
 ```
 
 핵심 원칙:
-1. **context 구조체(`node/context.py`)** 에 그 질문 처리에 필요한 작업변수를 다 모아둔다.
+1. **context 구조체(`question_process/context.py`)** 에 그 질문 처리에 필요한 작업변수를 다 모아둔다.
    인스턴스는 질문마다 process 진입부에서 새로 만든다(질문 간 값 안 섞이게).
 2. 각 스텝 함수는 `ctx`를 받아 **자기 필드 하나만 채우고**(return 대신 인자 업데이트),
    다음 함수가 그 필드를 읽어 이어서 쓴다. `x = get_something(node)` 처럼 함수 안에서
    값을 뽑아 쓰지 않는다 — 중간값도 ctx 필드로 올려 전용 스텝으로 분리한다.
 3. 진입점 이름은 `<파일이름>_process(node, ...)` 형태. 함수 위에는 한 줄 기능 주석.
+4. 센서 공용 스텝(카메라→box→scan→seg→3D)은 solver마다 재정의하지 말고
+   `sensor_process/sensor_process.py`에서 import해서 쓴다. 발행은 `nav_publish.py`로 모은다.
 
-## 이번 리팩토링 요약 (구조 변경, 동작은 그대로)
+## 3차 리팩토링 요약 (2026-07-14, 구조 변경·동작 그대로)
 
-- `vlm_node.py` → `main_node.py` 로 rename (setup.py 엔트리포인트도 갱신)
-- `handlers/{object_reference,numerical,instruction}.py` → `t1/t2/t3_*_solver/` 3개 폴더로 분리
-- 각 solver를 **context 구조체 + 출력-인자 스타일**로 재작성, 함수명 직관화 + 주석 추가
-- **파일 하나짜리 폴더 9개**(initialize/callback/helper/context/segmentation/reasoning/
-  tf/grounding/bbox3d/spatial_reasoning/object_filter)를 **4개 도메인**(node/perception/
-  geometry/spatial)으로 통합 → top-level 폴더 15개 → 9개
-- `graph`·`sort3d` 는 파일 많은 진짜 서브시스템이라 그대로 유지
+- **top-level 폴더 10 → 7.** 없어진 폴더: `context/`, `geometry/`, `perception/`.
+- `perception/{camera,lidar}` + `geometry/` + `common/scan_transform` → **`sensor_process/`** 로 통합.
+  카메라→3D 파이프라인의 공용 스텝을 흐름파일 `sensor_process/sensor_process.py`에 모아
+  t2/t3가 중복 정의 없이 import (solver 파일이 얇아짐).
+- `context/context` → `question_process/context`, `context/helpers` + `main_node.dispatch_question`
+  → **`question_process/dispatch.py`**, `perception/camera/query_parser` → `question_process/query_parser`.
+- 세 solver에 흩어져 있던 marker/waypoint/count 발행 → **`nav_publish.py`** 한 파일로 통일
+  (`t3_object_reference_solver/publish.py` 삭제).
+- `spatial/` · `graph/` · `sort3d/` → **`reasoning/`** 한 부모 아래로 이동 (내부 구조는 그대로).
+- marker 색/선굵기, t1 전진거리, 타이머 주기 등 흩어진 상수 → **`config.py`** 로 흡수.
+- 모든 이동은 `git mv`(히스토리 유지), import 90곳 + `setup.py` 엔트리포인트 갱신,
+  `py_compile` + import 교차검증 스크립트로 확인.
 
-주의: 구조가 크게 바뀌었으니 컨테이너에서 `colcon build --symlink-install` 한 번 재실행 후
-`ros2 launch tmah_vlm tmah_vlm.launch` 로 확인할 것.
+주의: 구조가 크게 바뀌었으니 컨테이너에서 클린 재빌드
+(`rm -rf build/tmah_vlm install/tmah_vlm && colcon build --symlink-install --packages-select tmah_vlm`,
+권한 에러 나면 CLAUDE.md의 07-13 항목 참고) 후 `ros2 launch tmah_vlm tmah_vlm.launch` 로 확인할 것.
 

@@ -5,8 +5,8 @@ marker/waypoint 발행은 sort3d/publish.py로 분리했다.
 """
 
 from tmah_vlm.common.helpers import get_robot_pose
-from tmah_vlm.sort3d.pipeline import Sort3DLite
-from tmah_vlm.sort3d.publish import publish_sort3d_result
+from tmah_vlm.reasoning.sort3d.pipeline import Sort3DLite
+from tmah_vlm.reasoning.sort3d.publish import publish_sort3d_result
 
 
 RELATION_WORDS = (

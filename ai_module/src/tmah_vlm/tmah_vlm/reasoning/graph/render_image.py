@@ -13,7 +13,7 @@ import os
 
 from PIL import Image, ImageDraw, ImageFont
 
-from tmah_vlm.graph.scene_graph import SceneGraph
+from tmah_vlm.reasoning.graph.scene_graph import SceneGraph
 
 
 PALETTE = [

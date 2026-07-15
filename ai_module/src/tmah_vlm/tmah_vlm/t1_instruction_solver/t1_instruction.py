@@ -10,10 +10,10 @@ process는 조건문 + 함수 호출만 나열한다. 각 스텝 함수는 ctx(m
 받아 자기 필드를 채우고, 다음 함수가 그 필드를 읽어 이어서 쓴다.
 """
 
-from geometry_msgs.msg import Pose2D
-
-from tmah_vlm.context.context import make_instruction_context
+from tmah_vlm import config
+from tmah_vlm.question_process.context import make_instruction_context
 from tmah_vlm.common.helpers import get_robot_pose
+from tmah_vlm.nav_publish import publish_waypoint
 
 
 # ========================================
@@ -40,22 +40,9 @@ def read_robot_pose(node, ctx):
 
 
 def plan_forward_waypoint(ctx):
-    # ctx.robot_pose 기준 정면 1m 앞 지점을 목표 waypoint로 계산한다.
+    # ctx.robot_pose 기준 정면 앞 지점을 목표 waypoint로 계산한다.
     ctx.waypoint = {
-        "x": ctx.robot_pose["x"] + 1.0,
+        "x": ctx.robot_pose["x"] + config.INSTRUCTION_FORWARD_DISTANCE_M,
         "y": ctx.robot_pose["y"],
         "heading": ctx.robot_pose["yaw"],
     }
-
-
-# ========================================
-# Publish
-# ========================================
-
-def publish_waypoint(node, ctx):
-    # 계산된 waypoint를 Pose2D로 발행한다.
-    msg = Pose2D()
-    msg.x = float(ctx.waypoint["x"])
-    msg.y = float(ctx.waypoint["y"])
-    msg.theta = float(ctx.waypoint["heading"])
-    node.waypoint_pub.publish(msg)

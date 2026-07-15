@@ -10,10 +10,10 @@ inside tmah_vlm/graph.
 import os
 
 from tmah_vlm import config
-from tmah_vlm.graph.nodes import ObjectObservation
-from tmah_vlm.graph.render_image import render_scene_graph
-from tmah_vlm.graph.scene_graph import SceneGraph
-from tmah_vlm.graph.visualizer import publish_scene_graph_markers
+from tmah_vlm.reasoning.graph.nodes import ObjectObservation
+from tmah_vlm.reasoning.graph.render_image import render_scene_graph
+from tmah_vlm.reasoning.graph.scene_graph import SceneGraph
+from tmah_vlm.reasoning.graph.visualizer import publish_scene_graph_markers
 
 
 def stamp_to_sec(stamp):
@@ -39,7 +39,7 @@ def get_vlm_captioner(node):
         return node.vlm_captioner
 
     try:
-        from tmah_vlm.sort3d.caption.vlm_captioner import FlorenceCaptioner
+        from tmah_vlm.reasoning.sort3d.caption.vlm_captioner import FlorenceCaptioner
         node.vlm_captioner = FlorenceCaptioner(
             model_id=getattr(config, "CAPTION_MODEL_ID", "microsoft/Florence-2-base"),
             device=getattr(config, "CAPTION_DEVICE", "cpu"),

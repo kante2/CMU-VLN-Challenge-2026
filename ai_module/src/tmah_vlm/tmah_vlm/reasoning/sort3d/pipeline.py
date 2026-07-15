@@ -4,12 +4,12 @@
 import json
 import re
 
-from tmah_vlm.sort3d.reasoning.actions import go_between, go_near
-from tmah_vlm.sort3d.caption.captioner import attach_rule_captions
-from tmah_vlm.sort3d.reasoning.filters import filter_relevant_objects
-from tmah_vlm.sort3d.data.object_list import load_object_list
-from tmah_vlm.sort3d.data.objects import Sort3DObject, normalize_text
-from tmah_vlm.sort3d.reasoning.toolbox import SpatialToolbox
+from tmah_vlm.reasoning.sort3d.reasoning.actions import go_between, go_near
+from tmah_vlm.reasoning.sort3d.caption.captioner import attach_rule_captions
+from tmah_vlm.reasoning.sort3d.reasoning.filters import filter_relevant_objects
+from tmah_vlm.reasoning.sort3d.data.object_list import load_object_list
+from tmah_vlm.reasoning.sort3d.data.objects import Sort3DObject, normalize_text
+from tmah_vlm.reasoning.sort3d.reasoning.toolbox import SpatialToolbox
 
 
 class Sort3DLite:
@@ -36,7 +36,7 @@ class Sort3DLite:
 
     @classmethod
     def from_scene_graph(cls, scene_graph):
-        """Build from the live tmah_vlm.graph.scene_graph.SceneGraph object."""
+        """Build from the live tmah_vlm.reasoning.graph.scene_graph.SceneGraph object."""
         if scene_graph is None:
             return cls([])
         if hasattr(scene_graph, "to_dict"):

@@ -7,7 +7,7 @@ SORT3D's useful pieces to the challenge stack without pulling in the full LLM,
 captioning, or semantic-mapping runtime.
 """
 
-from tmah_vlm.sort3d.data.objects import Sort3DObject
-from tmah_vlm.sort3d.pipeline import Sort3DLite
+from tmah_vlm.reasoning.sort3d.data.objects import Sort3DObject
+from tmah_vlm.reasoning.sort3d.pipeline import Sort3DLite
 
 __all__ = ["Sort3DObject", "Sort3DLite"]
