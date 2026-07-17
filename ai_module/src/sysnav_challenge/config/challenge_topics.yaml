@@ -1,0 +1,5 @@
+sysnav_challenge_adapter:
+  ros__parameters:
+    question_topic: /challenge_question
+    sysnav_instruction_topic: /keyboard_input
+    legacy_question_topic: /sysnav_challenge/legacy_question

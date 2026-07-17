@@ -1,0 +1,188 @@
+diff --git a/set_yolo_e.py b/set_yolo_e.py
+--- a/set_yolo_e.py
++++ b/set_yolo_e.py
+@@ -2,6 +2,9 @@ from ultralytics import YOLOWorld, YOLO, YOLOE
+ import yaml
+ import os
+ 
+-object_file_path = 'src/semantic_mapping/semantic_mapping/config/objects.yaml'
++object_file_path = os.environ.get(
++    'SYSNAV_OBJECT_FILE',
++    'src/semantic_mapping/semantic_mapping/config/objects.yaml',
++)
+ with open(object_file_path, "r") as file:
+     object_config = yaml.safe_load(file)
+diff --git a/set_yolo_world.py b/set_yolo_world.py
+--- a/set_yolo_world.py
++++ b/set_yolo_world.py
+@@ -2,6 +2,9 @@ from ultralytics import YOLOWorld, YOLO
+ import yaml
+ import os
+ 
+-object_file_path = 'src/semantic_mapping/semantic_mapping/config/objects.yaml'
++object_file_path = os.environ.get(
++    'SYSNAV_OBJECT_FILE',
++    'src/semantic_mapping/semantic_mapping/config/objects.yaml',
++)
+ with open(object_file_path, "r") as file:
+     object_config = yaml.safe_load(file)
+diff --git a/src/exploration_planner/tare_planner/include/sensor_coverage_planner/sensor_coverage_planner_ground.h b/src/exploration_planner/tare_planner/include/sensor_coverage_planner/sensor_coverage_planner_ground.h
+--- a/src/exploration_planner/tare_planner/include/sensor_coverage_planner/sensor_coverage_planner_ground.h
++++ b/src/exploration_planner/tare_planner/include/sensor_coverage_planner/sensor_coverage_planner_ground.h
+@@ -123,4 +123,5 @@ private:
+ 
+   // Bool
+   bool kAutoStart;
++  bool kSingleRoomMode;
+   bool kRushHome;
+diff --git a/src/exploration_planner/tare_planner/src/sensor_coverage_planner/sensor_coverage_planner_ground.cpp b/src/exploration_planner/tare_planner/src/sensor_coverage_planner/sensor_coverage_planner_ground.cpp
+--- a/src/exploration_planner/tare_planner/src/sensor_coverage_planner/sensor_coverage_planner_ground.cpp
++++ b/src/exploration_planner/tare_planner/src/sensor_coverage_planner/sensor_coverage_planner_ground.cpp
+@@ -53,4 +53,5 @@ void SensorCoveragePlanner3D::ReadParameters() {
+ 
+   // Bool
+   this->declare_parameter<bool>("kAutoStart", false);
++  this->declare_parameter<bool>("kSingleRoomMode", false);
+   this->declare_parameter<bool>("kRushHome", false);
+@@ -216,4 +217,5 @@ void SensorCoveragePlanner3D::ReadParameters() {
+                       pub_momentum_activation_count_topic_);
+ 
+   this->get_parameter("kAutoStart", kAutoStart);
++  this->get_parameter("kSingleRoomMode", kSingleRoomMode);
+ 
+@@ -3666,5 +3668,5 @@ void SensorCoveragePlanner3D::execute() {
+         auto &current_room = representation_->GetRoomNode(current_room_id_);
+         // this room is nearly finished, ask the vlm in advance
+         // if the room is too small, it can never finish the local coverage if only exploring within the room, so add the area limit
+-        if ((grid_world_->IsRoomFinished() && !local_coverage_planner_->IsLocalCoverageComplete() && !transit_across_room_)
+-            || (current_room.area_ < 6.0)) {
++        if (!kSingleRoomMode && ((grid_world_->IsRoomFinished() && !local_coverage_planner_->IsLocalCoverageComplete() && !transit_across_room_)
++            || (current_room.area_ < 6.0))) {
+@@ -3679,12 +3681,20 @@ void SensorCoveragePlanner3D::execute() {
+         // if the room is finished, ask the vlm for next room to explore
+         if ((grid_world_->IsRoomFinished() && local_coverage_planner_->IsLocalCoverageComplete() && !transit_across_room_)
+             || (current_room.area_ < 10.0 && stayed_in_room_counter_ > 20)) {
+-          ask_vlm_finish_room_ = true;
++          ask_vlm_finish_room_ = !kSingleRoomMode;
+          // if (current_room_id_ <= representation_->GetRoomNodeCount())
+          if (representation_->HasRoomNode(current_room_id_)) {
+             representation_->GetRoomNode(current_room_id_).SetIsCovered(true);
+           }
+-          GetAnswer();
++          if (kSingleRoomMode) {
++            if (!exploration_finished_) {
++              RCLCPP_INFO(this->get_logger(),
++                          "Single-room mapping complete; no next-room query will be sent");
++            }
++            exploration_finished_ = true;
++          } else {
++            GetAnswer();
++          }
+         }
+        else {
+          ask_vlm_finish_room_ = false;
+diff --git a/src/semantic_mapping/semantic_mapping/semantic_mapping_node.py b/src/semantic_mapping/semantic_mapping/semantic_mapping_node.py
+--- a/src/semantic_mapping/semantic_mapping/semantic_mapping_node.py
++++ b/src/semantic_mapping/semantic_mapping/semantic_mapping_node.py
+@@ -69,5 +69,12 @@ except ModuleNotFoundError:
+     print(f"Captioner not found. Fall back to no captioning version.")
+ 
+ def load_models():
+-    checkpoint = "src/semantic_mapping/semantic_mapping/external/sam2/checkpoints/sam2.1_hiera_base_plus.pt"
++    package_dir = Path(__file__).resolve().parent
++    checkpoint = str(
++        package_dir
++        / "external"
++        / "sam2"
++        / "checkpoints"
++        / "sam2.1_hiera_base_plus.pt"
++    )
+     model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+diff --git a/src/semantic_mapping/semantic_mapping/utils.py b/src/semantic_mapping/semantic_mapping/utils.py
+--- a/src/semantic_mapping/semantic_mapping/utils.py
++++ b/src/semantic_mapping/semantic_mapping/utils.py
+@@ -4,15 +4,4 @@ from bisect import bisect_left
+ import open3d as o3d
+ import torch
+ from scipy.spatial import cKDTree
+-import yaml
+-
+-object_file_path = 'src/semantic_mapping/semantic_mapping/config/objects.yaml'
+-with open(object_file_path, "r") as file:
+-    object_config = yaml.safe_load(file)
+-label_template = object_config['prompts']
+-object_list = {}
+-for idx, value in enumerate(label_template.values()):
+-    labels = value['prompts']
+-    for label in labels:
+-        object_list[label] = idx
+ 
+@@ -49,9 +38,8 @@ def generate_colors(n, is_int=False):
+     return colors
+ 
+ def map_label_to_color(label):
+-    if label in object_list:
+-        idx = object_list[label]
+-    else:
+-        print(f"Warning: Label '{label}' not found in object list. Assigning white.")
+-        return [1.0, 1.0, 1.0]
++    # Keep visualization independent from the process working directory and
++    # from a particular object vocabulary. Python's hash is randomized per
++    # process, so derive a stable small integer directly from the label bytes.
++    idx = sum((i + 1) * byte for i, byte in enumerate(label.encode("utf-8")))
+ 
+diff --git a/src/vlm_node/vlm_node/constants.py b/src/vlm_node/vlm_node/constants.py
+--- a/src/vlm_node/vlm_node/constants.py
++++ b/src/vlm_node/vlm_node/constants.py
+@@ -5,13 +5,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+ DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+ 
+ # ---- Provider selection ----
+-# Explicit via VLM_PROVIDER=gemini|qwen, or auto-detected from which key is set.
+-# If both keys are set and VLM_PROVIDER is unset, Gemini wins (preserves prior behavior).
++# Gemini Free Tier is the default for integration testing. Qwen remains
++# available by explicitly setting VLM_PROVIDER=qwen.
+-VLM_PROVIDER = os.environ.get("VLM_PROVIDER", "").lower()
++VLM_PROVIDER = os.environ.get("VLM_PROVIDER", "gemini").lower()
+ if VLM_PROVIDER not in ("gemini", "qwen"):
+-    if GEMINI_API_KEY:
+-        VLM_PROVIDER = "gemini"
+-    elif DASHSCOPE_API_KEY:
+-        VLM_PROVIDER = "qwen"
+-    else:
+-        VLM_PROVIDER = "gemini"
++    VLM_PROVIDER = "gemini"
+@@ -24,4 +19,6 @@ else:
+     VLM_API_KEY = GEMINI_API_KEY
+     VLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+-    MODEL_NAME = "gemini-2.5-flash"
+-    MODEL_NAME_LITE = "gemini-2.5-flash-lite"
++    MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
++    MODEL_NAME_LITE = os.environ.get(
++        "GEMINI_MODEL_LITE", "gemini-3.5-flash"
++    )
+diff --git a/src/vlm_node/vlm_node/vlm_reasoning_node.py b/src/vlm_node/vlm_node/vlm_reasoning_node.py
+--- a/src/vlm_node/vlm_node/vlm_reasoning_node.py
++++ b/src/vlm_node/vlm_node/vlm_reasoning_node.py
+@@ -38,8 +38,13 @@ class VLMNode(Node):
+         # Initialize VLM
+         self.declare_parameter('log_dir', 'logs/episode_0')
+         self.declare_parameter('platform', 'mecanum')
++        self.declare_parameter(
++            'object_file',
++            'src/semantic_mapping/semantic_mapping/config/objects.yaml',
++        )
+ 
+         self.log_dir = self.get_parameter('log_dir').get_parameter_value().string_value
+         self.platform = self.get_parameter('platform').get_parameter_value().string_value
++        self.object_file = self.get_parameter('object_file').value
+ 
+         self.get_logger().info(f"Log directory: {self.log_dir}")
+@@ -171,6 +176,5 @@ class VLMNode(Node):
+         {"is_target": true, "reason": "The object is a silver refrigerator located in the student lounge, which matches the instruction."}
+         """
+ 
+-        object_file_path = 'src/semantic_mapping/semantic_mapping/config/objects.yaml'
+-        with open(object_file_path, "r") as file:
++        with open(self.object_file, "r") as file:
+             self.object_config = yaml.safe_load(file)

@@ -5,7 +5,14 @@ USER root
 
 # 베이스 이미지에 pip 이 없으므로 apt 로 먼저 설치
 RUN apt-get update && \
-    apt-get install -y python3-pip && \
+    apt-get install -y \
+        python3-pip \
+        wget \
+        ros-jazzy-pcl-ros \
+        libpcl-dev \
+        nlohmann-json3-dev \
+        libgoogle-glog-dev \
+        ros-jazzy-backward-ros && \
     rm -rf /var/lib/apt/lists/*
 
 # 파이썬 인식/추론 라이브러리
@@ -18,6 +25,27 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     "qwen-vl-utils" \
     "accelerate" \
     "pillow" "numpy"
+
+# SysNav semantic mapping, VLM and TensorRT dependencies. Ubuntu installs
+# psutil through apt without pip RECORD metadata, so install its wheel first.
+COPY src/SysNav/requirement.txt /tmp/sysnav-requirement.txt
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        --ignore-installed "psutil==7.2.2" && \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        -r /tmp/sysnav-requirement.txt && \
+    python3 -m pip uninstall --break-system-packages -y clip && \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        git+https://github.com/ultralytics/CLIP.git && \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        --ignore-installed "numpy==1.26.4" && \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        "numpy<2" "onnxruntime-gpu" "onnxslim>=0.1.82" \
+        "nvidia-modelopt[onnx]>=0.44" && \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        "setuptools==79.0.1"
+
+COPY src/SysNav/src/semantic_mapping/semantic_mapping/external/sam2 /tmp/sam2
+RUN python3 -m pip install --no-cache-dir --break-system-packages -e /tmp/sam2
 
 # 모델 가중치 빌드 시점에 미리 받기 (test-time 네트워크 불필요)
 #  1) GroundingDINO-tiny  2) Qwen2-VL-2B-Instruct
@@ -47,6 +75,9 @@ print('SAM cached.')" || echo "WARN: SAM pre-download skipped"
 
 # tmah_vlm 소스 복사
 COPY src/tmah_vlm /home/docker/ai_module/src/tmah_vlm
+COPY src/SysNav /home/docker/ai_module/src/SysNav
+COPY src/sysnav_challenge /home/docker/ai_module/src/sysnav_challenge
+RUN bash /home/docker/ai_module/src/sysnav_challenge/scripts/apply_sysnav_patch.sh
 
 # tmah_vlm 패키지만 빌드
 WORKDIR /home/docker/ai_module
@@ -54,7 +85,19 @@ RUN /bin/bash -c "\
     source /opt/ros/jazzy/setup.bash && \
     colcon build --symlink-install --packages-select tmah_vlm"
 
+# Keep the heavy SysNav C++ build separate from the legacy package so the
+# mounted development workspace cannot hit ownership conflicts.
+RUN /bin/bash -c "\
+    source /opt/ros/jazzy/setup.bash && \
+    colcon --log-base log_sysnav build --symlink-install \
+      --build-base build_sysnav \
+      --install-base install_sysnav \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release \
+      --base-paths src/SysNav/src src/sysnav_challenge \
+      --packages-select tare_planner semantic_mapping vlm_node sysnav_challenge"
+
 RUN echo "source /home/docker/ai_module/install/setup.bash" >> /home/docker/.bashrc
+RUN echo "source /home/docker/ai_module/install_sysnav/setup.bash" >> /home/docker/.bashrc
 
 # 원래 유저로 복귀
 USER docker

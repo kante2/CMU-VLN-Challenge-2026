@@ -1,0 +1,47 @@
+prompts:
+  sofa: {prompts: [sofa, couch], is_instance: true}
+  chair: {prompts: [chair], is_instance: true}
+  table: {prompts: [table, coffee table, dining table, bedside table, nightstand], is_instance: true}
+  cabinet: {prompts: [cabinet, TV cabinet, file cabinet], is_instance: true}
+  shelf: {prompts: [shelf, display ledge], is_instance: true}
+  stool: {prompts: [stool], is_instance: true}
+  bench: {prompts: [bench], is_instance: true}
+  ottoman: {prompts: [ottoman], is_instance: true}
+  bed: {prompts: [bed], is_instance: true}
+  pillow: {prompts: [pillow], is_instance: true}
+  picture: {prompts: [picture, painting, photo, framed record], is_instance: true}
+  potted_plant: {prompts: [potted plant, plant], is_instance: true}
+  vase: {prompts: [vase], is_instance: true}
+  flowers: {prompts: [flowers], is_instance: true}
+  bowl: {prompts: [bowl], is_instance: true}
+  cup: {prompts: [cup, paper cup, coffee cup], is_instance: true}
+  bottle: {prompts: [beer bottle, bottle], is_instance: true}
+  kettle: {prompts: [kettle], is_instance: true}
+  book: {prompts: [book], is_instance: true}
+  magazine: {prompts: [magazine], is_instance: true}
+  folder: {prompts: [folder], is_instance: true}
+  box: {prompts: [box], is_instance: true}
+  clock: {prompts: [clock], is_instance: true}
+  lamp: {prompts: [lamp, wall lamp, lantern], is_instance: true}
+  television: {prompts: [TV, television], is_instance: true}
+  computer_monitor: {prompts: [computer monitor], is_instance: true}
+  speaker: {prompts: [speaker], is_instance: true}
+  phone: {prompts: [phone], is_instance: true}
+  remote: {prompts: [TV remote], is_instance: true}
+  microwave: {prompts: [microwave], is_instance: true}
+  refrigerator: {prompts: [refrigerator], is_instance: true}
+  trash_can: {prompts: [trash can], is_instance: true}
+  water_cooler: {prompts: [water cooler], is_instance: true}
+  projector_screen: {prompts: [projector screen], is_instance: true}
+  whiteboard: {prompts: [whiteboard], is_instance: true}
+  curtain: {prompts: [curtain], is_instance: true}
+  window: {prompts: [window], is_instance: true}
+  door: {prompts: [door, door frame, wardrobe door], is_instance: true}
+  fireplace: {prompts: [fireplace], is_instance: true}
+  mirror: {prompts: [mirror], is_instance: true}
+  folding_screen: {prompts: [folding screen], is_instance: true}
+  suitcase: {prompts: [suitcase], is_instance: true}
+  guitar: {prompts: [guitar], is_instance: true}
+  soccer_ball: {prompts: [soccer ball], is_instance: true}
+  decoration: {prompts: [decoration, figurine, fossil decoration, sphere decoration, crystal ball], is_instance: true}
+  unknown: {prompts: [unknown], is_instance: false}
