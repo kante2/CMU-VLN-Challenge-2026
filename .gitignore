@@ -18,3 +18,6 @@ docker/.env
 
 # Runtime outputs — semantic_mapping viewpoint/object images, npy poses (heavy, regenerated each run)
 ai_module/output/
+
+# Third-party vendored web demos (GeographicLib) — contain sample API keys, not needed
+**/3rdparty/GeographicLib/js/
