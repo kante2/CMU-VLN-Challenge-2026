@@ -7,3 +7,14 @@ __pycache__/
 
 # Unity environment assets (too large for GitHub)
 unity_env_models/*.zip
+
+# SysNav demo videos (too large, README demos only)
+ai_module/src/SysNav/video/
+
+# Secrets — API keys (never commit)
+docker/.env
+.env
+*.env
+
+# Runtime outputs — semantic_mapping viewpoint/object images, npy poses (heavy, regenerated each run)
+ai_module/output/

@@ -1,0 +1,28 @@
+vln_orchestrator:
+  ros__parameters:
+    # waypoint reach distance (m) for instruction-following sequencing
+    waypoint_reach_dist: 1.0
+    # per-question wall-clock budget (s). Challenge limit is 600s (10 min); leave
+    # headroom so we always publish before the cutoff and keep time-bonus margin.
+    answer_deadline_s: 540.0
+    # --- exploration (drive the scene to build the map before answering) ---
+    # stop exploring + answer at this elapsed (< answer_deadline_s) unless we
+    # converge sooner (covered + map stable).
+    explore_budget_s: 420.0
+    # answer early once no new objects for this long AND the area is covered.
+    convergence_timeout_s: 20.0
+    # never answer-on-convergence before this much exploration has happened.
+    min_explore_s: 15.0
+    # abandon a frontier the robot can't reach within this long (mark it blocked,
+    # re-route). Stops the robot getting stuck on one corner.
+    goal_timeout_s: 12.0
+    # explore loop period (s).
+    explore_tick_s: 1.0
+    # a terrain point is an unexplored frontier if >= this far from every visited
+    # pose (m); single goals are clamped to explore_step (m) to drive incrementally.
+    frontier_clearance: 2.0
+    explore_step: 4.0
+    # keep every Nth /terrain_map point (subsample for speed).
+    terrain_subsample: 5
+    # VLM provider config is read from the handler/perception modules (env/keys),
+    # not hard-coded here, so secrets stay out of the repo.

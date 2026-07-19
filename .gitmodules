@@ -3,6 +3,3 @@
 	url = git@github.com:Yuxin916/End2end-ObjectNav-Physical-Experiment.git
 	branch = iros_workshop
 
-[submodule "ai_module/src/SysNav"]
-	path = ai_module/src/SysNav
-	url = https://github.com/zwandering/SysNav.git

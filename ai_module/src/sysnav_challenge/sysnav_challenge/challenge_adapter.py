@@ -24,7 +24,7 @@ class ChallengeAdapter(Node):
     def __init__(self) -> None:
         super().__init__("sysnav_challenge_adapter")
 
-        self.declare_parameter("question_topic", "/challenge_question")
+        self.declare_parameter("question_topic", "/challenge_question") # topic 구독
         self.declare_parameter("sysnav_instruction_topic", "/keyboard_input")
         self.declare_parameter(
             "legacy_question_topic", "/sysnav_challenge/legacy_question"
@@ -68,6 +68,7 @@ class ChallengeAdapter(Node):
             return "object_reference"
         return "instruction"
 
+    # question -> callback -> kind -> pub
     def _question_callback(self, msg: String) -> None:
         question = msg.data.strip()
         if not question or question == self._last_question:

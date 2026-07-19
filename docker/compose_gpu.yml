@@ -48,9 +48,12 @@ services:
     network_mode: host
     stdin_open: true
     tty: true
+    env_file:
+      - .env
     volumes:
       - ../ai_module/debug:/home/docker/ai_module/debug
       - ../ai_module/src:/home/docker/ai_module/src
+      - ../ai_module/output:/home/docker/ai_module/output
     deploy:
         resources:
           reservations:

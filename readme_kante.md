@@ -49,6 +49,12 @@ ros2 topic pub --once /challenge_question std_msgs/msg/String \
 D - 키보드 컨트롤 하는 방법
 RVIZ에 뜨고 있음, 
 
+# 재일 0719
+export GEMINI_API_KEY='A~~'
+ros2 launch sysnav_challenge sysnav_challenge.launch.py \
+  single_room:=true use_rviz:=true use_legacy_solvers:=false auto_start:=true
+
+
 
 # 매핑 파일 제작중(시뮬A키고 -> 이 파일을 실행하면 됨.)
 docker exec -it iros2026_tmah_module bash
