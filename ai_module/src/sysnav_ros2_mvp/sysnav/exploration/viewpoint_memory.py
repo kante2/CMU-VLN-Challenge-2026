@@ -1,4 +1,9 @@
-"""Memory for already visited exploration viewpoints."""
+"""Visited exploration-goal memory.
+
+This helper prevents the frontier planner from selecting nearly identical goals. It is
+not the paper-style Scene Graph Viewpoint store; representative Viewpoint nodes and
+coverage regions are managed by ``scene_graph/scene_graph_manager.py``.
+"""
 
 from __future__ import annotations
 

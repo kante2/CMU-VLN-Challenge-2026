@@ -5,7 +5,7 @@ package_name = "sysnav"
 
 setup(
     name=package_name,
-    version="0.1.0",
+    version="0.3.0",
     packages=find_packages(exclude=("tests",)),
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
@@ -16,7 +16,7 @@ setup(
     zip_safe=True,
     maintainer="kante",
     maintainer_email="gangtae9050@gmail.com",
-    description="Single-room SysNav ROS2 MVP",
+    description="Single-room SysNav ROS2 MVP with coverage-based structured scene graph",
     license="Apache-2.0",
     entry_points={"console_scripts": ["sysnav = sysnav.main:main"]},
 )

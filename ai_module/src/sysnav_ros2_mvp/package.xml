@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>sysnav</name>
-  <version>0.1.0</version>
-  <description>Single-room SysNav MVP for ROS2.</description>
+  <version>0.2.0</version>
+  <description>Single-room SysNav ROS2 MVP with structured Room/Viewpoint/Object scene graph.</description>
   <maintainer email="gangtae9050@gmail.com">kante</maintainer>
   <license>Apache-2.0</license>
   <buildtool_depend>ament_python</buildtool_depend>

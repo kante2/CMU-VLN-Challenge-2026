@@ -39,6 +39,30 @@ docker start iros2026_system iros2026_sysnav_module
 docker compose -f compose_gpu.yml up -d --force-recreate sysnav_module
 ```
 
+
+## ----------------------명령어 요약--------------------
+터미널 A — 시뮬레이터 (이미 켜져있다면 생략)
+
+
+docker exec -it iros2026_system bash
+/home/docker/autonomy_stack_mecanum_wheel_platform/system_simulation.sh
+터미널 B — sysnav 실행 (컨테이너 재시작됐으니 새로 exec)
+
+
+docker exec -it iros2026_sysnav_module bash
+source /opt/ros/jazzy/setup.bash
+source /home/docker/ai_module/install/setup.bash
+ros2 launch sysnav sysnav.launch.py
+터미널 C — 질의
+
+
+docker exec -it iros2026_sysnav_module bash
+source /opt/ros/jazzy/setup.bash
+ros2 topic pub --once /challenge_question std_msgs/msg/String \
+  "{data: 'Find the white chair'}"
+
+## --------------------------------------------------
+
 ## 2. A — 시뮬레이터/autonomy 실행 (터미널 A)
 
 ```bash
@@ -99,7 +123,6 @@ segmentation mask + 3D position 텍스트) 오버레이 이미지를 `ai_module/
   setfacl -R    -m u:1001:rwx  ai_module/debug
   setfacl -R -d -m u:1001:rwx  ai_module/debug
   ```
-
 ## 주의사항
 
 1. **`sysnav/config.py`의 `T_LIDAR_TO_CAMERA`, `T_SENSOR_TO_BASE`,

@@ -7,3 +7,8 @@ __pycache__/
 
 # secrets (e.g. GEMINI_API_KEY for sysnav_module)
 ai_module/.env
+
+# debug outputs / backups / archives
+ai_module/debug/
+*.bak_*/
+*.zip
