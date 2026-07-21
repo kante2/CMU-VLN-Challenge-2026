@@ -4,3 +4,6 @@
 
 __pycache__/
 *.pyc
+
+# secrets (e.g. GEMINI_API_KEY for sysnav_module)
+ai_module/.env

@@ -1,0 +1,65 @@
+FROM zhangjicmu/ubuntu24_ros:ai_module
+
+# apt/pip 설치를 위해 잠시 root 로 전환
+USER root
+
+# 베이스 이미지에 pip/git 이 없으므로 apt 로 먼저 설치
+RUN apt-get update && \
+    apt-get install -y python3-pip git curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# PyTorch (YOLO-World, SAM2 둘 다 필요)
+# --ignore-installed: 베이스 이미지에 apt로 깐 numpy(1.26.4)가 pip RECORD 메타데이터 없이
+# 설치돼있어 uninstall 시도 시 에러남 (debian 패키지 특성). 새 버전으로 그냥 덮어쓰게 함.
+RUN python3 -m pip install --no-cache-dir --break-system-packages --ignore-installed torch torchvision
+
+# sysnav 자체 requirements (numpy, opencv-python-headless, ultralytics, google-genai, Pillow)
+COPY src/sysnav_ros2_mvp/requirements.txt /tmp/sysnav_requirements.txt
+RUN python3 -m pip install --no-cache-dir --break-system-packages --ignore-installed -r /tmp/sysnav_requirements.txt
+
+# YOLO-World가 open-vocabulary 텍스트 임베딩에 clip을 필요로 함. requirements.txt에 없어서
+# 런타임에 ultralytics가 자동설치를 시도하는데, 이 환경 pip는 PEP668(externally-managed)이라
+# --break-system-packages 없인 자동설치가 실패함 ("No module named 'clip'" 런타임 에러).
+# → 빌드 시점에 미리 설치해서 런타임 자동설치 자체가 안 일어나게 함.
+RUN python3 -m pip install --no-cache-dir --break-system-packages "git+https://github.com/ultralytics/CLIP.git"
+
+# SAM2 공식 저장소 (pip 패키지가 없어서 소스 설치)
+# --no-build-isolation: 기본값(격리 빌드 venv)이면 이미 설치된 torch/CUDA를 무시하고
+# 빌드 의존성 해석 과정에서 통째로(수GB) 재다운로드함. 이미 깔린 torch를 그대로 쓰게 함.
+RUN git clone --depth 1 https://github.com/facebookresearch/sam2.git /opt/sam2 && \
+    python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation -e /opt/sam2
+
+# 모델 가중치 빌드 시점에 미리 받기 (test-time 네트워크 불필요)
+#  1) SAM2.1 hiera-tiny checkpoint  2) YOLOv8x-WorldV2 weights
+RUN mkdir -p /home/docker/ai_module/weights && \
+    curl -L -o /home/docker/ai_module/weights/sam2.1_hiera_tiny.pt \
+      https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt
+
+RUN python3 -c "\
+from ultralytics import YOLOWorld; \
+YOLOWorld('/home/docker/ai_module/weights/yolov8x-worldv2.pt'); \
+print('YOLO-World weights cached.')" || echo "WARN: yolo-world pre-download skipped"
+
+# sysnav 소스 복사
+COPY src/sysnav_ros2_mvp /home/docker/ai_module/src/sysnav_ros2_mvp
+
+# colcon-core는 setuptools<80을 요구하는데 위 pip install들이 최신(83.x)으로 올려놔서
+# ament_python 빌드(setup.py develop --editable)가 "option --editable not recognized"로 깨짐 → 되돌림
+RUN python3 -m pip install --no-cache-dir --break-system-packages "setuptools<80"
+
+# sysnav 패키지만 빌드
+WORKDIR /home/docker/ai_module
+RUN /bin/bash -c "\
+    source /opt/ros/jazzy/setup.bash && \
+    colcon build --symlink-install --packages-select sysnav"
+
+RUN echo "source /home/docker/ai_module/install/setup.bash" >> /home/docker/.bashrc
+
+ENV SAM2_CHECKPOINT=/home/docker/ai_module/weights/sam2.1_hiera_tiny.pt
+ENV SAM2_MODEL_CFG=configs/sam2.1/sam2.1_hiera_t.yaml
+ENV YOLO_WORLD_WEIGHTS=/home/docker/ai_module/weights/yolov8x-worldv2.pt
+
+RUN chown -R docker:docker /home/docker/ai_module
+
+# 원래 유저로 복귀
+USER docker

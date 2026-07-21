@@ -58,3 +58,25 @@ services:
               - driver: nvidia
                 count: all
                 capabilities: [gpu]
+
+  # sysnav MVP (YOLO-World + SAM2 + Gemini) - tmah_vlm과 별개 의존성 스택이라 독립 컨테이너로 분리 (0720 생성)
+  sysnav_module:
+    build:
+      context: ../ai_module
+      dockerfile: docker/Dockerfile.sysnav
+    container_name: iros2026_sysnav_module
+    network_mode: host
+    stdin_open: true
+    tty: true
+    env_file:
+      - ../ai_module/.env
+    volumes:
+      - ../ai_module/src/sysnav_ros2_mvp:/home/docker/ai_module/src/sysnav_ros2_mvp
+      - ../ai_module/debug:/home/docker/ai_module/debug
+    deploy:
+        resources:
+          reservations:
+            devices:
+              - driver: nvidia
+                count: all
+                capabilities: [gpu]
