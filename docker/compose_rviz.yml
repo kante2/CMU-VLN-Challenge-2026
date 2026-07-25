@@ -1,0 +1,4 @@
+services:
+  system:
+    volumes:
+      - ./rviz/vehicle_simulator.rviz:/home/docker/autonomy_stack_mecanum_wheel_platform/src/base_autonomy/vehicle_simulator/rviz/vehicle_simulator.rviz:ro
