@@ -46,6 +46,7 @@ docker compose -f compose_gpu.yml up -d --force-recreate sysnav_module
 
 docker exec -it iros2026_system bash
 /home/docker/autonomy_stack_mecanum_wheel_platform/system_simulation.sh
+
 터미널 B — sysnav 실행 (컨테이너 재시작됐으니 새로 exec)
 
 
@@ -53,6 +54,7 @@ docker exec -it iros2026_sysnav_module bash
 source /opt/ros/jazzy/setup.bash
 source /home/docker/ai_module/install/setup.bash
 ros2 launch sysnav sysnav.launch.py
+
 터미널 C — 질의
 
 
@@ -60,6 +62,32 @@ docker exec -it iros2026_sysnav_module bash
 source /opt/ros/jazzy/setup.bash
 ros2 topic pub --once /challenge_question std_msgs/msg/String \
   "{data: 'Find the white chair'}"
+
+
+## --------------------------------------------------
+## A - 시뮬레이션 킬때, 방을 변경하고 싶으면 다음 sh을 실행 
+./docker/run_scene.sh home_building_1
+
+./docker/run_scene.sh hotel_room_1
+
+<위 실행 이전에 , 세팅 방법>
+맵 zip 파일을 map/ 폴더에 넣기
+
+
+/home/kante/CMU-VLN-Challenge-2026/map/<씬이름>.zip
+예: map/office_2.zip
+
+컨테이너 실행/최신화 (한 번만, 이미 떠있으면 생략)
+
+
+docker compose -f docker/compose_gpu.yml up -d system   # GPU 없으면 compose.yml
+map/ 폴더가 컨테이너 안 /home/docker/maps로 마운트되게 compose 파일에 이미 설정해놨어서, 이 명령 한 번이면 zip이 컨테이너에서 바로 보임.
+
+실행
+
+./docker/run_scene.sh <씬이름>
+예: ./docker/run_scene.sh office_2
+
 
 ## --------------------------------------------------
 

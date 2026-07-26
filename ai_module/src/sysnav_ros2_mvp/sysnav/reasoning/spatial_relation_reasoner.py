@@ -12,6 +12,7 @@ from itertools import combinations, product
 import json
 import math
 import os
+import time
 
 import cv2
 import numpy as np
@@ -172,6 +173,20 @@ class SpatialRelationReasoner:
             raise RuntimeError("Spatial-relation image JPEG encoding failed")
         return encoded.tobytes()
 
+    @staticmethod
+    def _save_debug_image(annotated: np.ndarray, relation: str) -> None:
+        if not config.SAVE_DEBUG_IMAGES:
+            return
+        try:
+            os.makedirs(config.DEBUG_DIR, exist_ok=True)
+            filename = f"sysnav_spatial_relation_{relation}_{time.time():.3f}.jpg"
+            cv2.imwrite(
+                os.path.join(config.DEBUG_DIR, filename),
+                cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR),
+            )
+        except Exception as error:  # pragma: no cover - debug output must never crash reasoning
+            print(f"[spatial_relation_reasoner] failed to save debug image: {error}")
+
     def _infer_with_gemini(
         self,
         question: str,
@@ -184,6 +199,7 @@ class SpatialRelationReasoner:
         from google.genai import types
 
         annotated = self._annotate_image(image_rgb, records)
+        self._save_debug_image(annotated, relation)
         object_summary = [
             {
                 "object_id": object_id,

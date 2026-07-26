@@ -176,12 +176,11 @@ class SysNavNode(Node):
         if not config.KEEP_MEMORY_BETWEEN_TASKS:
             self.object_memory.clear()
             self.scene_graph.clear()
+            self.viewpoint_memory.clear()
+            with self.sensor_lock:
+                pose = None if self.latest_pose is None else dict(self.latest_pose)
+            self.coverage_planner.reset(pose)
         self.scene_graph.start_task(self.task_id, parsed)
-        self.viewpoint_memory.clear()
-
-        with self.sensor_lock:
-            pose = None if self.latest_pose is None else dict(self.latest_pose)
-        self.coverage_planner.reset(pose)
 
         self.get_logger().info(
             f"Task #{self.task_id}: target={parsed['target']}, "

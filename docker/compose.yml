@@ -13,6 +13,7 @@ services:
       - /etc/localtime:/etc/localtime:ro
       - /dev/input:/dev/input
       - /dev/bus/usb:/dev/bus/usb
+      - ../map:/home/docker/maps:ro
     stdin_open: true
     tty: true
 
