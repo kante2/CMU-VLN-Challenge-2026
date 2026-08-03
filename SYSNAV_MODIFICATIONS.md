@@ -10,7 +10,48 @@
 - 커밋 이후 추가 수정사항은 아직 커밋되지 않은 working tree 변경으로 남아 있다.
 - 사용자가 별도로 수정한 `docker/C_질의.sh`, `readme_kante2.md`, `scene/`은 SysNav 변경과 분리해서 관리해야 한다.
 
-## 2. 질문 파싱 및 detection alias
+## 2. 수정 및 추가한 파일
+
+### SysNav 구현 파일
+
+| 파일 | 변경 내용 |
+|---|---|
+| `ai_module/src/sysnav_ros2_mvp/sysnav/config.py` | Gemini, alias, grounding fallback, target navigation 관련 설정 추가 |
+| `ai_module/src/sysnav_ros2_mvp/sysnav/sysnav_node.py` | parser 연결, task 초기화, target 이동 상태 로그, 목표 재발행, 1.5m 성공 기준, `TASK END 🏁` 로그 추가 |
+| `ai_module/src/sysnav_ros2_mvp/sysnav/task/gemini_query_parser.py` | Gemini 기반 질문 구조화 parser 추가 |
+| `ai_module/src/sysnav_ros2_mvp/sysnav/task/prompt_bank.py` | canonical category별 YOLO-World detection alias 목록 추가 |
+| `ai_module/src/sysnav_ros2_mvp/sysnav/task/query_parser.py` | relation chain과 Gemini parser 결과를 기존 rule parser 구조에 연결 |
+| `ai_module/src/sysnav_ros2_mvp/sysnav/perception/detector.py` | alias prompt로 검출한 결과를 canonical category로 통합하고 `detected_as` 기록 |
+| `ai_module/src/sysnav_ros2_mvp/sysnav/perception/gemini_visual_alias.py` | 검출 실패 category에 대한 이미지 기반 alias fallback 추가 |
+| `ai_module/src/sysnav_ros2_mvp/sysnav/perception/perception_pipeline.py` | detector, visual alias retry, SAM, LiDAR grounding 실행 흐름 연결 |
+| `ai_module/src/sysnav_ros2_mvp/sysnav/perception/lidar_grounding.py` | multi-frame provisional grounding, bbox/mask hit 계산, bbox 보조 fallback, 실시간 로그 추가 |
+| `ai_module/src/sysnav_ros2_mvp/sysnav/perception/debug_visualize.py` | LiDAR projection 이미지와 `bbox`, `mask`, `+bbox` overlay 추가 |
+| `ai_module/src/sysnav_ros2_mvp/sysnav/memory/object_memory.py` | canonical category, alias, `detected_as`, grounding 정보를 Object Memory에 보존 |
+
+### 테스트 파일
+
+| 파일 | 변경 내용 |
+|---|---|
+| `ai_module/src/sysnav_ros2_mvp/tests/test_query_parser.py` | alias, canonical mapping, relation parsing 테스트 추가 |
+| `ai_module/src/sysnav_ros2_mvp/tests/test_lidar_grounding_provisional.py` | provisional 누적, bbox hit, sparse mask 보충, bbox-only fallback 테스트 추가 |
+
+### 문서 파일
+
+| 파일 | 변경 내용 |
+|---|---|
+| `SYSNAV_MODIFICATIONS.md` | 전체 수정 내용, 설정값, 실행 방법, 위험 요소 정리 |
+
+### 이번 작업에서 수정하지 않은 영역
+
+- 저수준 navigation stack
+- 경로 계획 및 obstacle avoidance 알고리즘
+- 모터와 로봇 제어 코드
+- `/way_point_with_heading` 메시지 형식
+- simulation scene 원본 파일
+
+`sysnav_node.py`의 target goal 관리 로직은 수정했지만, navigation stack 자체는 수정하지 않았다.
+
+## 3. 질문 파싱 및 detection alias
 
 ### Gemini 질문 파싱
 
@@ -47,7 +88,7 @@ YOLO-World가 alias로 검출한 결과는 다시 canonical category로 통합�
 
 필수 category가 검출되지 않으면 Gemini에 현재 이미지를 전달해 추가 visual alias를 제안받고 YOLO-World를 한 번 더 실행한다.
 
-## 3. LiDAR grounding
+## 4. LiDAR grounding
 
 ### 기본 grounding 기준
 
@@ -107,7 +148,7 @@ multi_frame_provisional
 
 > 주의: `bbox_only_fallback`은 SAM과 겹치지 않는 배경, 조리대 또는 벽의 point를 객체 point로 잘못 사용할 수 있다. 작은 물체를 더 잘 등록하는 대신 잘못된 3D 위치가 생성될 위험이 있다.
 
-## 4. LiDAR debug 이미지
+## 5. LiDAR debug 이미지
 
 다음 projection 이미지를 `ai_module/debug`에 저장한다.
 
@@ -125,7 +166,7 @@ sysnav_lidar_projection_<timestamp>.jpg
 bowl 0.53 bbox=3 mask=0 +bbox=3
 ```
 
-## 5. 객체 관계 판단
+## 6. 객체 관계 판단
 
 현재 관계 판단은 VLM과 3D geometry를 함께 사용하는 구조다.
 
@@ -153,7 +194,7 @@ tail -f /home/docker/ai_module/debug/sysnav_relation_check.txt
 
 `method=gemini` 또는 `method=geometry`로 실제 사용된 판단 방식을 확인할 수 있다.
 
-## 6. Target navigation
+## 7. Target navigation
 
 ### 이동 상태 로그
 
@@ -192,7 +233,7 @@ Target navigation:     1.50m
 TASK END 🏁 Target navigation completed (task_id=1)
 ```
 
-## 7. 주요 설정값
+## 8. 주요 설정값
 
 | 설정 | 현재 값 | 의미 |
 |---|---:|---|
@@ -207,7 +248,7 @@ TASK END 🏁 Target navigation completed (task_id=1)
 | `TARGET_STUCK_TIMEOUT_SEC` | 8초 | target 이동 정체 판단 시간 |
 | `TARGET_STUCK_PROGRESS_M` | 0.10m | 진행으로 인정할 최소 거리 감소량 |
 
-## 8. 테스트 및 빌드
+## 9. 테스트 및 빌드
 
 LiDAR grounding 테스트에는 다음 항목이 포함된다.
 
@@ -238,7 +279,7 @@ PYTHONPATH=.:$PYTHONPATH /usr/bin/python3 -m unittest discover -s tests -v
 '
 ```
 
-## 9. 실행 방법
+## 10. 실행 방법
 
 빌드 후 실행 중인 SysNav를 종료하고 다음 명령으로 재시작한다.
 
@@ -255,7 +296,7 @@ ros2 topic pub --once /challenge_question std_msgs/msg/String \
   "{data: 'find the bowl closest to the knife rack near the trash can.'}"
 ```
 
-## 10. 알려진 위험 및 후속 개선점
+## 11. 알려진 위험 및 후속 개선점
 
 1. `bbox_only_fallback`은 객체가 아닌 배경 point를 사용할 수 있다.
 2. 잘못된 bbox-only 3D 위치는 geometry relation 판단과 target goal을 왜곡할 수 있다.
