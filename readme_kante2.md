@@ -39,6 +39,9 @@ docker start iros2026_system iros2026_sysnav_module
 docker compose -f compose_gpu.yml up -d --force-recreate sysnav_module
 ```
 
+## start CONTAINER----------------------------------------------------
+docker start iros2026_system iros2026_sysnav_module
+
 
 ## -----------------------------------------------------------------
 # 시뮬 겹침 초기화
@@ -59,7 +62,6 @@ ros2 launch sysnav sysnav.launch.py
 ## ----------------------명령어 요약--------------------
 터미널 A — 시뮬레이터 (이미 켜져있다면 생략)
 
-
 docker exec -it iros2026_system bash
 /home/docker/autonomy_stack_mecanum_wheel_platform/system_simulation.sh
 
@@ -78,6 +80,12 @@ docker exec -it iros2026_sysnav_module bash
 source /opt/ros/jazzy/setup.bash
 ros2 topic pub --once /challenge_question std_msgs/msg/String \
   "{data: 'Find the toilet'}"
+
+ros2 topic pub --once /challenge_question std_msgs/msg/String \
+"{data: 'Find the bowl closest to the knife rack near the trash can.'}"
+
+ros2 topic pub --once /challenge_question std_msgs/msg/String \
+"{data: 'Find the bowl near the trash can.'}"
 
 
 ## --------------------------------------------------
@@ -141,7 +149,7 @@ ros2 launch sysnav sysnav.launch.py
 docker exec -it iros2026_sysnav_module bash
 source /opt/ros/jazzy/setup.bash
 ros2 topic pub --once /challenge_question std_msgs/msg/String \
-  "{data: 'Find the white chair'}"
+  "{data: 'Find the toilet'}"
 ```
 `network_mode: host`라 어느 컨테이너에서 쏴도 상관없음 (system, sysnav_module 다 같은 ROS2 네트워크).
 

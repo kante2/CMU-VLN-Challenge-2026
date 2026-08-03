@@ -25,21 +25,6 @@ class SpatialRelationReasoner:
     def __init__(self) -> None:
         self.api_key = os.getenv("GEMINI_API_KEY")
         self._client = None
-        # sysnav_relation_check.txt는 매번 append라 노드를 재실행할 때마다 이전 실행
-        # 기록이 계속 쌓였다. 노드가 새로 뜰 때(=SpatialRelationReasoner가 새로 생성될
-        # 때) 한 번 지워서, 이번 실행 동안의 기록만 남게 한다.
-        self._reset_debug_table()
-
-    @staticmethod
-    def _reset_debug_table() -> None:
-        if not config.SAVE_DEBUG_IMAGES:
-            return
-        try:
-            path = os.path.join(config.DEBUG_DIR, "sysnav_relation_check.txt")
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as error:  # pragma: no cover - debug output must never crash startup
-            print(f"[spatial_relation_reasoner] failed to reset relation debug table: {error}")
 
     def infer(
         self,

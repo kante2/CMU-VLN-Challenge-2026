@@ -23,8 +23,6 @@ from visualization_msgs.msg import MarkerArray
 from sysnav import config
 from sysnav.exploration.coverage_planner import CoveragePlanner
 from sysnav.exploration.viewpoint_memory import ViewpointMemory
-from sysnav.rooms.room_segmenter import RoomSegmenter
-from sysnav.rooms.room_visualizer import export_room_segmentation
 from sysnav.memory.object_memory import ObjectMemory
 from sysnav.navigation.goal_publisher import GoalPublisher
 from sysnav.perception.perception_pipeline import PerceptionPipeline
@@ -38,7 +36,8 @@ from sysnav.ros_helpers import (
     odometry_to_pose,
     pointcloud2_to_xyz,
 )
-from sysnav.task.query_parser import extract_target, effective_relation_chain
+from sysnav.task.gemini_query_parser import GeminiQueryParser
+from sysnav.task.query_parser import effective_relation_chain
 
 '''
 ThreadPoolExecutor 문법 -  시간이 오래걸리는 함수를 별도 작업 스레드에서 실행하도록 맡기는 도구,
@@ -114,17 +113,20 @@ class SysNavNode(Node):
         # novel LiDAR voxel coverage가 충분할 때만 생성하며 debug graph를 갱신한다.
         self.scene_graph = SceneGraphManager(debug_dir=config.DEBUG_DIR)
         self.selector = GeminiSelector()
+        self.query_parser = GeminiQueryParser()
         self.coverage_planner = CoveragePlanner()
-        self.room_segmenter = RoomSegmenter()
         self.viewpoint_memory = ViewpointMemory()
         self.goal_publisher = GoalPublisher(self)
         self.object_marker_pub = self.create_publisher(MarkerArray, config.TOPIC_OBJECT_MARKERS, 10)
 
         self.current_goal: dict | None = None
         self.exploration_route = deque()
-        self._latest_room_segmentation: dict | None = None
         self._exploration_goal_best_distance_m: float | None = None
         self._exploration_goal_last_progress_time: float | None = None
+        self._target_goal_best_distance_m: float | None = None
+        self._target_goal_last_progress_time: float | None = None
+        self._target_last_status_log_time = 0.0
+        self._target_goal_republish_count = 0
 
         self.question_sub = self.create_subscription(
             String,
@@ -169,7 +171,7 @@ class SysNavNode(Node):
     # ------------------------------------------------------------------
 
     def question_callback(self, msg: String) -> None:
-        parsed = extract_target(msg.data)
+        parsed = self.query_parser.parse(msg.data)
         if not parsed["target"]:
             self.get_logger().error(f"Could not extract target object: {msg.data}")
             return
@@ -181,6 +183,11 @@ class SysNavNode(Node):
             self.current_goal = None
             self.exploration_route.clear()
             self.last_processed_image_stamp = -1.0
+            self._target_goal_best_distance_m = None
+            self._target_goal_last_progress_time = None
+            self._target_last_status_log_time = 0.0
+            self._target_goal_republish_count = 0
+            self.perception.begin_task()
 
         if not config.KEEP_MEMORY_BETWEEN_TASKS:
             self.object_memory.clear()
@@ -195,7 +202,8 @@ class SysNavNode(Node):
         self.get_logger().info(
             f"Task #{self.task_id}: target={parsed['target']}, "
             f"attributes={parsed['attributes']}, relation={parsed['relation']}, "
-            f"references={parsed['reference_objects']}"
+            f"references={parsed['reference_objects']}, "
+            f"prompts={parsed['detection_prompts']}, parser={parsed.get('parser', 'rules')}"
         )
 
     def state_callback(self, msg: Odometry) -> None:
@@ -237,17 +245,6 @@ class SysNavNode(Node):
         self.coverage_planner.update_from_scan(pointcloud2_to_xyz(scan_msg), pose)
         #-> Occupancy Map
         # frontier는 이 occupancy map을 통해서 찾게 된다.
-        self._update_room_segmentation()
-
-    # Room Node segmentation (SysNav paper Sec. IV-A-1) - 매핑이 갱신될 때마다 같이
-    # 갱신하고, room_segmentation_latest.png를 scene_graph_latest.png와 같은 패턴으로
-    # (append가 아니라 매번 통째로 다시 그려서) 덮어쓴다.
-    def _update_room_segmentation(self) -> None:
-        grid = self.coverage_planner.snapshot_grid()
-        max_height = self.coverage_planner.snapshot_max_height()
-        result = self.room_segmenter.segment(grid, max_height=max_height)
-        self._latest_room_segmentation = result
-        export_room_segmentation(grid, result)
     '''
     NumPy XYZ 배열
     ↓
@@ -306,6 +303,7 @@ class SysNavNode(Node):
             points_sensor=points_sensor, # pointcloud -> numpy
             prompts=list(task["detection_prompts"]), #  YOLO-World가 검출해야 하는 객체 목록 -> prompts
             robot_pose=pose, # LiDAR의 객체 point를 map 좌표로 변환
+            prompt_categories=dict(task.get("prompt_categories", {})),
         )
         '''
         < self.perception.process 내부 구조 >
@@ -343,11 +341,19 @@ class SysNavNode(Node):
             object_nodes=observed_object_nodes,
             task=task,
         )
+        required_categories = {str(task["target"]).lower()}
+        for source, _relation, reference in effective_relation_chain(task):
+            required_categories.add(str(source).lower())
+            required_categories.add(str(reference).lower())
+        observed_categories = {
+            str(observation["category"]).lower() for observation in observations
+        }
         return {
             "task_id": task_id,
             "image_stamp": image_stamp,
             "candidates": self.object_memory.find_by_category(task["target"]),
             "scene_graph": graph_update,
+            "missing_categories": sorted(required_categories - observed_categories),
         }
     '''
     동기화된 이미지·LiDAR·로봇 pose를 이용해 객체를 3D로 인식하고, Object Memory를 갱신한 뒤 목표 객체 후보들을 반환하는 작업
@@ -381,12 +387,6 @@ class SysNavNode(Node):
                 for candidate in candidates
                 if int(candidate["object_id"]) in relation_candidate_ids
             ]
-        elif effective_relation_chain(task):
-            # 문장에 relation 제약(예: "knife rack 근처의")이 있는데 아직 그 제약을
-            # 만족하는 candidate가 하나도 검증 안 됐다 - 보통 참조 물체(knife rack)를
-            # 아직 못 봤기 때문. 검증 안 된 채로 아무 bowl이나 확정지으면 오답으로
-            # navigation을 끝내버리게 되므로, 여기서 확정하지 않고 계속 탐색하게 한다.
-            return {"task_id": task_id, "selected_id": None, "relation_pending": True}
 
         # GeminiSelector()
         selected_id = self.selector.select(
@@ -398,8 +398,7 @@ class SysNavNode(Node):
         )
         return {
             "task_id": task_id, # 현재 처리중인 질문 번호 / worker가 어느 질문인지 확인하기 위함.
-            "selected_id": selected_id,
-            "relation_pending": False,
+            "selected_id": selected_id
             } # task (질의문장) 에 대해 선택된 object_id 반환
     '''
     Object Memory에 저장된 목표 후보들 중에서, 질문에 가장 맞는 객체 하나의 object_id를 고르는 작업
@@ -422,9 +421,7 @@ class SysNavNode(Node):
     def exploration_job(self, task_id: int, pose: dict) -> dict:
         return {
             "task_id": task_id,
-            "route": self.coverage_planner.plan_route(
-                pose, self.viewpoint_memory, room_segmentation=self._latest_room_segmentation
-            ),
+            "route": self.coverage_planner.plan_route(pose, self.viewpoint_memory),
         }
 
     # ------------------------------------------------------------------
@@ -510,6 +507,11 @@ class SysNavNode(Node):
         if kind == "perception":
             self.last_processed_image_stamp = float(result["image_stamp"])
             self.last_perception_wall_time = time.monotonic()
+            if result.get("missing_categories"):
+                self.get_logger().info(
+                    "Canonical categories not grounded in this frame: "
+                    f"{result['missing_categories']}"
+                )
             graph_update = result.get("scene_graph")
             if graph_update and graph_update.get("debug_files"):
                 if graph_update.get("viewpoint_created"):
@@ -540,16 +542,6 @@ class SysNavNode(Node):
                     self.state = "PLAN_EXPLORATION"
 
         elif kind == "selection":
-            if result.get("relation_pending"):
-                # 문장의 relation 제약(예: "knife rack 근처")이 아직 검증 안 된 candidate뿐이다.
-                # 확정하지 않고 계속 탐색해서 참조 물체를 더 찾아본다.
-                self.get_logger().info(
-                    "Selection deferred: relation constraint not verified for any candidate yet, "
-                    "continuing exploration"
-                )
-                with self.state_lock:
-                    self.state = "PLAN_EXPLORATION"
-                return
             selected = self.object_memory.get(result["selected_id"])
             with self.sensor_lock:
                 pose = None if self.latest_pose is None else dict(self.latest_pose)
@@ -566,6 +558,11 @@ class SysNavNode(Node):
                 "type": "target",
                 "object_id": selected["object_id"],
             }
+            now = time.monotonic()
+            self._target_goal_best_distance_m = None
+            self._target_goal_last_progress_time = now
+            self._target_last_status_log_time = now
+            self._target_goal_republish_count = 0
             # 선택된 target object를 Scene Graph에 표시하고 debug PNG/JSON/DOT을 갱신한다.
             self.scene_graph.mark_selected_object(selected["object_id"])
             self.publish_object_markers()
@@ -581,9 +578,7 @@ class SysNavNode(Node):
             if not route:
                 with self.state_lock:
                     self.state = "FAILED"
-                self.get_logger().warning(
-                    f"No reachable frontier remains ({self.coverage_planner.describe_last_plan_failure()})"
-                )
+                self.get_logger().warning("No reachable frontier remains")
                 return
             self.exploration_route = deque(route)
             self.publish_next_exploration_goal()
@@ -611,10 +606,57 @@ class SysNavNode(Node):
             return
 
         if state == "NAVIGATE_TARGET":
-            if self.goal_reached(pose):
+            assert self.current_goal is not None
+            target_distance = math.hypot(
+                float(self.current_goal["x"]) - float(pose["x"]),
+                float(self.current_goal["y"]) - float(pose["y"]),
+            )
+            now = time.monotonic()
+            if now - self._target_last_status_log_time >= config.TARGET_STATUS_LOG_INTERVAL_SEC:
+                self._target_last_status_log_time = now
+                self.get_logger().info(
+                    "NAVIGATE_TARGET: "
+                    f"robot=({pose['x']:.2f}, {pose['y']:.2f}), "
+                    f"goal=({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f}), "
+                    f"dist={target_distance:.2f}m, "
+                    f"republish_count={self._target_goal_republish_count}"
+                )
+
+            if target_distance <= config.TARGET_GOAL_REACHED_DISTANCE_M:
                 with self.state_lock:
                     self.state = "SUCCESS"
-                self.get_logger().info("Target navigation completed")
+                self.get_logger().info(
+                    f"TASK END 🏁 Target navigation completed (task_id={task_id})"
+                )
+                return
+
+            if (
+                self._target_goal_best_distance_m is None
+                or target_distance
+                <= self._target_goal_best_distance_m - config.TARGET_STUCK_PROGRESS_M
+            ):
+                self._target_goal_best_distance_m = target_distance
+                self._target_goal_last_progress_time = now
+
+            if (
+                self._target_goal_last_progress_time is not None
+                and now - self._target_goal_last_progress_time >= config.TARGET_STUCK_TIMEOUT_SEC
+            ):
+                self.goal_publisher.publish(
+                    self.current_goal["x"],
+                    self.current_goal["y"],
+                    self.current_goal["theta"],
+                )
+                self._target_goal_republish_count += 1
+                self._target_goal_best_distance_m = target_distance
+                self._target_goal_last_progress_time = now
+                self.get_logger().warning(
+                    "NAVIGATE_TARGET made no progress for "
+                    f"{config.TARGET_STUCK_TIMEOUT_SEC:.0f}s; republishing goal "
+                    f"({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f}, "
+                    f"{self.current_goal['theta']:.2f}), "
+                    f"attempt={self._target_goal_republish_count}"
+                )
             return
 
         if state == "FOLLOW_EXPLORATION":

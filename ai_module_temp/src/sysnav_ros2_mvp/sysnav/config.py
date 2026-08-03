@@ -20,10 +20,14 @@ SENSOR_SYNC_TOLERANCE_SEC = 0.30
 SCAN_BUFFER_SIZE = 40
 POSE_BUFFER_SIZE = 100
 GOAL_REACHED_DISTANCE_M = 0.55
+TARGET_GOAL_REACHED_DISTANCE_M = 1.50
 # exploration goal까지 거리가 이 이상 줄지 않은 채 이 시간(초)이 지나면 도달 불가로 보고 포기한다.
 # (벽 너머 등 실제로는 갈 수 없는 waypoint에 로봇이 영원히 박혀있는 것을 막기 위한 안전장치)
 EXPLORATION_STUCK_TIMEOUT_SEC = 8.0
 EXPLORATION_STUCK_PROGRESS_M = 0.10
+TARGET_STATUS_LOG_INTERVAL_SEC = 1.0
+TARGET_STUCK_TIMEOUT_SEC = 8.0
+TARGET_STUCK_PROGRESS_M = 0.10
 TARGET_STANDOFF_DISTANCE_M = 0.90
 KEEP_MEMORY_BETWEEN_TASKS = True
 
@@ -41,6 +45,15 @@ SAM2_MIN_MASK_AREA_PX = 80
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_TEMPERATURE = 0.0
+GEMINI_QUERY_PARSER_ENABLED = os.getenv(
+    "GEMINI_QUERY_PARSER_ENABLED", "1"
+) not in ("0", "false", "False")
+GEMINI_VISUAL_ALIAS_FALLBACK_ENABLED = os.getenv(
+    "GEMINI_VISUAL_ALIAS_FALLBACK_ENABLED", "1"
+) not in ("0", "false", "False")
+GEMINI_VISUAL_ALIAS_MAX_ALIASES = max(
+    1, int(os.getenv("GEMINI_VISUAL_ALIAS_MAX_ALIASES", "3"))
+)
 
 SAVE_DEBUG_IMAGES = os.getenv("SYSNAV_SAVE_DEBUG_IMAGES", "1") not in ("0", "false", "False")
 DEBUG_DIR = os.getenv("SYSNAV_DEBUG_DIR", "/home/docker/ai_module/debug")
@@ -63,7 +76,13 @@ PANORAMA_YAW_OFFSET_DEG = float(os.getenv("PANORAMA_YAW_OFFSET_DEG", "0.0"))
 PANORAMA_PITCH_OFFSET_DEG = float(os.getenv("PANORAMA_PITCH_OFFSET_DEG", "0.0"))
 GROUNDING_MIN_RANGE_M = 0.30
 GROUNDING_MAX_RANGE_M = 30.0
-GROUNDING_MIN_POINTS = 5
+GROUNDING_MIN_POINTS = 3
+GROUNDING_PROVISIONAL_MIN_POINTS = 1
+GROUNDING_PROVISIONAL_MIN_FRAMES = 2
+GROUNDING_PROVISIONAL_TIMEOUT_SEC = 5.0
+GROUNDING_PROVISIONAL_ASSOCIATION_DISTANCE_M = 0.75
+GROUNDING_BBOX_FALLBACK_MAX_MASK_DISTANCE_PX = 5.0
+GROUNDING_BBOX_FALLBACK_DEPTH_TOLERANCE_M = 0.30
 GROUNDING_MAX_OBJECT_POINTS = 2048
 
 ASSOCIATION_MAX_DISTANCE_M = 1.20
@@ -85,65 +104,18 @@ MAP_UPDATE_INTERVAL_SEC = 0.35
 OCC_UNKNOWN = -1
 OCC_FREE = 0
 OCC_OCCUPIED = 100
-# 이 값 x2가 "통과 가능한 최소 문/통로 폭"이다 (양쪽에서 벽을 이만큼씩 부풀리므로).
-# 원래 0.45 -> 0.30으로 낮췄는데도 문 통과가 잘 안 돼서 더 낮춤(최소 통과 폭 0.4m).
-# 실제 로봇 폭을 몰라 정확한 값은 아니니, 나중에 실측되면 갱신할 것 - 로봇이 문틀에
-# 부딪히면 다시 올려야 한다.
-ROBOT_CLEARANCE_M = 0.20
-
-# Room Node segmentation (SysNav paper Sec. IV-A-1, "Scene Representation Building").
-# 논문은 3D point cloud에서 벽 평면을 피팅해서 방을 나누지만, 우리는 이미 2D top-down
-# occupancy grid(OCC_OCCUPIED = 벽의 2D 투영)가 있어서 그걸로 대신한다: 벽에서
-# ROOM_SEGMENTATION_MIN_CLEARANCE_M 이상 떨어진 "넓은" 영역을 방의 core로 잡고,
-# distance-transform 기반 watershed로 거기서부터 채워나간다 - 문처럼 좁은 통로는
-# 이 값보다 거리가 짧아서 자연스럽게 두 방 사이의 경계(ridge)가 된다. 문 폭의
-# 절반보다는 크고, 가장 좁은 방의 절반 폭보다는 작아야 한다.
-ROOM_SEGMENTATION_MIN_CLEARANCE_M = 0.75
-ROOM_SEGMENTATION_MIN_ROOM_CELLS = 40
-# OCC_OCCUPIED은 벽/가구를 구분 안 하므로, room 경계로는 "충분히 높이까지 닿은" 셀만
-# 진짜 벽으로 본다 (소파/테이블/의자 등은 보통 이 아래, 실제 벽은 MAP_OBSTACLE_Z_MAX_M
-# 안에서도 이 위까지 계속 point가 찍힘). CoveragePlanner.max_height 기준.
-ROOM_WALL_MIN_HEIGHT_M = 1.30
-# 벽(위 기준으로 판정된 것) 주변에 이만큼 더 두껍게 padding을 줘서 distance-transform을
-# 계산한다 - 문처럼 좁은 통로가 코어 임계값보다 확실히 더 낮게 나오도록 여유를 더 준다.
-# (room segmentation 전용 값이라 실제 주행 가능 여부(ROBOT_CLEARANCE_M)에는 영향 없음 -
-# 방을 나누는 그림/판정만 더 정확해질 뿐, 원래도 두꺼워서 문 통과가 막힌 원인은 아니었지만
-# 요청대로 줄여둠.)
-ROOM_SEGMENTATION_WALL_PADDING_M = 0.05
-
+ROBOT_CLEARANCE_M = 0.45
 FRONTIER_MIN_CLUSTER_CELLS = 5
 FRONTIER_COVERAGE_RADIUS_M = 3.0  # 논문의 d_cover
-# candidate에서 surface point가 "보이는지"(LOS) 판정할 때 쓰는 벽 margin. ROBOT_CLEARANCE_M
-# (몸체가 실제로 지나갈 수 있는지)과는 다른 목적이라 따로 둔다 - frontier는 정의상 벽
-# 바로 옆에 있는 경우가 많은데, candidate는 항상 clearance 밖에 서야 해서 그 둘 사이
-# 직선이 clearance 버퍼 셀을 스치기만 해도 "안 보인다"고 오판되어 coverage 점수가
-# 0이 되어버리는 문제가 있었다. 대각선 코너 스침만 막을 정도의 작은 값으로 둔다.
-FRONTIER_LOS_WALL_MARGIN_M = 0.15
 
 # In-room exploration policy (SysNav paper Sec. IV-B-1): stochastic candidate selection
 EXPLORATION_CANDIDATE_SAMPLES = 60  # |H|, 한 사이클에 샘플링할 pose 후보 수
 EXPLORATION_MIN_SCORE_DELTA = 3     # δ, wcov가 이 밑으로 떨어지면 후보 뽑기를 멈춤
 EXPLORATION_STOCHASTIC_TRIALS = 4   # K, stochastic sampling을 반복해서 TSP 비용 최소인 것을 채택
-# 한 plan_route() 사이클에서 최대 몇 개의 candidate를 한 번에 뽑아 TSP로 묶을지. frontier
-# anchor(모든 남은 frontier마다 보장되는 후보)까지 생기면서, 방 양쪽 끝처럼 서로 먼 두 곳이
-# 한 번에 다 뽑혀서 "이쪽 찍고 저쪽 찍고" 왔다갔다 하는 경로가 나오는 문제가 있었다. 1로
-# 두면 매 사이클 가장 좋은 후보 하나만 골라서 그리로 갔다가, 도착하면 최신 지도로 다시
-# 고른다 - 논문의 "batch로 여러 개 묶어서 효율화"보다는 덜 효율적일 수 있지만 왔다갔다
-# 하는 걸 원천적으로 막는다.
-EXPLORATION_MAX_CANDIDATES_PER_CYCLE = 1
-# candidate를 뽑는 확률 가중치를 순수 wcov가 아니라 로봇 현재 위치로부터의 거리로
-# 감쇠시킨다 (weight = wcov / (1 + distance/halflife)). 이 값(m)만큼 떨어지면 가중치가
-# 절반이 된다. MAX_CANDIDATES_PER_CYCLE=1로도, 방 양쪽 끝의 wcov 점수가 비슷하면 매
-# cycle 거의 50:50으로 반대쪽이 뽑혀서 여전히 왔다갔다하는 것처럼 보이는 문제가 있었다 -
-# 가까운 후보를 확실히 우선해서 이 진동을 줄인다. 값을 키우면 거리 영향이 약해진다.
-EXPLORATION_DISTANCE_PENALTY_HALFLIFE_M = 3.0
 # candidate까지 A*로 구한 경로를 이 간격(m)으로 잘라 중간 waypoint를 만든다. 최종 목적지 하나만
 # 찍어서 보내면 그 사이에 벽이 있을 때 base autonomy가 돌아가지 못하고 벽에 막힐 수 있어서,
 # 내부 occupancy grid가 이미 계산해둔 (벽을 피해가는) A* 경로를 따라 짧게 여러 번 나눠 보낸다.
-# (원래 1.5m라 waypoint(보라색 점)가 너무 자주/가깝게 찍혀서 3.0m로 늘림 - 뚫린 직선
-# 구간에서는 여전히 한 번에 더 길게 건너뛴다, string-pulling이라 코너/문에서는 자동으로
-# 촘촘해짐 - _simplify_path_indices 참고.)
-EXPLORATION_PATH_WAYPOINT_SPACING_M = 3.0
+EXPLORATION_PATH_WAYPOINT_SPACING_M = 1.5
 
 VIEWPOINT_MIN_DISTANCE_M = 1.0
 

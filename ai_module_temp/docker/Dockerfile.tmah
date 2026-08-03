@@ -1,0 +1,60 @@
+FROM zhangjicmu/ubuntu24_ros:ai_module
+
+# apt/pip 설치를 위해 잠시 root 로 전환
+USER root
+
+# 베이스 이미지에 pip 이 없으므로 apt 로 먼저 설치
+RUN apt-get update && \
+    apt-get install -y python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+# 파이썬 인식/추론 라이브러리
+#   - GroundingDINO(검출) + Qwen2-VL(선택) 둘 다 transformers 로 로드
+#   - qwen-vl-utils: Qwen 비전 입력 헬퍼
+#   - accelerate: device_map 로딩
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+    "torch" "torchvision" \
+    "transformers>=4.49" \
+    "qwen-vl-utils" \
+    "accelerate" \
+    "pillow" "numpy"
+
+# 모델 가중치 빌드 시점에 미리 받기 (test-time 네트워크 불필요)
+#  1) GroundingDINO-tiny  2) Qwen2-VL-2B-Instruct
+# Qwen2.5-VL-3B(~6.3GB)는 GroundingDINO+SAM이랑 8GB GPU에 같이 못 들어가서(OOM)
+# Qwen2-VL-2B(~4GB)로 낮춤 (2026-07-09).
+RUN python3 -c "\
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection; \
+m='IDEA-Research/grounding-dino-tiny'; \
+AutoProcessor.from_pretrained(m); \
+AutoModelForZeroShotObjectDetection.from_pretrained(m); \
+print('GroundingDINO cached.')" || echo "WARN: grounding-dino pre-download skipped"
+
+RUN python3 -c "\
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration; \
+m='Qwen/Qwen2-VL-2B-Instruct'; \
+AutoProcessor.from_pretrained(m); \
+Qwen2VLForConditionalGeneration.from_pretrained(m, torch_dtype='auto'); \
+print('Qwen2-VL cached.')" || echo "WARN: qwen pre-download skipped"
+
+# 3) SAM (box-prompted segmentation, bbox 안 배경 point 오염 줄이는 데 사용)
+RUN python3 -c "\
+from transformers import SamModel, SamProcessor; \
+m='facebook/sam-vit-base'; \
+SamProcessor.from_pretrained(m); \
+SamModel.from_pretrained(m); \
+print('SAM cached.')" || echo "WARN: SAM pre-download skipped"
+
+# tmah_vlm 소스 복사
+COPY src/tmah_vlm /home/docker/ai_module/src/tmah_vlm
+
+# tmah_vlm 패키지만 빌드
+WORKDIR /home/docker/ai_module
+RUN /bin/bash -c "\
+    source /opt/ros/jazzy/setup.bash && \
+    colcon build --symlink-install --packages-select tmah_vlm"
+
+RUN echo "source /home/docker/ai_module/install/setup.bash" >> /home/docker/.bashrc
+
+# 원래 유저로 복귀
+USER docker
