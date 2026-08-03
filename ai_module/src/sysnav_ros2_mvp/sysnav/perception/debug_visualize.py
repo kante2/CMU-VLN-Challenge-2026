@@ -37,7 +37,14 @@ def save_lidar_projection_image(
                 cv2.circle(overlay, (u, v), 4, (0, 0, 255), -1, cv2.LINE_AA)
             x1, y1, x2, y2 = [int(value) for value in hit.get("bbox", (0, 0, 0, 0))]
             cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label = f"{hit.get('category', '')} lidar_hits={len(hit_u)}"
+            bbox_hits = int(hit.get("bbox_hits", 0))
+            mask_hits = int(hit.get("mask_hits", len(hit_u)))
+            supplemented_hits = int(hit.get("supplemented_hits", 0))
+            label = (
+                f"{hit.get('category', '')} "
+                f"bbox_hits={bbox_hits} mask_hits={mask_hits} "
+                f"+bbox={supplemented_hits}"
+            )
             cv2.putText(
                 overlay,
                 label,
@@ -94,8 +101,12 @@ def save_debug_image(
             cv2.rectangle(overlay, (x1, y1), (x2, y2), _BOX_COLOR_BGR, 2)
 
             label = f"{det['category']} {det['confidence']:.2f}"
-            lidar_points = int(det.get("grounding_num_points", 0))
-            label += f" lidar={lidar_points}"
+            bbox_points = int(det.get("bbox_lidar_points", 0))
+            mask_points = int(det.get("grounding_num_points", 0))
+            label += f" bbox={bbox_points} mask={mask_points}"
+            supplemented_points = int(det.get("supplemented_num_points", 0))
+            if supplemented_points:
+                label += f" +bbox={supplemented_points}"
             provisional_points = int(det.get("provisional_num_points", 0))
             provisional_frames = int(det.get("provisional_frame_count", 0))
             if provisional_points:

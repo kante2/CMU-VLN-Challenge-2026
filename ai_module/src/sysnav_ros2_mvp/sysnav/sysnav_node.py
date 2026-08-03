@@ -123,6 +123,10 @@ class SysNavNode(Node):
         self.exploration_route = deque()
         self._exploration_goal_best_distance_m: float | None = None
         self._exploration_goal_last_progress_time: float | None = None
+        self._target_goal_best_distance_m: float | None = None
+        self._target_goal_last_progress_time: float | None = None
+        self._target_last_status_log_time = 0.0
+        self._target_goal_republish_count = 0
 
         self.question_sub = self.create_subscription(
             String,
@@ -179,6 +183,10 @@ class SysNavNode(Node):
             self.current_goal = None
             self.exploration_route.clear()
             self.last_processed_image_stamp = -1.0
+            self._target_goal_best_distance_m = None
+            self._target_goal_last_progress_time = None
+            self._target_last_status_log_time = 0.0
+            self._target_goal_republish_count = 0
             self.perception.begin_task()
 
         if not config.KEEP_MEMORY_BETWEEN_TASKS:
@@ -550,6 +558,11 @@ class SysNavNode(Node):
                 "type": "target",
                 "object_id": selected["object_id"],
             }
+            now = time.monotonic()
+            self._target_goal_best_distance_m = None
+            self._target_goal_last_progress_time = now
+            self._target_last_status_log_time = now
+            self._target_goal_republish_count = 0
             # 선택된 target object를 Scene Graph에 표시하고 debug PNG/JSON/DOT을 갱신한다.
             self.scene_graph.mark_selected_object(selected["object_id"])
             self.publish_object_markers()
@@ -593,10 +606,57 @@ class SysNavNode(Node):
             return
 
         if state == "NAVIGATE_TARGET":
-            if self.goal_reached(pose):
+            assert self.current_goal is not None
+            target_distance = math.hypot(
+                float(self.current_goal["x"]) - float(pose["x"]),
+                float(self.current_goal["y"]) - float(pose["y"]),
+            )
+            now = time.monotonic()
+            if now - self._target_last_status_log_time >= config.TARGET_STATUS_LOG_INTERVAL_SEC:
+                self._target_last_status_log_time = now
+                self.get_logger().info(
+                    "NAVIGATE_TARGET: "
+                    f"robot=({pose['x']:.2f}, {pose['y']:.2f}), "
+                    f"goal=({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f}), "
+                    f"dist={target_distance:.2f}m, "
+                    f"republish_count={self._target_goal_republish_count}"
+                )
+
+            if target_distance <= config.TARGET_GOAL_REACHED_DISTANCE_M:
                 with self.state_lock:
                     self.state = "SUCCESS"
-                self.get_logger().info("Target navigation completed")
+                self.get_logger().info(
+                    f"TASK END 🏁 Target navigation completed (task_id={task_id})"
+                )
+                return
+
+            if (
+                self._target_goal_best_distance_m is None
+                or target_distance
+                <= self._target_goal_best_distance_m - config.TARGET_STUCK_PROGRESS_M
+            ):
+                self._target_goal_best_distance_m = target_distance
+                self._target_goal_last_progress_time = now
+
+            if (
+                self._target_goal_last_progress_time is not None
+                and now - self._target_goal_last_progress_time >= config.TARGET_STUCK_TIMEOUT_SEC
+            ):
+                self.goal_publisher.publish(
+                    self.current_goal["x"],
+                    self.current_goal["y"],
+                    self.current_goal["theta"],
+                )
+                self._target_goal_republish_count += 1
+                self._target_goal_best_distance_m = target_distance
+                self._target_goal_last_progress_time = now
+                self.get_logger().warning(
+                    "NAVIGATE_TARGET made no progress for "
+                    f"{config.TARGET_STUCK_TIMEOUT_SEC:.0f}s; republishing goal "
+                    f"({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f}, "
+                    f"{self.current_goal['theta']:.2f}), "
+                    f"attempt={self._target_goal_republish_count}"
+                )
             return
 
         if state == "FOLLOW_EXPLORATION":

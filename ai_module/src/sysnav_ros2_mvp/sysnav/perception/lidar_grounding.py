@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 
+import cv2
 import numpy as np
 
 from sysnav import config
@@ -26,6 +27,72 @@ def _base_to_map(points: np.ndarray, pose: dict) -> np.ndarray:
     ])
     translation = np.array([pose["x"], pose["y"], pose.get("z", 0.0)], dtype=np.float64)
     return points @ rotation.T + translation
+
+
+def count_bbox_hits(u: np.ndarray, v: np.ndarray, bbox: tuple[int, int, int, int]) -> int:
+    """Count projected LiDAR pixels inside an xyxy detection box."""
+    x1, y1, x2, y2 = bbox
+    inside = (u >= x1) & (u < x2) & (v >= y1) & (v < y2)
+    return int(np.count_nonzero(inside))
+
+
+def supplement_mask_hits_from_bbox(
+    mask: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    projected_points: np.ndarray,
+    selected: np.ndarray,
+) -> tuple[np.ndarray, int]:
+    """Add only nearby, depth-consistent bbox points to a sparse SAM mask."""
+    selected = np.asarray(selected, dtype=bool)
+    mask_hits = int(np.count_nonzero(selected))
+    if mask_hits >= config.GROUNDING_MIN_POINTS:
+        return selected, 0
+
+    x1, y1, x2, y2 = bbox
+    inside_bbox = (u >= x1) & (u < x2) & (v >= y1) & (v < y2)
+    if int(np.count_nonzero(inside_bbox)) < config.GROUNDING_MIN_POINTS:
+        return selected, 0
+
+    if mask_hits == 0:
+        # When SAM has no LiDAR hit, fall back directly to every projected
+        # point inside the detection bbox, as long as the normal minimum-point
+        # threshold is satisfied.
+        supplemented = selected.copy()
+        supplemented[inside_bbox] = True
+        return supplemented, int(np.count_nonzero(inside_bbox))
+
+    # distanceTransform gives each non-mask pixel's distance to the nearest
+    # SAM-mask pixel. This keeps the fallback local instead of accepting the
+    # entire (often background-heavy) detection box.
+    mask_bool = np.asarray(mask, dtype=bool)
+    distance_to_mask = cv2.distanceTransform(
+        (~mask_bool).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_3
+    )
+    pixel_distance = distance_to_mask[v, u]
+
+    ranges = np.linalg.norm(projected_points, axis=1)
+    reference_range = float(np.median(ranges[selected]))
+    range_error = np.abs(ranges - reference_range)
+    candidates = (
+        inside_bbox
+        & ~selected
+        & (pixel_distance <= config.GROUNDING_BBOX_FALLBACK_MAX_MASK_DISTANCE_PX)
+        & (range_error <= config.GROUNDING_BBOX_FALLBACK_DEPTH_TOLERANCE_M)
+    )
+    candidate_indices = np.flatnonzero(candidates)
+    if not len(candidate_indices):
+        return selected, 0
+
+    # Use only the minimum number of extra points, preferring pixels closest
+    # to the SAM mask and then points with the closest depth.
+    order = np.lexsort((range_error[candidate_indices], pixel_distance[candidate_indices]))
+    needed = config.GROUNDING_MIN_POINTS - mask_hits
+    chosen = candidate_indices[order[:needed]]
+    supplemented = selected.copy()
+    supplemented[chosen] = True
+    return supplemented, int(len(chosen))
 
 
 class PanoramaLidarGrounder:
@@ -183,7 +250,17 @@ class PanoramaLidarGrounder:
         now = time.monotonic()
         self._expire_provisional(now)
         # 0. error check
-        if not segmented_objects or points_sensor.size == 0:
+        if not segmented_objects:
+            return []
+        if points_sensor.size == 0:
+            for segmented in segmented_objects:
+                segmented["bbox_lidar_points"] = 0
+                segmented["grounding_num_points"] = 0
+                print(
+                    "[sysnav lidar_grounding] "
+                    f"category={segmented.get('category', '')} bbox_hits=0 mask_hits=0",
+                    flush=True,
+                )
             return []
         # 1. lidar을 이미지에 투영
         # LiDAR의 3D 점을 파노라마 이미지의 2D 픽셀로 바꾼다.
@@ -195,6 +272,14 @@ class PanoramaLidarGrounder:
         }
         # - error check: 투영된 LiDAR point가 없으면 빈 list 반환
         if not len(projection_lidar_to_image["indices"]):
+            for segmented in segmented_objects:
+                segmented["bbox_lidar_points"] = 0
+                segmented["grounding_num_points"] = 0
+                print(
+                    "[sysnav lidar_grounding] "
+                    f"category={segmented.get('category', '')} bbox_hits=0 mask_hits=0",
+                    flush=True,
+                )
             return []
 
         # 2. SAM2 mask 안에 들어오는 LiDAR point만 선택
@@ -207,23 +292,56 @@ class PanoramaLidarGrounder:
         output_3D_list_ = [] # 각 객체의 3D 정보를 하나씩 만들어 저장할 리스트
 
         for segmented in segmented_objects:
-            selected = segmented["mask"][
+            bbox = tuple(segmented.get("bbox", (0, 0, 0, 0)))
+            bbox_hits = count_bbox_hits(
+                projection_lidar_to_image["u"],
+                projection_lidar_to_image["v"],
+                bbox,
+            )
+            mask_selected = segmented["mask"][
                 projection_lidar_to_image["v"], projection_lidar_to_image["u"]
                 # segmented된 mask에 대해, projection["u"], projection["v"]에는 각 LiDAR 포인트가 투영된 이미지 좌표
                 ]
-            self.last_projection_debug["hits"].append({
-                "category": str(segmented.get("category", "")),
-                "bbox": tuple(segmented.get("bbox", (0, 0, 0, 0))),
-                "u": projection_lidar_to_image["u"][selected].copy(),
-                "v": projection_lidar_to_image["v"][selected].copy(),
-            })
+            mask_hits = int(np.count_nonzero(mask_selected))
+            selected, supplemented_hits = supplement_mask_hits_from_bbox(
+                segmented["mask"],
+                projection_lidar_to_image["u"],
+                projection_lidar_to_image["v"],
+                bbox,
+                projected_lidar_points_in_SAM2mask,
+                mask_selected,
+            )
             object_points = points_map[np.flatnonzero(selected)] # np.flatnonzero(selected)는 True인 index를 반환
             object_points = object_points[np.isfinite(object_points).all(axis=1)]
             # Keep the pre-threshold count on the segmentation record as well, so
             # debug overlays can explain why a 2D detection was not 3D-grounded.
-            segmented["grounding_num_points"] = int(len(object_points))
+            segmented["bbox_lidar_points"] = bbox_hits
+            segmented["grounding_num_points"] = mask_hits
+            segmented["supplemented_num_points"] = supplemented_hits
+            segmented["grounding_final_num_points"] = int(len(object_points))
+            self.last_projection_debug["hits"].append({
+                "category": str(segmented.get("category", "")),
+                "bbox": bbox,
+                "bbox_hits": bbox_hits,
+                "mask_hits": mask_hits,
+                "supplemented_hits": supplemented_hits,
+                "u": projection_lidar_to_image["u"][selected].copy(),
+                "v": projection_lidar_to_image["v"][selected].copy(),
+            })
+            print(
+                "[sysnav lidar_grounding] "
+                f"category={segmented.get('category', '')} "
+                f"bbox_hits={bbox_hits} mask_hits={mask_hits} "
+                f"supplemented_hits={supplemented_hits} final_hits={len(object_points)}",
+                flush=True,
+            )
             category = str(segmented.get("category", "")).lower()
-            grounding_source = "single_frame"
+            if supplemented_hits and mask_hits == 0:
+                grounding_source = "bbox_only_fallback"
+            elif supplemented_hits:
+                grounding_source = "mask_bbox_fallback"
+            else:
+                grounding_source = "single_frame"
             provisional_frames = 1
             if len(object_points) < config.GROUNDING_MIN_POINTS:
                 promoted, accumulated_points, provisional_frames = self._accumulate_provisional(
