@@ -34,7 +34,12 @@ class YoloWorldDetector:
         # mismatch the next time set_classes() runs with new prompts.
         self._model.to(select_device(self.device))
 
-    def detect(self, image_rgb: np.ndarray, prompts: Iterable[str]) -> list[dict]:
+    def detect(
+        self,
+        image_rgb: np.ndarray,
+        prompts: Iterable[str],
+        prompt_categories: dict[str, str] | None = None,
+    ) -> list[dict]:
         prompt_list = []
         for prompt in prompts:
             value = str(prompt).strip().lower()
@@ -69,6 +74,10 @@ class YoloWorldDetector:
         height, width = image_rgb.shape[:2]
         detections = []
 
+        canonical_by_prompt = {
+            str(prompt).strip().lower(): str(canonical).strip().lower()
+            for prompt, canonical in (prompt_categories or {}).items()
+        }
         for box, confidence, class_id in zip(xyxy, confidences, class_ids):
             x1, y1, x2, y2 = box.tolist()
             bbox = (
@@ -78,5 +87,11 @@ class YoloWorldDetector:
                 int(max(1, min(height, round(y2)))),
             )
             category = str(names[class_id] if not isinstance(names, dict) else names.get(class_id, prompt_list[class_id]))
-            detections.append({"category": category.lower(), "confidence": float(confidence), "bbox": bbox})
+            detected_as = category.lower()
+            detections.append({
+                "category": canonical_by_prompt.get(detected_as, detected_as),
+                "detected_as": detected_as,
+                "confidence": float(confidence),
+                "bbox": bbox,
+            })
         return detections

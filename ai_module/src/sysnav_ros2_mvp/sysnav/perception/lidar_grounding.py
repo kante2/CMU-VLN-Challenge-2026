@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 
@@ -31,6 +32,80 @@ class PanoramaLidarGrounder:
     def __init__(self) -> None:
         self.t_lidar_to_camera = np.asarray(config.T_LIDAR_TO_CAMERA, dtype=np.float64)
         self.t_sensor_to_base = np.asarray(config.T_SENSOR_TO_BASE, dtype=np.float64)
+        self._provisional: list[dict] = []
+        self._frame_id = 0
+        self.last_projection_debug: dict = {"u": np.empty(0, int), "v": np.empty(0, int), "hits": []}
+
+    def reset(self) -> None:
+        self._provisional.clear()
+        self._frame_id = 0
+        self.last_projection_debug = {"u": np.empty(0, int), "v": np.empty(0, int), "hits": []}
+
+    def _expire_provisional(self, now: float) -> None:
+        self._provisional = [
+            candidate for candidate in self._provisional
+            if now - float(candidate["last_seen"]) <= config.GROUNDING_PROVISIONAL_TIMEOUT_SEC
+        ]
+
+    def _discard_nearby_provisional(self, category: str, points: np.ndarray) -> None:
+        if not len(points):
+            return
+        center = np.median(points, axis=0)
+        self._provisional = [
+            candidate for candidate in self._provisional
+            if candidate["category"] != category
+            or float(np.linalg.norm(candidate["center"] - center))
+            > config.GROUNDING_PROVISIONAL_ASSOCIATION_DISTANCE_M
+        ]
+
+    def _accumulate_provisional(
+        self,
+        category: str,
+        points: np.ndarray,
+        now: float,
+    ) -> tuple[np.ndarray | None, int, int]:
+        """Accumulate 1-2 point observations, promoting only across frames."""
+        if len(points) < config.GROUNDING_PROVISIONAL_MIN_POINTS:
+            return None, 0, 0
+
+        center = np.median(points, axis=0)
+        candidates = [
+            candidate for candidate in self._provisional
+            if candidate["category"] == category
+            and candidate["last_frame_id"] != self._frame_id
+            and float(np.linalg.norm(candidate["center"] - center))
+            <= config.GROUNDING_PROVISIONAL_ASSOCIATION_DISTANCE_M
+        ]
+        if candidates:
+            candidate = min(
+                candidates,
+                key=lambda item: float(np.linalg.norm(item["center"] - center)),
+            )
+            candidate["points"] = np.concatenate([candidate["points"], points], axis=0)
+            candidate["center"] = np.median(candidate["points"], axis=0)
+            candidate["frame_count"] += 1
+            candidate["last_seen"] = now
+            candidate["last_frame_id"] = self._frame_id
+        else:
+            candidate = {
+                "category": category,
+                "points": points.copy(),
+                "center": center,
+                "frame_count": 1,
+                "last_seen": now,
+                "last_frame_id": self._frame_id,
+            }
+            self._provisional.append(candidate)
+
+        point_count = int(len(candidate["points"]))
+        frame_count = int(candidate["frame_count"])
+        if point_count < config.GROUNDING_MIN_POINTS or frame_count < config.GROUNDING_PROVISIONAL_MIN_FRAMES:
+            return None, point_count, frame_count
+
+        self._provisional = [
+            item for item in self._provisional if item is not candidate
+        ]
+        return candidate["points"], point_count, frame_count
 
     def _project(self, points_sensor: np.ndarray, image_shape: tuple[int, int]) -> dict:
         height, width = image_shape
@@ -104,12 +179,20 @@ class PanoramaLidarGrounder:
         segmented_objects: list[dict], # SAM2가 만든 2D 객체 mask와 bounding box 정보
         robot_pose: dict,
     ) -> list[dict]:
+        self._frame_id += 1
+        now = time.monotonic()
+        self._expire_provisional(now)
         # 0. error check
         if not segmented_objects or points_sensor.size == 0:
             return []
         # 1. lidar을 이미지에 투영
         # LiDAR의 3D 점을 파노라마 이미지의 2D 픽셀로 바꾼다.
         projection_lidar_to_image = self._project(points_sensor, image_rgb.shape[:2]) # LiDAR point를 이미지에 투영
+        self.last_projection_debug = {
+            "u": projection_lidar_to_image["u"].copy(),
+            "v": projection_lidar_to_image["v"].copy(),
+            "hits": [],
+        }
         # - error check: 투영된 LiDAR point가 없으면 빈 list 반환
         if not len(projection_lidar_to_image["indices"]):
             return []
@@ -128,11 +211,34 @@ class PanoramaLidarGrounder:
                 projection_lidar_to_image["v"], projection_lidar_to_image["u"]
                 # segmented된 mask에 대해, projection["u"], projection["v"]에는 각 LiDAR 포인트가 투영된 이미지 좌표
                 ]
+            self.last_projection_debug["hits"].append({
+                "category": str(segmented.get("category", "")),
+                "bbox": tuple(segmented.get("bbox", (0, 0, 0, 0))),
+                "u": projection_lidar_to_image["u"][selected].copy(),
+                "v": projection_lidar_to_image["v"][selected].copy(),
+            })
             object_points = points_map[np.flatnonzero(selected)] # np.flatnonzero(selected)는 True인 index를 반환
             object_points = object_points[np.isfinite(object_points).all(axis=1)]
-            # # mask 안에 들어온 lidar point가 최소 개수보다 적으면, 해당 객체는 3D 정보 계산하지 않고 건너뜀
-            if len(object_points) < config.GROUNDING_MIN_POINTS: 
-                continue
+            # Keep the pre-threshold count on the segmentation record as well, so
+            # debug overlays can explain why a 2D detection was not 3D-grounded.
+            segmented["grounding_num_points"] = int(len(object_points))
+            category = str(segmented.get("category", "")).lower()
+            grounding_source = "single_frame"
+            provisional_frames = 1
+            if len(object_points) < config.GROUNDING_MIN_POINTS:
+                promoted, accumulated_points, provisional_frames = self._accumulate_provisional(
+                    category,
+                    object_points,
+                    now,
+                )
+                segmented["provisional_num_points"] = accumulated_points
+                segmented["provisional_frame_count"] = provisional_frames
+                if promoted is None:
+                    continue
+                object_points = promoted
+                grounding_source = "multi_frame_provisional"
+            else:
+                self._discard_nearby_provisional(category, object_points)
             
             # mask 안에 들어온 lidar point가 최대 개수보다 많으면, 랜덤하게 최대 개수만큼 샘플링 (연산 과부화 방지)
             if len(object_points) > config.GROUNDING_MAX_OBJECT_POINTS:
@@ -154,6 +260,8 @@ class PanoramaLidarGrounder:
                 "extent_3d": tuple(float(v) for v in (maximum - minimum)),
                 "crop_image": self._crop(image_rgb, segmented["mask"], segmented["bbox"]),
                 "num_points": int(len(object_points)),
+                "grounding_source": grounding_source,
+                "provisional_frame_count": provisional_frames,
             })
             output_3D_list_.append(item) # 완성된 객체 검출을, output_3D_list_에 추가
         return output_3D_list_

@@ -51,6 +51,10 @@ class ObjectMemory:
             # 기본 식별 정보
             "object_id": object_id,
             "category": str(observation["category"]).lower(),
+            "detected_as": str(observation.get("detected_as", observation["category"])).lower(),
+            "detected_aliases": [
+                str(observation.get("detected_as", observation["category"])).lower()
+            ],
             # 대표 3d위치
             "position": tuple(float(v) for v in observation["position"]),
             "point_cloud": observation.get("point_cloud", np.empty((0, 3), np.float32)).copy(),
@@ -119,6 +123,11 @@ class ObjectMemory:
         node["last_seen_time"] = timestamp
         node["observation_count"] = count + 1
         node["num_points"] = len(node["point_cloud"])
+        detected_as = str(observation.get("detected_as", observation["category"])).lower()
+        aliases = node.setdefault("detected_aliases", [])
+        if detected_as and detected_as not in aliases:
+            aliases.append(detected_as)
+        node["detected_as"] = detected_as
         # 이번 observation과 기존 객체가 얼마나 유사했는지 저장
         node["association_score"] = float(metrics["score"])
         if metrics.get("observation_histogram") is not None:

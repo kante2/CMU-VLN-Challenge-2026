@@ -36,7 +36,8 @@ from sysnav.ros_helpers import (
     odometry_to_pose,
     pointcloud2_to_xyz,
 )
-from sysnav.task.query_parser import extract_target
+from sysnav.task.gemini_query_parser import GeminiQueryParser
+from sysnav.task.query_parser import effective_relation_chain
 
 '''
 ThreadPoolExecutor 문법 -  시간이 오래걸리는 함수를 별도 작업 스레드에서 실행하도록 맡기는 도구,
@@ -112,6 +113,7 @@ class SysNavNode(Node):
         # novel LiDAR voxel coverage가 충분할 때만 생성하며 debug graph를 갱신한다.
         self.scene_graph = SceneGraphManager(debug_dir=config.DEBUG_DIR)
         self.selector = GeminiSelector()
+        self.query_parser = GeminiQueryParser()
         self.coverage_planner = CoveragePlanner()
         self.viewpoint_memory = ViewpointMemory()
         self.goal_publisher = GoalPublisher(self)
@@ -165,7 +167,7 @@ class SysNavNode(Node):
     # ------------------------------------------------------------------
 
     def question_callback(self, msg: String) -> None:
-        parsed = extract_target(msg.data)
+        parsed = self.query_parser.parse(msg.data)
         if not parsed["target"]:
             self.get_logger().error(f"Could not extract target object: {msg.data}")
             return
@@ -177,6 +179,7 @@ class SysNavNode(Node):
             self.current_goal = None
             self.exploration_route.clear()
             self.last_processed_image_stamp = -1.0
+            self.perception.begin_task()
 
         if not config.KEEP_MEMORY_BETWEEN_TASKS:
             self.object_memory.clear()
@@ -191,7 +194,8 @@ class SysNavNode(Node):
         self.get_logger().info(
             f"Task #{self.task_id}: target={parsed['target']}, "
             f"attributes={parsed['attributes']}, relation={parsed['relation']}, "
-            f"references={parsed['reference_objects']}"
+            f"references={parsed['reference_objects']}, "
+            f"prompts={parsed['detection_prompts']}, parser={parsed.get('parser', 'rules')}"
         )
 
     def state_callback(self, msg: Odometry) -> None:
@@ -291,6 +295,7 @@ class SysNavNode(Node):
             points_sensor=points_sensor, # pointcloud -> numpy
             prompts=list(task["detection_prompts"]), #  YOLO-World가 검출해야 하는 객체 목록 -> prompts
             robot_pose=pose, # LiDAR의 객체 point를 map 좌표로 변환
+            prompt_categories=dict(task.get("prompt_categories", {})),
         )
         '''
         < self.perception.process 내부 구조 >
@@ -328,11 +333,19 @@ class SysNavNode(Node):
             object_nodes=observed_object_nodes,
             task=task,
         )
+        required_categories = {str(task["target"]).lower()}
+        for source, _relation, reference in effective_relation_chain(task):
+            required_categories.add(str(source).lower())
+            required_categories.add(str(reference).lower())
+        observed_categories = {
+            str(observation["category"]).lower() for observation in observations
+        }
         return {
             "task_id": task_id,
             "image_stamp": image_stamp,
             "candidates": self.object_memory.find_by_category(task["target"]),
             "scene_graph": graph_update,
+            "missing_categories": sorted(required_categories - observed_categories),
         }
     '''
     동기화된 이미지·LiDAR·로봇 pose를 이용해 객체를 3D로 인식하고, Object Memory를 갱신한 뒤 목표 객체 후보들을 반환하는 작업
@@ -486,6 +499,11 @@ class SysNavNode(Node):
         if kind == "perception":
             self.last_processed_image_stamp = float(result["image_stamp"])
             self.last_perception_wall_time = time.monotonic()
+            if result.get("missing_categories"):
+                self.get_logger().info(
+                    "Canonical categories not grounded in this frame: "
+                    f"{result['missing_categories']}"
+                )
             graph_update = result.get("scene_graph")
             if graph_update and graph_update.get("debug_files"):
                 if graph_update.get("viewpoint_created"):

@@ -118,6 +118,8 @@ def _extract_relation_chain(phrase: str) -> list[dict]:
 
 
 def extract_target(question: str) -> dict:
+    from sysnav.task.prompt_bank import enrich_task_prompts, load_alias_cache
+
     raw = question.strip()
     normalized = _LEADING_COMMAND.sub("", raw).strip()
 
@@ -143,7 +145,7 @@ def extract_target(question: str) -> dict:
         if node["object"] and node["object"] not in prompts:
             prompts.append(node["object"])
 
-    return {
+    return enrich_task_prompts({
         "raw": raw,
         "target": target_object,
         "attributes": attributes,
@@ -151,7 +153,7 @@ def extract_target(question: str) -> dict:
         "reference_objects": reference_objects,
         "relation_chain": relation_chain,
         "detection_prompts": prompts,
-    }
+    }, load_alias_cache())
 
 
 def effective_relation_chain(task: dict) -> list[tuple[str, str, str]]:
