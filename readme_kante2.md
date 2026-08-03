@@ -40,6 +40,22 @@ docker compose -f compose_gpu.yml up -d --force-recreate sysnav_module
 ```
 
 
+## -----------------------------------------------------------------
+# 시뮬 겹침 초기화
+pkill -9 -f autonomy_stack_mecanum_wheel_platform
+pkill -9 -f static_transform_publisher
+pkill -9 -f joy_node
+pkill -9 -f default_server_endpoint
+
+## ----------------------코드 수정후 재빌드----------------------------
+docker exec -it iros2026_sysnav_module bash
+source /opt/ros/jazzy/setup.bash
+cd /home/docker/ai_module
+colcon build --symlink-install --packages-select sysnav
+source install/setup.bash
+ros2 launch sysnav sysnav.launch.py
+
+
 ## ----------------------명령어 요약--------------------
 터미널 A — 시뮬레이터 (이미 켜져있다면 생략)
 
@@ -61,7 +77,7 @@ ros2 launch sysnav sysnav.launch.py
 docker exec -it iros2026_sysnav_module bash
 source /opt/ros/jazzy/setup.bash
 ros2 topic pub --once /challenge_question std_msgs/msg/String \
-  "{data: 'Find the white chair'}"
+  "{data: 'Find the toilet'}"
 
 
 ## --------------------------------------------------

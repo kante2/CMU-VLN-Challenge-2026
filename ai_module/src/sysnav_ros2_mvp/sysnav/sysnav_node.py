@@ -18,6 +18,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import String
+from visualization_msgs.msg import MarkerArray
 
 from sysnav import config
 from sysnav.exploration.coverage_planner import CoveragePlanner
@@ -27,6 +28,7 @@ from sysnav.navigation.goal_publisher import GoalPublisher
 from sysnav.perception.perception_pipeline import PerceptionPipeline
 from sysnav.reasoning.gemini_selector import GeminiSelector
 from sysnav.scene_graph.scene_graph_manager import SceneGraphManager
+from sysnav.scene_graph.scene_graph_rviz import build_object_marker_array
 from sysnav.ros_helpers import (
     closest_stamped_item,
     image_msg_to_rgb,
@@ -113,9 +115,12 @@ class SysNavNode(Node):
         self.coverage_planner = CoveragePlanner()
         self.viewpoint_memory = ViewpointMemory()
         self.goal_publisher = GoalPublisher(self)
+        self.object_marker_pub = self.create_publisher(MarkerArray, config.TOPIC_OBJECT_MARKERS, 10)
 
         self.current_goal: dict | None = None
         self.exploration_route = deque()
+        self._exploration_goal_best_distance_m: float | None = None
+        self._exploration_goal_last_progress_time: float | None = None
 
         self.question_sub = self.create_subscription(
             String,
@@ -181,6 +186,7 @@ class SysNavNode(Node):
                 pose = None if self.latest_pose is None else dict(self.latest_pose)
             self.coverage_planner.reset(pose)
         self.scene_graph.start_task(self.task_id, parsed)
+        self.publish_object_markers()
 
         self.get_logger().info(
             f"Task #{self.task_id}: target={parsed['target']}, "
@@ -500,6 +506,7 @@ class SysNavNode(Node):
                 self.get_logger().warning(
                     f"Scene graph export failed: {self.scene_graph.last_export_error}"
                 )
+            self.publish_object_markers()
             if result["candidates"]:
                 with self.state_lock:
                     self.state = "SELECT_TARGET"
@@ -527,6 +534,7 @@ class SysNavNode(Node):
             }
             # 선택된 target object를 Scene Graph에 표시하고 debug PNG/JSON/DOT을 갱신한다.
             self.scene_graph.mark_selected_object(selected["object_id"])
+            self.publish_object_markers()
             with self.state_lock:
                 self.state = "NAVIGATE_TARGET"
             self.get_logger().info(
@@ -575,13 +583,32 @@ class SysNavNode(Node):
 
         if state == "FOLLOW_EXPLORATION":
             if self.goal_reached(pose):
-                if self.current_goal is not None:
+                # 경로의 중간 hop까지 전부 "방문한 viewpoint"로 기록하면 안 된다 - 진짜
+                # candidate(마지막 hop, is_viewpoint=True)만 기록해야 근처-방문 판정이
+                # 지나온 복도 전체를 덮어버려 탐색이 조기 종료되는 걸 막을 수 있다.
+                if self.current_goal is not None and self.current_goal.get("is_viewpoint"):
                     self.viewpoint_memory.add(
                         self.current_goal["x"],
                         self.current_goal["y"],
                         self.current_goal["theta"],
                         self.current_goal.get("coverage_score"),
                     )
+                self.publish_next_exploration_goal()
+                return
+
+            if self._exploration_goal_unreachable(pose):
+                self.get_logger().warning(
+                    f"Exploration goal unreachable (no progress for "
+                    f"{config.EXPLORATION_STUCK_TIMEOUT_SEC:.0f}s), skipping "
+                    f"({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
+                )
+                # 도달 실패한 지점도 방문한 것으로 취급해서 같은/근처 후보를 다시 뽑지 않게 한다.
+                self.viewpoint_memory.add(
+                    self.current_goal["x"],
+                    self.current_goal["y"],
+                    self.current_goal["theta"],
+                    self.current_goal.get("coverage_score"),
+                )
                 self.publish_next_exploration_goal()
                 return
 
@@ -653,12 +680,36 @@ class SysNavNode(Node):
         goal = self.exploration_route.popleft()
         self.goal_publisher.publish(goal["x"], goal["y"], goal["theta"])
         self.current_goal = {**goal, "type": "exploration"}
+        self._exploration_goal_best_distance_m = None
+        self._exploration_goal_last_progress_time = time.monotonic()
         with self.state_lock:
             self.state = "FOLLOW_EXPLORATION"
+
+        # "보라색 waypoint는 찍히는데 로봇이 안 움직인다" 같은 증상을 로그 하나로 바로
+        # 진단하기 위해, 목표가 로봇 현재 위치 대비 실제로 얼마나 먼지 같이 남긴다.
+        with self.sensor_lock:
+            robot_pose = None if self.latest_pose is None else dict(self.latest_pose)
+        if robot_pose is not None:
+            distance_m = math.hypot(goal["x"] - robot_pose["x"], goal["y"] - robot_pose["y"])
+            distance_note = f", robot=({robot_pose['x']:.2f}, {robot_pose['y']:.2f}), dist={distance_m:.2f}m"
+        else:
+            distance_note = ", robot pose unknown"
+
+        remaining = len(self.exploration_route)
         self.get_logger().info(
             f"Exploration goal=({goal['x']:.2f}, {goal['y']:.2f}, {goal['theta']:.2f}), "
-            f"coverage={goal.get('coverage_score', 0)}"
+            f"is_viewpoint={goal.get('is_viewpoint')}, coverage={goal.get('coverage_score', 0)}, "
+            f"remaining_in_route={remaining}{distance_note}"
         )
+
+    def publish_object_markers(self) -> None:
+        snapshot = self.scene_graph.snapshot()
+        markers = build_object_marker_array(
+            snapshot["objects"],
+            snapshot.get("selected_object_id"),
+            self.get_clock().now().to_msg(),
+        )
+        self.object_marker_pub.publish(markers)
 
     def goal_reached(self, pose: dict) -> bool:
         if self.current_goal is None:
@@ -667,6 +718,28 @@ class SysNavNode(Node):
             float(self.current_goal["x"]) - float(pose["x"]),
             float(self.current_goal["y"]) - float(pose["y"]),
         ) <= config.GOAL_REACHED_DISTANCE_M
+
+    # exploration goal(x, y)이 벽 너머 등 실제로 도달 불가능한 지점일 때, goal_reached가 영원히
+    # False로 남아 로봇이 계속 벽에 박혀있는 것을 막기 위한 진행도 기반 stuck 감지.
+    # 목표까지 거리가 최근 EXPLORATION_STUCK_TIMEOUT_SEC 안에 EXPLORATION_STUCK_PROGRESS_M 이상
+    # 줄어들지 않으면 도달 불가로 판단한다.
+    def _exploration_goal_unreachable(self, pose: dict) -> bool:
+        if self.current_goal is None:
+            return False
+        distance = math.hypot(
+            float(self.current_goal["x"]) - float(pose["x"]),
+            float(self.current_goal["y"]) - float(pose["y"]),
+        )
+        now = time.monotonic()
+        if (
+            self._exploration_goal_best_distance_m is None
+            or distance <= self._exploration_goal_best_distance_m - config.EXPLORATION_STUCK_PROGRESS_M
+        ):
+            self._exploration_goal_best_distance_m = distance
+            self._exploration_goal_last_progress_time = now
+            return False
+        assert self._exploration_goal_last_progress_time is not None
+        return now - self._exploration_goal_last_progress_time >= config.EXPLORATION_STUCK_TIMEOUT_SEC
 
     def destroy_node(self):
         self.worker.shutdown(wait=False, cancel_futures=True)

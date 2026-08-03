@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from sysnav import config
+from sysnav.task.query_parser import effective_relation_chain
 
 
 class SpatialRelationReasoner:
@@ -34,9 +35,8 @@ class SpatialRelationReasoner:
         object_ids: list[int],
         object_nodes: list[dict],
     ) -> list[dict]:
-        relation = task.get("relation")
-        references = list(task.get("reference_objects") or [])
-        if not relation or not references:
+        chain = effective_relation_chain(task)
+        if not chain:
             return []
 
         records = self._build_records(observations, object_ids, object_nodes)
@@ -48,10 +48,13 @@ class SpatialRelationReasoner:
             try:
                 gemini_edges = self._infer_with_gemini(
                     question=task.get("raw", ""),
-                    relation=relation,
                     image_rgb=image_rgb,
                     candidates=candidates,
                     records=records,
+                )
+                self._save_debug_table(
+                    task=task, candidates=candidates,
+                    records=records, accepted=gemini_edges, method="gemini",
                 )
                 if gemini_edges:
                     return gemini_edges
@@ -60,12 +63,73 @@ class SpatialRelationReasoner:
                 # perception. The geometric check below keeps the graph operational.
                 pass
 
-        return self._infer_with_geometry(
-            relation=relation,
+        geometry_edges = self._infer_with_geometry(
             candidates=candidates,
             records=records,
             viewpoint_pose=viewpoint_pose,
         )
+        self._save_debug_table(
+            task=task, candidates=candidates,
+            records=records, accepted=geometry_edges, method="geometry",
+        )
+        return geometry_edges
+
+    # ------------------------------------------------------------------
+    # Debug: [obj1] [obj2] [문장 속 relation] [LLM/기하 검증 결과] 표를
+    # ai_module/debug/sysnav_relation_check.txt 에 계속 append한다.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _save_debug_table(
+        task: dict,
+        candidates: list[dict],
+        records: dict[int, dict],
+        accepted: list[dict],
+        method: str,
+    ) -> None:
+        if not config.SAVE_DEBUG_IMAGES:
+            return
+        try:
+            accepted_by_key: dict[tuple, dict] = {
+                (edge["source_object_id"], tuple(edge["target_object_ids"]), edge["relation"]): edge
+                for edge in accepted
+            }
+
+            rows = []
+            for candidate in candidates:
+                source = records.get(candidate["source_object_id"])
+                if source is None:
+                    continue
+                obj1 = f"{source['category']}#{source['object_id']}"
+                relation = candidate["relation"]
+                key = (candidate["source_object_id"], tuple(candidate["target_object_ids"]), relation)
+                edge = accepted_by_key.get(key)
+                verdict = "TRUE" if edge is not None else "false"
+                reason = edge.get("reason", "") if edge is not None else ""
+                for target_id in candidate["target_object_ids"]:
+                    target = records.get(target_id)
+                    if target is None:
+                        continue
+                    obj2 = f"{target['category']}#{target['object_id']}"
+                    rows.append((obj1, obj2, relation, verdict, method, reason))
+
+            if not rows:
+                return
+
+            os.makedirs(config.DEBUG_DIR, exist_ok=True)
+            path = os.path.join(config.DEBUG_DIR, "sysnav_relation_check.txt")
+            lines = [
+                f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} | question: {task.get('raw', '')} ===",
+                f"{'obj1':<22}{'obj2':<22}{'relation(sentence)':<20}{'verdict':<8}{'method':<10}reason",
+            ]
+            for obj1, obj2, rel, verdict, method_used, reason in rows:
+                lines.append(f"{obj1:<22}{obj2:<22}{rel:<20}{verdict:<8}{method_used:<10}{reason}")
+            lines.append("")
+
+            with open(path, "a", encoding="utf-8") as file:
+                file.write("\n".join(lines) + "\n")
+        except Exception as error:  # pragma: no cover - debug output must never crash reasoning
+            print(f"[spatial_relation_reasoner] failed to write relation debug table: {error}")
 
     @staticmethod
     def _build_records(
@@ -103,40 +167,48 @@ class SpatialRelationReasoner:
 
     @staticmethod
     def _candidate_relations(task: dict, records: dict[int, dict]) -> list[dict]:
-        target_category = str(task.get("target", "")).lower()
-        reference_categories = [str(value).lower() for value in task.get("reference_objects", [])]
-        relation = str(task.get("relation", ""))
-
-        targets = [record for record in records.values() if record["category"] == target_category]
-        if not targets:
+        """문장이 "A relation1 B relation2 C"처럼 relation을 연쇄로 담고 있으면
+        (effective_relation_chain), 매 hop(source_category, relation, target_category)
+        마다 실제 매칭되는 object pair를 전부 후보로 만든다 - 문장에 등장한 물체
+        전부가 검증 대상이 되도록 한다 (예전엔 relation != "between"일 때
+        reference_objects[0]만 쓰고 나머지 reference는 조용히 버렸음)."""
+        chain = effective_relation_chain(task)
+        if not chain:
             return []
 
-        if relation == "between" and len(reference_categories) >= 2:
+        if len(chain) == 1 and chain[0][1] == "between":
+            source_category = chain[0][0]
+            reference_categories = [str(value).lower() for value in task.get("reference_objects", [])]
+            if len(reference_categories) < 2:
+                return []
+            sources = [record for record in records.values() if record["category"] == source_category]
             first_refs = [record for record in records.values() if record["category"] == reference_categories[0]]
             second_refs = [record for record in records.values() if record["category"] == reference_categories[1]]
             output = []
-            for target, first_ref, second_ref in product(targets, first_refs, second_refs):
-                ids = {target["object_id"], first_ref["object_id"], second_ref["object_id"]}
+            for source, first_ref, second_ref in product(sources, first_refs, second_refs):
+                ids = {source["object_id"], first_ref["object_id"], second_ref["object_id"]}
                 if len(ids) != 3:
                     continue
                 output.append({
-                    "source_object_id": target["object_id"],
+                    "source_object_id": source["object_id"],
                     "target_object_ids": [first_ref["object_id"], second_ref["object_id"]],
-                    "relation": relation,
+                    "relation": "between",
                 })
             return output
 
-        reference_category = reference_categories[0] if reference_categories else ""
-        references = [record for record in records.values() if record["category"] == reference_category]
-        return [
-            {
-                "source_object_id": target["object_id"],
-                "target_object_ids": [reference["object_id"]],
-                "relation": relation,
-            }
-            for target, reference in product(targets, references)
-            if target["object_id"] != reference["object_id"]
-        ]
+        output = []
+        for source_category, relation, target_category in chain:
+            sources = [record for record in records.values() if record["category"] == source_category]
+            targets = [record for record in records.values() if record["category"] == target_category]
+            for source, target in product(sources, targets):
+                if source["object_id"] == target["object_id"]:
+                    continue
+                output.append({
+                    "source_object_id": source["object_id"],
+                    "target_object_ids": [target["object_id"]],
+                    "relation": relation,
+                })
+        return output
 
     def _load_client(self) -> None:
         if self._client is not None:
@@ -190,7 +262,6 @@ class SpatialRelationReasoner:
     def _infer_with_gemini(
         self,
         question: str,
-        relation: str,
         image_rgb: np.ndarray,
         candidates: list[dict],
         records: dict[int, dict],
@@ -199,7 +270,10 @@ class SpatialRelationReasoner:
         from google.genai import types
 
         annotated = self._annotate_image(image_rgb, records)
-        self._save_debug_image(annotated, relation)
+        # 문장이 relation을 연쇄로 담고 있으면(예: "A closest to B near C") candidate마다
+        # relation이 다를 수 있어서, 파일명 태그는 candidate들에 등장하는 모든 relation을 합쳐 만든다.
+        relation_tag = "-".join(sorted({str(candidate["relation"]) for candidate in candidates})) or "relation"
+        self._save_debug_image(annotated, relation_tag)
         object_summary = [
             {
                 "object_id": object_id,
@@ -211,16 +285,16 @@ class SpatialRelationReasoner:
         ]
 
         prompt = f"""
-You validate an on-demand Object-Object edge for a mobile robot scene graph.
+You validate on-demand Object-Object edges for a mobile robot scene graph.
 Instruction: {question}
-Requested normalized relation: {relation}
 Visible objects: {json.dumps(object_summary, ensure_ascii=False)}
-Candidate checks: {json.dumps(candidates, ensure_ascii=False)}
+Candidate checks (each has its own normalized relation): {json.dumps(candidates, ensure_ascii=False)}
 
 The image is annotated with exact object IDs. For every candidate check, decide whether
-its requested relation is visibly true. Return only candidates that are true. Preserve the
-provided source_object_id, target_object_ids, and normalized relation exactly. Do not add
-new object IDs or relations. A relation that is ambiguous must be omitted.
+its own requested relation is visibly true between its source and target object(s). Return
+only candidates that are true. Preserve the provided source_object_id, target_object_ids,
+and normalized relation exactly. Do not add new object IDs or relations. A relation that is
+ambiguous must be omitted.
 """.strip()
 
         response = self._client.models.generate_content(
@@ -295,17 +369,22 @@ new object IDs or relations. A relation that is ambiguous must be omitted.
 
     def _infer_with_geometry(
         self,
-        relation: str,
         candidates: list[dict],
         records: dict[int, dict],
         viewpoint_pose: dict,
     ) -> list[dict]:
-        output = []
-        for candidate in candidates:
+        # "nearest/closest"는 경쟁하는 후보 중 argmin 하나만 참이 되는 최상급 relation이라
+        # 나머지(pairwise 판정) relation과 채점 방식이 다르다. 체인이면 candidate마다 relation이
+        # 다를 수 있으므로(예: "A closest to B near C") relation별로 나눠서 처리한다.
+        nearest_candidates = [c for c in candidates if c["relation"] in ("nearest", "closest")]
+        other_candidates = [c for c in candidates if c["relation"] not in ("nearest", "closest")]
+
+        output = list(self._infer_nearest_with_geometry(nearest_candidates, records)) if nearest_candidates else []
+        for candidate in other_candidates:
             source = records[candidate["source_object_id"]]
             targets = [records[object_id] for object_id in candidate["target_object_ids"]]
             holds, confidence, reason = self._geometry_check(
-                relation,
+                candidate["relation"],
                 source,
                 targets,
                 viewpoint_pose,
@@ -317,6 +396,37 @@ new object IDs or relations. A relation that is ambiguous must be omitted.
                 "confidence": confidence,
                 "method": "geometry",
                 "reason": reason,
+            })
+        return output
+
+    @staticmethod
+    def _infer_nearest_with_geometry(candidates: list[dict], records: dict[int, dict]) -> list[dict]:
+        """"nearest/closest"는 근접 threshold(near)와 달리 최상급(argmin) relation이다:
+        같은 reference를 두고 경쟁하는 후보(target category가 같은 object들) 중 거리가
+        가장 짧은 하나만 참이 된다. reference별로 그룹을 묶어 argmin을 고른다."""
+        groups: dict[tuple[int, ...], list[dict]] = {}
+        for candidate in candidates:
+            groups.setdefault(tuple(candidate["target_object_ids"]), []).append(candidate)
+
+        output = []
+        for target_ids, group in groups.items():
+            scored = []
+            for candidate in group:
+                source = records[candidate["source_object_id"]]
+                target = records[target_ids[0]]
+                distance = float(np.linalg.norm(
+                    np.asarray(source["position"][:2], dtype=np.float64)
+                    - np.asarray(target["position"][:2], dtype=np.float64)
+                ))
+                scored.append((candidate, distance))
+            if not scored:
+                continue
+            winner, winner_distance = min(scored, key=lambda item: item[1])
+            output.append({
+                **winner,
+                "confidence": 1.0,
+                "method": "geometry",
+                "reason": f"xy_distance={winner_distance:.3f}m (min among {len(scored)} candidate(s))",
             })
         return output
 

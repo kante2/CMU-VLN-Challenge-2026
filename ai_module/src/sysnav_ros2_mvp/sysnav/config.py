@@ -9,6 +9,10 @@ TOPIC_STATE = "/state_estimation"
 TOPIC_IMAGE = "/camera/image"
 TOPIC_SCAN = "/sensor_scan"
 TOPIC_WAYPOINT = "/way_point_with_heading"
+TOPIC_OBJECT_MARKERS = "/sysnav/object_markers"
+
+OBJECT_MARKER_FRAME_ID = "map"
+OBJECT_MARKER_DEFAULT_SIZE_M = 0.3
 
 CONTROL_PERIOD_SEC = 0.20
 PERCEPTION_WHILE_MOVING_INTERVAL_SEC = 1.50
@@ -16,6 +20,10 @@ SENSOR_SYNC_TOLERANCE_SEC = 0.30
 SCAN_BUFFER_SIZE = 40
 POSE_BUFFER_SIZE = 100
 GOAL_REACHED_DISTANCE_M = 0.55
+# exploration goal까지 거리가 이 이상 줄지 않은 채 이 시간(초)이 지나면 도달 불가로 보고 포기한다.
+# (벽 너머 등 실제로는 갈 수 없는 waypoint에 로봇이 영원히 박혀있는 것을 막기 위한 안전장치)
+EXPLORATION_STUCK_TIMEOUT_SEC = 8.0
+EXPLORATION_STUCK_PROGRESS_M = 0.10
 TARGET_STANDOFF_DISTANCE_M = 0.90
 KEEP_MEMORY_BETWEEN_TASKS = True
 
@@ -79,10 +87,17 @@ OCC_FREE = 0
 OCC_OCCUPIED = 100
 ROBOT_CLEARANCE_M = 0.45
 FRONTIER_MIN_CLUSTER_CELLS = 5
-FRONTIER_COVERAGE_RADIUS_M = 3.0
-FRONTIER_TOP_K = 6
-FRONTIER_DISTANCE_WEIGHT = 1.5
-FRONTIER_CLUSTER_WEIGHT = 0.4
+FRONTIER_COVERAGE_RADIUS_M = 3.0  # 논문의 d_cover
+
+# In-room exploration policy (SysNav paper Sec. IV-B-1): stochastic candidate selection
+EXPLORATION_CANDIDATE_SAMPLES = 60  # |H|, 한 사이클에 샘플링할 pose 후보 수
+EXPLORATION_MIN_SCORE_DELTA = 3     # δ, wcov가 이 밑으로 떨어지면 후보 뽑기를 멈춤
+EXPLORATION_STOCHASTIC_TRIALS = 4   # K, stochastic sampling을 반복해서 TSP 비용 최소인 것을 채택
+# candidate까지 A*로 구한 경로를 이 간격(m)으로 잘라 중간 waypoint를 만든다. 최종 목적지 하나만
+# 찍어서 보내면 그 사이에 벽이 있을 때 base autonomy가 돌아가지 못하고 벽에 막힐 수 있어서,
+# 내부 occupancy grid가 이미 계산해둔 (벽을 피해가는) A* 경로를 따라 짧게 여러 번 나눠 보낸다.
+EXPLORATION_PATH_WAYPOINT_SPACING_M = 1.5
+
 VIEWPOINT_MIN_DISTANCE_M = 1.0
 
 # ---------------------------------------------------------------------------

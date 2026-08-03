@@ -28,6 +28,7 @@ from sysnav import config
 from sysnav.reasoning.spatial_relation_reasoner import SpatialRelationReasoner
 from sysnav.scene_graph.scene_graph_visualizer import SceneGraphVisualizer
 from sysnav.scene_graph.viewpoint_coverage import ViewpointCoverageBuilder, VoxelKey
+from sysnav.task.query_parser import effective_relation_chain
 
 
 class SceneGraphManager:
@@ -149,32 +150,66 @@ class SceneGraphManager:
             self._safe_export_locked()
 
     def find_matching_target_ids(self, task: dict) -> list[int]:
-        relation = task.get("relation")
-        references = set(str(value).lower() for value in task.get("reference_objects", []))
-        if not relation or not references:
+        """target 카테고리에서 시작해서 relation_chain을 hop-by-hop으로 따라가며
+        실제 object-object edge가 이어지는 object만 남긴다 (예: "A closest to B near C"는
+        A--nearest-->B, B--near-->C 두 edge가 각각 실제로 존재해야 A가 매칭됨).
+        "between"은 3항 relation(하나의 edge가 target을 2개 가짐)이라 예전처럼 별도 처리한다."""
+        chain = effective_relation_chain(task)
+        if not chain:
             return []
 
         with self._lock:
-            matched = []
-            for edge in self._edges.values():
-                if edge["edge_type"] != "object_object" or edge["relation"] != relation:
-                    continue
-                target_ids = [self._parse_object_node_id(value) for value in edge["targets"]]
-                target_categories = {
-                    self._objects[object_id]["category"]
-                    for object_id in target_ids
-                    if object_id in self._objects
-                }
-                if not references.issubset(target_categories):
-                    continue
-                source_id = self._parse_object_node_id(edge["source"])
-                if (
-                    source_id in self._objects
-                    and self._objects[source_id]["category"]
-                    == str(task.get("target", "")).lower()
-                ):
-                    matched.append(source_id)
-            return sorted(set(matched))
+            if len(chain) == 1 and chain[0][1] == "between":
+                references = set(str(value).lower() for value in task.get("reference_objects", []))
+                if len(references) < 2:
+                    return []
+                matched = []
+                for edge in self._edges.values():
+                    if edge["edge_type"] != "object_object" or edge["relation"] != "between":
+                        continue
+                    target_ids = [self._parse_object_node_id(value) for value in edge["targets"]]
+                    target_categories = {
+                        self._objects[object_id]["category"]
+                        for object_id in target_ids
+                        if object_id in self._objects
+                    }
+                    if not references.issubset(target_categories):
+                        continue
+                    source_id = self._parse_object_node_id(edge["source"])
+                    if source_id in self._objects and self._objects[source_id]["category"] == chain[0][0]:
+                        matched.append(source_id)
+                return sorted(set(matched))
+
+            # frontier: 현재 hop까지 도달한 "체인상의 현재 object_id" -> 그 경로가 시작된
+            # 원래 target(root) object_id 집합. hop을 넘어갈 때마다 edge를 타고 이동하는
+            # object가 바뀌므로(예: bowl -> knife_rack -> trash_can), root와 현재 위치를
+            # 따로 추적해야 마지막에 "root(target) object"만 뽑아낼 수 있다.
+            frontier: dict[int, set[int]] = {
+                object_id: {object_id}
+                for object_id, obj in self._objects.items()
+                if obj["category"] == chain[0][0]
+            }
+            for _, relation, target_category in chain:
+                if not frontier:
+                    return []
+                next_frontier: dict[int, set[int]] = {}
+                for edge in self._edges.values():
+                    if edge["edge_type"] != "object_object" or edge["relation"] != relation:
+                        continue
+                    source_id = self._parse_object_node_id(edge["source"])
+                    roots = frontier.get(source_id)
+                    if not roots:
+                        continue
+                    target_ids = [self._parse_object_node_id(value) for value in edge["targets"]]
+                    for target_id in target_ids:
+                        if target_id in self._objects and self._objects[target_id]["category"] == target_category:
+                            next_frontier.setdefault(target_id, set()).update(roots)
+                frontier = next_frontier
+
+            matched_roots: set[int] = set()
+            for roots in frontier.values():
+                matched_roots.update(roots)
+            return sorted(matched_roots)
 
     def common_viewpoint_ids(self, object_ids: list[int]) -> list[int]:
         """Return representative viewpoints that observe every requested object."""
@@ -360,11 +395,25 @@ class SceneGraphManager:
         )
 
     def _viewpoint_can_contain_task_relation(self, task: dict, visible_ids: list[int]) -> bool:
-        categories = [self._objects[value]["category"] for value in visible_ids]
-        if str(task.get("target", "")).lower() not in categories:
+        """이 viewpoint에서 relation_chain 중 최소 한 hop이라도 검증을 시도할 만한지 본다.
+        "between"(3항 relation)은 target+두 reference가 한 프레임에 다 보여야 기하 판정이
+        되므로 예전처럼 전부 요구하지만, 그 외 체인은 hop마다 다른 viewpoint에서 관측됐을
+        수 있으므로(예: "A closest to B near C"에서 A,B와 B,C가 서로 다른 프레임에 보일 수
+        있음) hop 하나만 양쪽 다 보이면 시도할 가치가 있다고 판단한다 - 나머지 hop은
+        해당 hop이 다 보이는 다른 viewpoint가 처리한다."""
+        categories = {self._objects[value]["category"] for value in visible_ids}
+        chain = effective_relation_chain(task)
+        if not chain:
             return False
-        required_references = [str(value).lower() for value in task.get("reference_objects", [])]
-        return all(reference in categories for reference in required_references)
+        if task.get("relation") == "between":
+            if str(task.get("target", "")).lower() not in categories:
+                return False
+            required_references = [str(value).lower() for value in task.get("reference_objects", [])]
+            return all(reference in categories for reference in required_references)
+        return any(
+            source_category in categories and target_category in categories
+            for source_category, _, target_category in chain
+        )
 
     @staticmethod
     def _load_viewpoint_image(image_path: str | None) -> np.ndarray:
