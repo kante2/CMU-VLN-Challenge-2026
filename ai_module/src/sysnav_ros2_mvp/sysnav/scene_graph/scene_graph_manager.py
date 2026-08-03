@@ -324,12 +324,14 @@ class SceneGraphManager:
         return [summaries[key] for key in sorted(summaries)]
 
     def _infer_task_relations_from_common_viewpoints(self, task: dict) -> list[dict]:
-        relation = task.get("relation")
-        references = list(task.get("reference_objects") or [])
-        if not relation or not references:
+        # effective_relation_chain()을 써야 한다 - task["relation"]/["reference_objects"]는
+        # "target -> 첫 hop"만 담고 있어서, 체인의 첫 hop이 비어있는(이론상) 경우를 놓칠 수 있다.
+        chain = effective_relation_chain(task)
+        if not chain:
             return []
 
         inferred: list[dict] = []
+        attempted_viewpoint_ids: list[int] = []
         task_signature = self._task_relation_signature(task)
         for viewpoint_id, viewpoint in sorted(self._viewpoints.items(), reverse=True):
             check_key = (task_signature, int(viewpoint_id))
@@ -343,6 +345,7 @@ class SceneGraphManager:
             if not self._viewpoint_can_contain_task_relation(task, visible_ids):
                 self._relation_checks.add(check_key)
                 continue
+            attempted_viewpoint_ids.append(int(viewpoint_id))
 
             image_rgb = self._load_viewpoint_image(viewpoint.get("image_path"))
             observations_by_id = {
@@ -380,6 +383,12 @@ class SceneGraphManager:
                 if self._add_object_relation_edge(viewpoint_id, edge):
                     inferred.append({**edge, "viewpoint_id": viewpoint_id})
             self._relation_checks.add(check_key)
+
+        if not attempted_viewpoint_ids:
+            # SpatialRelationReasoner.infer()가 한 번도 안 불렸다는 뜻 - 즉 sysnav_relation_check.txt
+            # 에 아무 줄도 안 남는다. "왜 relation 검증이 아예 시도조차 안 됐는지"를 별도로
+            # 남겨야 사용자가 "이 물체가 아직 한 프레임에 같이 안 보였구나"를 알 수 있다.
+            self._relation_reasoner.log_relation_check_skipped(task, chain, self._objects)
         return inferred
 
     @staticmethod

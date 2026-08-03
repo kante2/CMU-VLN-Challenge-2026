@@ -80,6 +80,40 @@ class SpatialRelationReasoner:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def log_relation_check_skipped(
+        task: dict,
+        chain: list[tuple[str, str, str]],
+        objects: dict[int, dict],
+    ) -> None:
+        """infer()가 단 한 번도 안 불렸을 때(=이 파일에 아무 줄도 안 남을 때) 왜인지
+        남긴다. 가장 흔한 원인: chain의 어느 hop도 두 카테고리가 같은 프레임(viewpoint)
+        에서 동시에 관측된 적이 없음 - 예를 들어 "knife rack"이 아직 한 번도 bowl이나
+        trash can과 같은 화면에 안 잡혔거나, 애초에 아직 탐지된 적이 없는 카테고리."""
+        if not config.SAVE_DEBUG_IMAGES:
+            return
+        try:
+            known_categories = {obj["category"] for obj in objects.values()}
+            os.makedirs(config.DEBUG_DIR, exist_ok=True)
+            path = os.path.join(config.DEBUG_DIR, "sysnav_relation_check.txt")
+            lines = [
+                f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} | question: {task.get('raw', '')} ===",
+                "SKIPPED - no stored viewpoint has co-observed both categories of any relation hop yet:",
+            ]
+            for source_category, relation, target_category in chain:
+                missing = [
+                    category for category in (source_category, target_category)
+                    if category not in known_categories
+                ]
+                note = f" (never detected: {', '.join(missing)})" if missing else " (detected, but not together in one frame)"
+                lines.append(f"  {source_category} --{relation}--> {target_category}{note}")
+            lines.append("")
+
+            with open(path, "a", encoding="utf-8") as file:
+                file.write("\n".join(lines) + "\n")
+        except Exception as error:  # pragma: no cover - debug output must never crash reasoning
+            print(f"[spatial_relation_reasoner] failed to write relation-skip debug note: {error}")
+
+    @staticmethod
     def _save_debug_table(
         task: dict,
         candidates: list[dict],
