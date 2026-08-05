@@ -42,6 +42,34 @@ SAM2_MIN_MASK_AREA_PX = 80
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_TEMPERATURE = 0.0
 
+# 문장 -> (target, attributes, relation_chain) 파싱을 LLM(Gemini)이 하도록 켤지.
+# SysNav 논문 Sec. III의 G=(c_tgt, Φ) 정의를 그대로 따르는 task/llm_query_parser.py가
+# 이걸 담당한다 - 실패(키 없음/에러/빈 응답 등 무엇이든)하면 항상 정규식 기반
+# task/query_parser.extract_target()로 자동 폴백한다.
+LLM_QUERY_PARSER_ENABLED = os.getenv(
+    "LLM_QUERY_PARSER_ENABLED", "1"
+) not in ("0", "false", "False")
+
+# YOLO-World가 애매한 confidence(YOLO_CONFIDENCE는 넘었지만 이 값 밑)로 탐지한 것만
+# Gemini에게 한 번 더 물어서 진짜 맞는지 확인한다 (예: 침대를 0.29로 sofa라고 오검출하는
+# 경우). 한 프레임의 애매한 detection을 전부 모아서 Gemini 호출 1번으로 묶어 검증한다 -
+# 박스마다 따로 부르면 지연이 누적된다. API 에러/키 없음 등으로 검증 자체가 안 되면
+# fail-open(그냥 통과)한다 - 검증 실패가 원래 있던 탐지를 막으면 안 되므로.
+DETECTION_VERIFICATION_ENABLED = os.getenv(
+    "DETECTION_VERIFICATION_ENABLED", "1"
+) not in ("0", "false", "False")
+DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD = float(
+    os.getenv("DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD", "0.35")
+)
+
+# SysNav paper Sec. IV-A-1 (Object Node self-attribute): 문장이 속성 제약(예: "black"
+# chair)을 요구하면, 후보가 몇 개든(1개여도!) 그 카테고리 후보 전부를 VLM한테 이미지로
+# 보여주고 속성이 맞는지 확인한다. 끄면 예전처럼 속성 검증 없이 카테고리만 보고 진행한다
+# (reasoning/attribute_verifier.py).
+ATTRIBUTE_VERIFICATION_ENABLED = os.getenv(
+    "ATTRIBUTE_VERIFICATION_ENABLED", "1"
+) not in ("0", "false", "False")
+
 SAVE_DEBUG_IMAGES = os.getenv("SYSNAV_SAVE_DEBUG_IMAGES", "1") not in ("0", "false", "False")
 DEBUG_DIR = os.getenv("SYSNAV_DEBUG_DIR", "/home/docker/ai_module/debug")
 

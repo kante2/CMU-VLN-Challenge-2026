@@ -54,6 +54,16 @@ class SceneGraphVisualizer:
     def _node_name(node_type: str, numeric_id: int) -> str:
         return f"{node_type}_{numeric_id}"
 
+    @staticmethod
+    def _attribute_text(obj: dict) -> str:
+        # SysNav paper Sec. IV-A-1의 self-attribute(φ) - object_memory에 캐싱된 VLM
+        # 추론 결과를 "attr=T/F"로 표시한다. 아직 한 번도 물어본 적 없으면 빈 문자열
+        # (라벨에 아무 줄도 안 붙음).
+        attributes = obj.get("self_attributes") or {}
+        if not attributes:
+            return ""
+        return ", ".join(f"{key}={'T' if value else 'F'}" for key, value in sorted(attributes.items()))
+
     def _to_dot(self, graph: dict) -> str:
         lines = [
             "digraph scene_graph {",
@@ -77,6 +87,9 @@ class SceneGraphVisualizer:
         for obj in graph["objects"]:
             name = self._node_name("object", obj["object_id"])
             label = f'{obj["category"]} #{obj["object_id"]}\\n({obj["position"][0]:.2f}, {obj["position"][1]:.2f})'
+            attribute_text = self._attribute_text(obj)
+            if attribute_text:
+                label += f"\\n{attribute_text}"
             fill = "#f5d6d6" if obj["object_id"] == selected_id else "#e9edf2"
             lines.append(f'  {name} [label="{label}", shape=box, fillcolor="{fill}"];')
 

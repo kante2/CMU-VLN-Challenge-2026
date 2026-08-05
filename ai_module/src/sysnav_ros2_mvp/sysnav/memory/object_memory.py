@@ -67,6 +67,10 @@ class ObjectMemory:
             "last_seen_time": timestamp,
             "latest_bbox_2d": tuple(observation.get("bbox", (0, 0, 0, 0))),
             "num_points": int(observation.get("num_points", 0)),
+            # SysNav paper Sec. IV-A-1의 self-attribute(φ, 예: color) - "on demand로
+            # 추론하고 node에 append"한다는 설계 그대로, 처음엔 비어있다가 task가 실제로
+            # 속성을 요구할 때만 VLM으로 채워지고 계속 캐싱된다 (reasoning/attribute_verifier.py).
+            "self_attributes": {},
         }
 
     # 기존 객체의 pointcloud와, 새 observation의 pointcloud를 합치는 함수
@@ -162,6 +166,17 @@ class ObjectMemory:
         with self._lock:
             node = self._nodes.get(int(object_id))
             return None if node is None else self._copy_node(node)
+
+    # VLM으로 새로 추론한 self-attribute(φ) 결과를 node에 캐싱한다 (attribute_verifier.py가
+    # 호출) - 논문의 "appending the results φ to each node"를 그대로 구현. 기존 캐시는
+    # 유지하고 새로 들어온 것만 덮어써서, 나중에 다른 속성 질문이 와도 이미 확인된 속성은
+    # 또 안 물어봐도 된다.
+    def update_self_attributes(self, object_id: int, attributes: dict[str, bool]) -> None:
+        with self._lock:
+            node = self._nodes.get(int(object_id))
+            if node is None:
+                return
+            node["self_attributes"] = {**node.get("self_attributes", {}), **attributes}
     # 저장된 모든 객체를 리스트로 반환
     def all_nodes(self) -> list[dict]:
         with self._lock:

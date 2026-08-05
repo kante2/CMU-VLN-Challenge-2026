@@ -91,6 +91,12 @@ class CoveragePlanner:
         with self._lock:
             return self.max_height.copy()
 
+    def surface_point_mask(self, grid: np.ndarray) -> np.ndarray:
+        """논문의 surface point set S(free/non-free 경계) - plan_route()가 candidate
+        점수(wcov)를 매길 때 쓰는 것과 동일한 마스크. 디버그 시각화 전용으로 외부에
+        노출한다 (exploration_visualizer.py)."""
+        return self.frontier_extractor._mask(grid)
+
     def _ensure_origin(self, pose: dict) -> None:
         if self.origin_x is None:
             half = config.MAP_SIZE_M / 2.0

@@ -22,12 +22,14 @@ from visualization_msgs.msg import MarkerArray
 
 from sysnav import config
 from sysnav.exploration.coverage_planner import CoveragePlanner
+from sysnav.exploration.exploration_visualizer import export_exploration_debug
 from sysnav.exploration.viewpoint_memory import ViewpointMemory
 from sysnav.rooms.room_segmenter import RoomSegmenter
 from sysnav.rooms.room_visualizer import export_room_segmentation
 from sysnav.memory.object_memory import ObjectMemory
 from sysnav.navigation.goal_publisher import GoalPublisher
 from sysnav.perception.perception_pipeline import PerceptionPipeline
+from sysnav.reasoning.attribute_verifier import AttributeVerifier
 from sysnav.reasoning.gemini_selector import GeminiSelector
 from sysnav.scene_graph.scene_graph_manager import SceneGraphManager
 from sysnav.scene_graph.scene_graph_rviz import build_object_marker_array
@@ -38,7 +40,8 @@ from sysnav.ros_helpers import (
     odometry_to_pose,
     pointcloud2_to_xyz,
 )
-from sysnav.task.query_parser import extract_target, effective_relation_chain
+from sysnav.task.llm_query_parser import LLMQueryParser
+from sysnav.task.query_parser import effective_relation_chain
 
 '''
 ThreadPoolExecutor 문법 -  시간이 오래걸리는 함수를 별도 작업 스레드에서 실행하도록 맡기는 도구,
@@ -109,11 +112,13 @@ class SysNavNode(Node):
         self.last_map_submit_time = 0.0
 
         self.perception = PerceptionPipeline()
+        self.query_parser = LLMQueryParser()
         self.object_memory = ObjectMemory()
         # Room/Viewpoint/Object node와 edge를 관리한다. Viewpoint는 매 프레임이 아니라
         # novel LiDAR voxel coverage가 충분할 때만 생성하며 debug graph를 갱신한다.
         self.scene_graph = SceneGraphManager(debug_dir=config.DEBUG_DIR)
         self.selector = GeminiSelector()
+        self.attribute_verifier = AttributeVerifier()
         self.coverage_planner = CoveragePlanner()
         self.room_segmenter = RoomSegmenter()
         self.viewpoint_memory = ViewpointMemory()
@@ -169,7 +174,9 @@ class SysNavNode(Node):
     # ------------------------------------------------------------------
 
     def question_callback(self, msg: String) -> None:
-        parsed = extract_target(msg.data)
+        # SysNav paper Sec. III의 G=(c_tgt, Φ) 파싱을 LLM이 하고, 실패하면 항상
+        # 규칙 기반 query_parser.extract_target()로 자동 폴백한다.
+        parsed = self.query_parser.parse(msg.data)
         if not parsed["target"]:
             self.get_logger().error(f"Could not extract target object: {msg.data}")
             return
@@ -195,7 +202,8 @@ class SysNavNode(Node):
         self.get_logger().info(
             f"Task #{self.task_id}: target={parsed['target']}, "
             f"attributes={parsed['attributes']}, relation={parsed['relation']}, "
-            f"references={parsed['reference_objects']}"
+            f"references={parsed['reference_objects']}, "
+            f"prompts={parsed['detection_prompts']}, parser={parsed.get('parser', 'rules')}"
         )
 
     def state_callback(self, msg: Odometry) -> None:
@@ -238,6 +246,7 @@ class SysNavNode(Node):
         #-> Occupancy Map
         # frontier는 이 occupancy map을 통해서 찾게 된다.
         self._update_room_segmentation()
+        self._update_exploration_debug(pose)
 
     # Room Node segmentation (SysNav paper Sec. IV-A-1) - 매핑이 갱신될 때마다 같이
     # 갱신하고, room_segmentation_latest.png를 scene_graph_latest.png와 같은 패턴으로
@@ -247,6 +256,15 @@ class SysNavNode(Node):
         max_height = self.coverage_planner.snapshot_max_height()
         result = self.room_segmenter.segment(grid, max_height=max_height)
         self._latest_room_segmentation = result
+
+    # surface point(S, plan_route()가 candidate 점수 매길 때 쓰는 것과 동일한 frontier
+    # 마스크)를 exploration_debug_latest.png로 시각화 - "지금 frontier를 제대로 잡고
+    # 있는지" RViz 없이 바로 확인할 수 있게 한다.
+    def _update_exploration_debug(self, pose: dict) -> None:
+        grid = self.coverage_planner.snapshot_grid()
+        surface_mask = self.coverage_planner.surface_point_mask(grid)
+        robot_cell = self.coverage_planner.world_to_grid(pose["x"], pose["y"])
+        export_exploration_debug(grid, surface_mask, robot_cell)
         export_room_segmentation(grid, result)
     '''
     NumPy XYZ 배열
@@ -387,6 +405,28 @@ class SysNavNode(Node):
             # 아직 못 봤기 때문. 검증 안 된 채로 아무 bowl이나 확정지으면 오답으로
             # navigation을 끝내버리게 되므로, 여기서 확정하지 않고 계속 탐색하게 한다.
             return {"task_id": task_id, "selected_id": None, "relation_pending": True}
+
+        # SysNav paper Sec. IV-A-1 (self-attribute): 문장에 속성 제약(예: "black" chair)이
+        # 있으면, 후보가 1개뿐이어도 반드시 VLM으로 확인한다 - "후보가 하나뿐이면 그냥
+        # 확정"하던 예전 GeminiSelector 지름길이 색을 전혀 안 보고 넘어가버리는 원인이었다.
+        attributes = list(task.get("attributes") or [])
+        if attributes and config.ATTRIBUTE_VERIFICATION_ENABLED and candidates:
+            attribute_results = self.attribute_verifier.verify(candidates, attributes)
+            for candidate in candidates:
+                newly_checked = attribute_results.get(int(candidate["object_id"]), {})
+                if newly_checked:
+                    self.object_memory.update_self_attributes(int(candidate["object_id"]), newly_checked)
+            candidates = [
+                candidate for candidate in candidates
+                if all(
+                    attribute_results.get(int(candidate["object_id"]), {}).get(attribute, False)
+                    for attribute in attributes
+                )
+            ]
+            if not candidates:
+                # 속성이 확인된 후보가 하나도 없다(전부 불일치했거나 아직 검증 자체가
+                # 안 됨) - 확정하지 않고 계속 탐색해서 진짜 맞는 물체를 더 찾아본다.
+                return {"task_id": task_id, "selected_id": None, "attribute_pending": True}
 
         # GeminiSelector()
         selected_id = self.selector.select(
@@ -546,6 +586,17 @@ class SysNavNode(Node):
                 self.get_logger().info(
                     "Selection deferred: relation constraint not verified for any candidate yet, "
                     "continuing exploration"
+                )
+                with self.state_lock:
+                    self.state = "PLAN_EXPLORATION"
+                return
+            if result.get("attribute_pending"):
+                # 문장의 속성 제약(예: "black" chair)을 만족하는 candidate가 검증되지
+                # 않았다(불일치했거나 아직 확인 자체가 안 됨) - 확정하지 않고 계속
+                # 탐색해서 진짜 속성이 맞는 물체를 더 찾아본다.
+                self.get_logger().info(
+                    "Selection deferred: attribute constraint not verified for any "
+                    "candidate yet, continuing exploration"
                 )
                 with self.state_lock:
                     self.state = "PLAN_EXPLORATION"

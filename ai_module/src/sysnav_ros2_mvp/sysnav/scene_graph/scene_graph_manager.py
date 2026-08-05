@@ -503,6 +503,12 @@ class SceneGraphManager:
             "first_seen_time": float(node.get("first_seen_time", 0.0)),
             "last_seen_time": float(node.get("last_seen_time", 0.0)),
             "room_id": int(config.SCENE_GRAPH_SINGLE_ROOM_ID),
+            # SysNav paper Sec. IV-A-1의 self-attribute(φ, 예: color) - object_memory에
+            # 캐싱된 VLM 추론 결과(attribute_verifier.py)를 그대로 노출한다. 아직 한 번도
+            # 물어본 적 없으면 빈 dict.
+            "self_attributes": {
+                str(key): bool(value) for key, value in (node.get("self_attributes") or {}).items()
+            },
         }
 
     def _save_viewpoint_image(self, viewpoint_id: int, image_rgb: np.ndarray) -> str | None:
