@@ -68,3 +68,31 @@ def build_object_marker_array(
         array.markers.append(label)
 
     return array
+
+
+_SELECTED_OBJECT_NAMESPACE = "selected_object"
+
+
+def build_selected_object_marker(obj: dict, stamp: Time) -> Marker:
+    """`/selected_object_marker`(Marker 단수) 발행용 - Object Reference 채점 토픽.
+    CLAUDE.md 확인 사항: 이 토픽은 dummy_vlm과 챌린지 visualizationTools가 이미
+    Marker(단수) 타입으로 고정 구독 중이라 MarkerArray로 바꾸면 안 된다."""
+    position = obj.get("position", (0.0, 0.0, 0.0))
+    extent = obj.get("extent_3d", (0.0, 0.0, 0.0))
+    size = [value if value > 0.01 else config.OBJECT_MARKER_DEFAULT_SIZE_M for value in extent]
+
+    marker = Marker()
+    marker.header.frame_id = config.OBJECT_MARKER_FRAME_ID
+    marker.header.stamp = stamp
+    marker.ns = _SELECTED_OBJECT_NAMESPACE
+    marker.id = 0
+    marker.type = Marker.CUBE
+    marker.action = Marker.ADD
+    marker.pose.position.x = float(position[0])
+    marker.pose.position.y = float(position[1])
+    marker.pose.position.z = float(position[2])
+    marker.pose.orientation.w = 1.0
+    marker.scale.x, marker.scale.y, marker.scale.z = (float(value) for value in size)
+    marker.color.r, marker.color.g, marker.color.b, marker.color.a = _SELECTED_COLOR
+    marker.text = str(obj.get("category", "?"))
+    return marker

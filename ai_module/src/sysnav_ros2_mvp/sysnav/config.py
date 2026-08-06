@@ -10,6 +10,11 @@ TOPIC_IMAGE = "/camera/image"
 TOPIC_SCAN = "/sensor_scan"
 TOPIC_WAYPOINT = "/way_point_with_heading"
 TOPIC_OBJECT_MARKERS = "/sysnav/object_markers"
+# 채점 대상 토픽(README) - Object Reference: 이 두 개는 절대 이름/타입을 바꾸지 말 것
+# (Marker 단수, MarkerArray 아님 - CLAUDE.md의 하드-런 규칙).
+TOPIC_SELECTED_OBJECT_MARKER = "/selected_object_marker"
+# 채점 대상 토픽(README) - Numerical.
+TOPIC_NUMERICAL_RESPONSE = "/numerical_response"
 
 OBJECT_MARKER_FRAME_ID = "map"
 OBJECT_MARKER_DEFAULT_SIZE_M = 0.3
@@ -139,6 +144,22 @@ ROOM_WALL_MIN_HEIGHT_M = 1.30
 # 요청대로 줄여둠.)
 ROOM_SEGMENTATION_WALL_PADDING_M = 0.05
 
+# Room Node identity persistence (rooms/room_registry.py). RoomSegmenter.segment()는
+# 매 mapping cycle마다 watershed를 처음부터 다시 돌려 room_id를 1..N으로 새로 매기므로
+# (사이클 간 정체성이 없음), RoomRegistry가 centroid 근접 매칭으로 "같은 물리적 방"을
+# 안정적인 room_id에 이어붙인다. 이 반경(m)보다 centroid가 더 멀어지면 다른 방으로
+# 취급해 새 id를 발급한다.
+ROOM_REGISTRY_MATCH_RADIUS_M = 2.0
+
+# Room category 추론(VLM) - SysNav paper Sec. IV-A-1의 room attribute c_i. Object
+# self-attribute와 같은 on-demand 패턴: room의 "best view"(가장 coverage_voxel_count가
+# 큰 viewpoint, 논문 각주의 "visible voxels 최대화")가 바뀔 때만 재추론하고, 그 외엔
+# 캐시를 재사용한다.
+ROOM_CLASSIFICATION_ENABLED = os.getenv("SYSNAV_ROOM_CLASSIFICATION_ENABLED", "1") not in ("0", "false", "False")
+# VLM 호출이 실패(키 없음 등)했을 때 매 mapping cycle(0.35초 간격)마다 재시도하면 로그가
+# 스팸이 되므로, 실패한 room은 이 시간(초)만큼 재시도를 쉰다.
+ROOM_CLASSIFICATION_RETRY_COOLDOWN_SEC = 15.0
+
 FRONTIER_MIN_CLUSTER_CELLS = 5
 FRONTIER_COVERAGE_RADIUS_M = 3.0  # 논문의 d_cover
 # candidate에서 surface point가 "보이는지"(LOS) 판정할 때 쓰는 벽 margin. ROBOT_CLEARANCE_M
@@ -174,6 +195,12 @@ EXPLORATION_DISTANCE_PENALTY_HALFLIFE_M = 3.0
 EXPLORATION_PATH_WAYPOINT_SPACING_M = 3.0
 
 VIEWPOINT_MIN_DISTANCE_M = 1.0
+
+# Instruction-Following (missions/mission3_pipe.py) - "avoiding the path between A
+# and B"/"avoid the path near Z" 같은 negative constraint를 A-B 선분(또는 Z 한 점)
+# 주변 이 반경(m)만큼 non-traversable로 마킹해서 plan_direct_path()가 우회하게 한다.
+# 실제 문/복도 폭을 모르므로 대략적인 근사치 - 너무 크면 우회 자체가 불가능해질 수 있다.
+INSTRUCTION_FORBIDDEN_RADIUS_M = 0.8
 
 # ---------------------------------------------------------------------------
 # Single-room scene graph

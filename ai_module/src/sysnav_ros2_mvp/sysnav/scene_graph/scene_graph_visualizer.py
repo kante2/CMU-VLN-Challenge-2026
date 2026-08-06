@@ -216,6 +216,14 @@ class SceneGraphVisualizer:
                 (position[0], position[1] + 66),
                 (80, 80, 80),
             )
+            attribute_text = self._attribute_text(obj)
+            if attribute_text:
+                self._label(
+                    canvas,
+                    attribute_text,
+                    (position[0], position[1] + 90),
+                    (140, 60, 20),
+                )
 
         cv2.putText(
             canvas,

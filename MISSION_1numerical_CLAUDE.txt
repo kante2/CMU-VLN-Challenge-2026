@@ -1,0 +1,86 @@
+# Numerical 미션 — 분석 및 구현 계획
+
+## 공식 정의 (문제 스펙)
+Numerical questions asks about the quantity of an object that fits certain
+attributes or spatial relations. The response is expected to be an integer number.
+
+예시:
+- "How many blue chairs are between the table and the wall?"
+- "How many black trash cans are near the window?"
+
+## questions.json 실제 예시 (15개 씬)
+- "How many sofas are below a window?"
+- "Count the number of chairs with pillows on them."
+- "How many pillows are on the sofa under the pictures?"
+- "How many red pillows are on the sofa?"
+- "How many pillows are on the bed?"
+- "How many pictures are above the bed?"
+- "How many calligraphy paintings are above the display ledge?"
+- "How many chairs are near the table with a vase on it?"
+- "How many cups are on the coffee table?"
+- "How many photos are on the TV cabinet?"
+- "How many pillows are on a sofa?"
+- "How many black pillows are on the sofa?"
+- "How many computer monitors are on the table closest to the map wall decal?"
+- "How many potted plants are on a table?"
+- "How many framed records are above the couch?"
+
+패턴: [속성?] 카테고리 + relation + 참조 물체(often "the X" 특정 인스턴스, 즉 그 X도
+먼저 찾아야 함 - 예: "sofa under **the pictures**", "table closest to **the map wall
+decal**"). relation 없이 attribute만 있는 경우도 있음("black pillows are on the sofa").
+
+## 채점 (README)
+- 배점: **/1점** (제일 낮음)
+- 토픽: `/numerical_response`, `std_msgs/msg/Int32`
+- 정확히 맞는 정수만 1점, 나머지 0점 (부분점수 없음)
+
+## 현재 구현 상태 — 전혀 없음
+`ai_module/src/sysnav_ros2_mvp/sysnav/` 전체에 numerical 관련 코드가 없다:
+- `sysnav_node.py`의 `question_callback`이 들어오는 모든 문장을 무조건 object-reference
+  (find X) 파이프라인으로 처리함 - "how many"로 시작해도 분기 없음
+- `/numerical_response` 퍼블리셔, `std_msgs/msg/Int32` import 전부 없음
+- "끝까지 다 세는" 로직(현재는 하나 찾으면 SELECT_TARGET -> NAVIGATE_TARGET -> SUCCESS로
+  끝나버리는 구조라 정반대)도 없음
+
+## 필요한 작업
+
+### 1. 질문 분기
+`question_callback`(또는 `dispatch`)에서 "how many"/"count"로 시작하면 numerical
+파이프라인으로 분기 (docker/README.md의 dummy_vlm 관례와 동일).
+
+### 2. 문장 파싱
+기존 `LLMQueryParser`/`query_parser.extract_target()`를 그대로 재사용 가능 - target
+카테고리 + attributes + relation_chain 추출은 object_reference와 동일한 구조. "target"의
+의미만 "찾을 유일한 물체"에서 "셀 카테고리"로 바뀔 뿐.
+
+### 3. 탐색 종료 조건이 근본적으로 다름 (가장 중요한 차이)
+object_reference는 "하나 찾으면 끝"이지만, numerical은 **"더 이상 탐색할 곳이 없을 때까지"**
+계속 探索해야 정확한 개수를 셀 수 있다. 즉:
+- `perception_job`에서 후보를 찾아도 바로 SELECT_TARGET으로 안 넘어가고 계속 PLAN_EXPLORATION
+- `coverage_planner.plan_route()`가 빈 route를 반환(`No reachable frontier remains`,
+  진단 로그로 이유도 남음)하는 시점이 "다 봤다"는 신호 - 그때 카운트를 확정
+- room-scoping 때문에 "이 방은 다 봤다"에서 다른 방으로 못 넘어가는 문제(예전에 겪었던
+  "화장실에 갇힘"과 비슷한 종류)가 여기서도 그대로 영향을 줄 수 있음 - 주의
+
+### 4. 카운트 로직
+- `object_memory.find_by_category(target)`로 후보 전부 가져옴
+- attribute 제약 있으면 `attribute_verifier.verify()`로 필터링 (이미 만든 인프라 재사용)
+- relation 제약 있으면 `scene_graph.find_matching_target_ids()`로 필터링 (이미 만든
+  인프라 재사용 - relation_chain의 참조 물체도 먼저 resolve해야 함, 예: "sofa under
+  the pictures"에서 "the pictures"도 먼저 찾아야 함)
+- 남은 후보 개수 = 답
+
+### 5. 발행
+`/numerical_response`(Int32)로 최종 개수 발행 후 태스크 종료(SUCCESS 상태로).
+
+## 재사용 가능한 기존 인프라
+- `task/query_parser.py` / `task/llm_query_parser.py` — 문장 파싱
+- `reasoning/attribute_verifier.py` — 속성 필터링
+- `reasoning/spatial_relation_reasoner.py` + `scene_graph_manager.find_matching_target_ids` — 관계 필터링
+- `exploration/coverage_planner.py` + room segmentation — 탐색 자체
+
+## 새로 만들어야 하는 것
+- numerical 전용 solver (예: `task/numerical_solver.py` 또는 `sysnav_node.py`에 직접) -
+  "끝까지 탐색 후 카운트" 상태 흐름
+- `/numerical_response` 퍼블리셔 등록
+- 질문 타입 분기 로직

@@ -17,13 +17,15 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2
-from std_msgs.msg import String
-from visualization_msgs.msg import MarkerArray
+from std_msgs.msg import Int32, String
+from visualization_msgs.msg import Marker, MarkerArray
 
 from sysnav import config
 from sysnav.exploration.coverage_planner import CoveragePlanner
 from sysnav.exploration.exploration_visualizer import export_exploration_debug
 from sysnav.exploration.viewpoint_memory import ViewpointMemory
+from sysnav.missions import mission1_pipe, mission2_pipe, mission3_pipe
+from sysnav.rooms.room_registry import RoomRegistry
 from sysnav.rooms.room_segmenter import RoomSegmenter
 from sysnav.rooms.room_visualizer import export_room_segmentation
 from sysnav.memory.object_memory import ObjectMemory
@@ -31,6 +33,7 @@ from sysnav.navigation.goal_publisher import GoalPublisher
 from sysnav.perception.perception_pipeline import PerceptionPipeline
 from sysnav.reasoning.attribute_verifier import AttributeVerifier
 from sysnav.reasoning.gemini_selector import GeminiSelector
+from sysnav.reasoning.room_classifier import RoomClassifier
 from sysnav.scene_graph.scene_graph_manager import SceneGraphManager
 from sysnav.scene_graph.scene_graph_rviz import build_object_marker_array
 from sysnav.ros_helpers import (
@@ -41,7 +44,21 @@ from sysnav.ros_helpers import (
     pointcloud2_to_xyz,
 )
 from sysnav.task.llm_query_parser import LLMQueryParser
+from sysnav.task.mission_classifier import (
+    MISSION_INSTRUCTION_FOLLOWING,
+    MISSION_NUMERICAL,
+    MISSION_OBJECT_REFERENCE,
+    classify_mission,
+)
 from sysnav.task.query_parser import effective_relation_chain
+
+# state 이름 -> 처리할 mission pipe 모듈. 미션에 없는 state로 잘못 분기되지 않도록
+# question_callback에서 항상 task["mission_type"]을 이 dict의 키 중 하나로 채운다.
+_MISSION_PIPES = {
+    MISSION_OBJECT_REFERENCE: mission2_pipe,
+    MISSION_NUMERICAL: mission1_pipe,
+    MISSION_INSTRUCTION_FOLLOWING: mission3_pipe,
+}
 
 '''
 ThreadPoolExecutor 문법 -  시간이 오래걸리는 함수를 별도 작업 스레드에서 실행하도록 맡기는 도구,
@@ -121,15 +138,32 @@ class SysNavNode(Node):
         self.attribute_verifier = AttributeVerifier()
         self.coverage_planner = CoveragePlanner()
         self.room_segmenter = RoomSegmenter()
+        self.room_registry = RoomRegistry()
+        self.room_classifier = RoomClassifier()
         self.viewpoint_memory = ViewpointMemory()
         self.goal_publisher = GoalPublisher(self)
         self.object_marker_pub = self.create_publisher(MarkerArray, config.TOPIC_OBJECT_MARKERS, 10)
+        # 채점 대상 토픽(README) - Object Reference/Numerical. 절대 이름/타입을 바꾸지
+        # 말 것 (Marker 단수, MarkerArray 아님 - CLAUDE.md 하드-룰).
+        self.selected_object_marker_pub = self.create_publisher(
+            Marker, config.TOPIC_SELECTED_OBJECT_MARKER, 10
+        )
+        self.numerical_response_pub = self.create_publisher(
+            Int32, config.TOPIC_NUMERICAL_RESPONSE, 10
+        )
 
         self.current_goal: dict | None = None
         self.exploration_route = deque()
         self._latest_room_segmentation: dict | None = None
         self._exploration_goal_best_distance_m: float | None = None
         self._exploration_goal_last_progress_time: float | None = None
+
+        # Mission 3(Instruction-Following, missions/mission3_pipe.py) 전용 상태 -
+        # 여러 목적지를 순서대로 처리해야 해서 mission2/1과 달리 진행 인덱스가
+        # 필요하다. 다른 미션에서는 안 쓰이므로 매 새 질문마다 리셋만 하면 무해하다.
+        self.mission3_step_index = 0
+        self.mission3_leg_queue = deque()
+        self.mission3_forbidden_mask = None
 
         self.question_sub = self.create_subscription(
             String,
@@ -174,11 +208,24 @@ class SysNavNode(Node):
     # ------------------------------------------------------------------
 
     def question_callback(self, msg: String) -> None:
-        # SysNav paper Sec. III의 G=(c_tgt, Φ) 파싱을 LLM이 하고, 실패하면 항상
-        # 규칙 기반 query_parser.extract_target()로 자동 폴백한다.
-        parsed = self.query_parser.parse(msg.data)
-        if not parsed["target"]:
-            self.get_logger().error(f"Could not extract target object: {msg.data}")
+        # 문장이 세 미션(Numerical/Object Reference/Instruction-Following) 중 어디로
+        # 가야 하는지부터 정한다 - 응답 형식/상태머신이 미션마다 완전히 다르다
+        # (MISSION_1/2/3_*_CLAUDE.txt 참고).
+        mission_type = classify_mission(msg.data)
+        if mission_type == MISSION_INSTRUCTION_FOLLOWING:
+            # 다단계 목적지 + 경로 제약 문장이라 단일 target G=(c_tgt,Φ) 파서로는
+            # 못 담는다 - 절 단위로 쪼개서 목적지 절마다 같은 LLMQueryParser를 재사용.
+            parsed = mission3_pipe.parse_instruction(self, msg.data)
+            is_valid = bool(parsed.get("steps"))
+        else:
+            # SysNav paper Sec. III의 G=(c_tgt, Φ) 파싱을 LLM이 하고, 실패하면 항상
+            # 규칙 기반 query_parser.extract_target()로 자동 폴백한다.
+            parsed = self.query_parser.parse(msg.data)
+            is_valid = bool(parsed.get("target"))
+        parsed["mission_type"] = mission_type
+
+        if not is_valid:
+            self.get_logger().error(f"Could not parse question ({mission_type}): {msg.data}")
             return
 
         with self.state_lock: # 읽는 도중 콜백으로 덮어쓰지 않도록 lock을 걸어준다.
@@ -188,6 +235,9 @@ class SysNavNode(Node):
             self.current_goal = None
             self.exploration_route.clear()
             self.last_processed_image_stamp = -1.0
+            self.mission3_step_index = 0
+            self.mission3_leg_queue.clear()
+            self.mission3_forbidden_mask = None
 
         if not config.KEEP_MEMORY_BETWEEN_TASKS:
             self.object_memory.clear()
@@ -199,12 +249,18 @@ class SysNavNode(Node):
         self.scene_graph.start_task(self.task_id, parsed)
         self.publish_object_markers()
 
-        self.get_logger().info(
-            f"Task #{self.task_id}: target={parsed['target']}, "
-            f"attributes={parsed['attributes']}, relation={parsed['relation']}, "
-            f"references={parsed['reference_objects']}, "
-            f"prompts={parsed['detection_prompts']}, parser={parsed.get('parser', 'rules')}"
-        )
+        if mission_type == MISSION_INSTRUCTION_FOLLOWING:
+            self.get_logger().info(
+                f"📩 NEW QUESTION [{mission_type}] - Task #{self.task_id}: \"{msg.data}\" -> "
+                f"steps={parsed['steps']}"
+            )
+        else:
+            self.get_logger().info(
+                f"📩 NEW QUESTION [{mission_type}] - Task #{self.task_id}: \"{msg.data}\" -> "
+                f"target={parsed['target']}, attributes={parsed['attributes']}, "
+                f"relation={parsed['relation']}, references={parsed['reference_objects']}, "
+                f"prompts={parsed['detection_prompts']}, parser={parsed.get('parser', 'rules')}"
+            )
 
     def state_callback(self, msg: Odometry) -> None:
         pose = odometry_to_pose(msg)
@@ -250,12 +306,39 @@ class SysNavNode(Node):
 
     # Room Node segmentation (SysNav paper Sec. IV-A-1) - 매핑이 갱신될 때마다 같이
     # 갱신하고, room_segmentation_latest.png를 scene_graph_latest.png와 같은 패턴으로
-    # (append가 아니라 매번 통째로 다시 그려서) 덮어쓴다.
+    # (append가 아니라 매번 통째로 다시 그려서) 덮어쓴다. exploration용
+    # self._latest_room_segmentation(room_scoped sampling에 쓰임, 사이클마다 room_id가
+    # 바뀌어도 무방 - 그 사이클 안에서만 일관되면 됨)과, 시각화/분류용 RoomRegistry(사이클
+    # 간에도 room_id가 안정적으로 유지되어야 category를 이어붙일 수 있음)는 서로 다른
+    # 목적이라 별도로 관리한다.
     def _update_room_segmentation(self) -> None:
         grid = self.coverage_planner.snapshot_grid()
         max_height = self.coverage_planner.snapshot_max_height()
         result = self.room_segmenter.segment(grid, max_height=max_height)
         self._latest_room_segmentation = result
+
+        viewpoints = self.scene_graph.list_viewpoints()
+        registry_result = self.room_registry.update(
+            segmentation=result,
+            viewpoints=viewpoints,
+            world_to_grid=self.coverage_planner.world_to_grid,
+        )
+        self._classify_pending_rooms()
+        export_room_segmentation(grid, registry_result)
+
+    def _classify_pending_rooms(self) -> None:
+        if not config.ROOM_CLASSIFICATION_ENABLED:
+            return
+        pending = self.room_registry.rooms_needing_classification()
+        if not pending:
+            return
+        categories = self.room_classifier.classify_many(pending)
+        for room in pending:
+            room_id = room["room_id"]
+            if room_id in categories:
+                self.room_registry.set_category(room_id, categories[room_id])
+            else:
+                self.room_registry.mark_classification_failed(room_id)
 
     # surface point(S, plan_route()가 candidate 점수 매길 때 쓰는 것과 동일한 frontier
     # 마스크)를 exploration_debug_latest.png로 시각화 - "지금 frontier를 제대로 잡고
@@ -265,7 +348,6 @@ class SysNavNode(Node):
         surface_mask = self.coverage_planner.surface_point_mask(grid)
         robot_cell = self.coverage_planner.world_to_grid(pose["x"], pose["y"])
         export_exploration_debug(grid, surface_mask, robot_cell)
-        export_room_segmentation(grid, result)
     '''
     NumPy XYZ 배열
     ↓
@@ -527,7 +609,7 @@ class SysNavNode(Node):
             result = future.result() # WORKER가 반환한 값을 .result() 을 통해서 가져온다.
         #  worker에서 예외 발생시,
         except Exception as error: # Worker 함수 안에서 오류가 발생하면 future.result()를 호출할 때 그 예외가 다시 발생
-            self.get_logger().error(f"{kind} job failed: {error}")
+            self.get_logger().error(f"⚠️ {kind} job failed: {error}")
             # ---------------- 작업 종류별 오류 복구 -----------------------
             with self.state_lock:
                 if kind == "perception":
@@ -547,6 +629,12 @@ class SysNavNode(Node):
         if expected_task_id != self.task_id or result.get("task_id") != self.task_id:
             return
 
+        with self.state_lock:
+            task = None if self.task is None else dict(self.task)
+
+        # perception 결과 반영(스탬프/scene graph 로깅/marker publish)은 세 미션
+        # 공통이다 - "이 결과로 어떤 state로 갈지"만 미션마다 다르므로 그 판단만
+        # missions/*.py에 위임한다.
         if kind == "perception":
             self.last_processed_image_stamp = float(result["image_stamp"])
             self.last_perception_wall_time = time.monotonic()
@@ -571,73 +659,11 @@ class SysNavNode(Node):
                     f"Scene graph export failed: {self.scene_graph.last_export_error}"
                 )
             self.publish_object_markers()
-            if result["candidates"]:
-                with self.state_lock:
-                    self.state = "SELECT_TARGET"
-                    self.exploration_route.clear()
-            elif origin_state == "OBSERVE":
-                with self.state_lock:
-                    self.state = "PLAN_EXPLORATION"
 
-        elif kind == "selection":
-            if result.get("relation_pending"):
-                # 문장의 relation 제약(예: "knife rack 근처")이 아직 검증 안 된 candidate뿐이다.
-                # 확정하지 않고 계속 탐색해서 참조 물체를 더 찾아본다.
-                self.get_logger().info(
-                    "Selection deferred: relation constraint not verified for any candidate yet, "
-                    "continuing exploration"
-                )
-                with self.state_lock:
-                    self.state = "PLAN_EXPLORATION"
-                return
-            if result.get("attribute_pending"):
-                # 문장의 속성 제약(예: "black" chair)을 만족하는 candidate가 검증되지
-                # 않았다(불일치했거나 아직 확인 자체가 안 됨) - 확정하지 않고 계속
-                # 탐색해서 진짜 속성이 맞는 물체를 더 찾아본다.
-                self.get_logger().info(
-                    "Selection deferred: attribute constraint not verified for any "
-                    "candidate yet, continuing exploration"
-                )
-                with self.state_lock:
-                    self.state = "PLAN_EXPLORATION"
-                return
-            selected = self.object_memory.get(result["selected_id"])
-            with self.sensor_lock:
-                pose = None if self.latest_pose is None else dict(self.latest_pose)
-            if selected is None or pose is None:
-                with self.state_lock:
-                    self.state = "PLAN_EXPLORATION"
-                return
-            x, y, theta = self.goal_publisher.object_approach_pose(pose, selected["position"])
-            self.goal_publisher.publish(x, y, theta)
-            self.current_goal = {
-                "x": x,
-                "y": y,
-                "theta": theta,
-                "type": "target",
-                "object_id": selected["object_id"],
-            }
-            # 선택된 target object를 Scene Graph에 표시하고 debug PNG/JSON/DOT을 갱신한다.
-            self.scene_graph.mark_selected_object(selected["object_id"])
-            self.publish_object_markers()
-            with self.state_lock:
-                self.state = "NAVIGATE_TARGET"
-            self.get_logger().info(
-                f"Selected object_id={selected['object_id']}, "
-                f"goal=({x:.2f}, {y:.2f}, {theta:.2f})"
-            )
-
-        elif kind == "exploration":
-            route = result["route"]
-            if not route:
-                with self.state_lock:
-                    self.state = "FAILED"
-                self.get_logger().warning(
-                    f"No reachable frontier remains ({self.coverage_planner.describe_last_plan_failure()})"
-                )
-                return
-            self.exploration_route = deque(route)
-            self.publish_next_exploration_goal()
+        mission_pipe = _MISSION_PIPES.get(
+            (task or {}).get("mission_type", MISSION_OBJECT_REFERENCE), mission2_pipe
+        )
+        mission_pipe.on_job_result(self, task, kind, result, origin_state)
 
     # ------------------------------------------------------------------
     # State machine
@@ -661,15 +687,20 @@ class SysNavNode(Node):
         if pose is None:
             return
 
-        if state == "NAVIGATE_TARGET":
-            if self.goal_reached(pose):
-                with self.state_lock:
-                    self.state = "SUCCESS"
-                self.get_logger().info("Target navigation completed")
-            return
-
+        # OBSERVE/PLAN_EXPLORATION/FOLLOW_EXPLORATION은 세 미션이 공유하는 인프라
+        # (perception/exploration job 제출, 이동 중 stuck 감지)라 여기서 그대로
+        # 처리한다. 그 외 state(SELECT_TARGET/NAVIGATE_TARGET, MISSION1_*,
+        # MISSION3_*)는 미션마다 의미가 달라서 해당 missions/*.py의 loop()에 위임한다.
         if state == "FOLLOW_EXPLORATION":
             if self.goal_reached(pose):
+                goal = self.current_goal or {}
+                self.get_logger().info(
+                    f"🚩 ARRIVED - exploration waypoint reached: "
+                    f"is_viewpoint={goal.get('is_viewpoint')}, "
+                    f"coverage={goal.get('coverage_score', 0)}, "
+                    f"robot_pose=({pose['x']:.2f}, {pose['y']:.2f}), "
+                    f"remaining_in_route={len(self.exploration_route)}"
+                )
                 # 경로의 중간 hop까지 전부 "방문한 viewpoint"로 기록하면 안 된다 - 진짜
                 # candidate(마지막 hop, is_viewpoint=True)만 기록해야 근처-방문 판정이
                 # 지나온 복도 전체를 덮어버려 탐색이 조기 종료되는 걸 막을 수 있다.
@@ -685,7 +716,7 @@ class SysNavNode(Node):
 
             if self._exploration_goal_unreachable(pose):
                 self.get_logger().warning(
-                    f"Exploration goal unreachable (no progress for "
+                    f"⏭️ SKIP - exploration goal unreachable (no progress for "
                     f"{config.EXPLORATION_STUCK_TIMEOUT_SEC:.0f}s), skipping "
                     f"({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
                 )
@@ -737,17 +768,6 @@ class SysNavNode(Node):
             )
             return
 
-        if state == "SELECT_TARGET":
-            self.submit_job(
-                "selection",
-                self.selection_job,
-                task_id,
-                task,
-                pose,
-                origin_state=state,
-            )
-            return
-
         if state == "PLAN_EXPLORATION":
             self.submit_job(
                 "exploration",
@@ -756,6 +776,12 @@ class SysNavNode(Node):
                 pose,
                 origin_state=state,
             )
+            return
+
+        mission_pipe = _MISSION_PIPES.get(
+            task.get("mission_type", MISSION_OBJECT_REFERENCE), mission2_pipe
+        )
+        mission_pipe.loop(self, state, task, task_id, pose)
 
     # state == "FOLLOW_EXPLORATION" -> publish next exploration goal
     def publish_next_exploration_goal(self) -> None:
@@ -784,7 +810,7 @@ class SysNavNode(Node):
 
         remaining = len(self.exploration_route)
         self.get_logger().info(
-            f"Exploration goal=({goal['x']:.2f}, {goal['y']:.2f}, {goal['theta']:.2f}), "
+            f"➡️ DEPARTING - exploration goal=({goal['x']:.2f}, {goal['y']:.2f}, {goal['theta']:.2f}), "
             f"is_viewpoint={goal.get('is_viewpoint')}, coverage={goal.get('coverage_score', 0)}, "
             f"remaining_in_route={remaining}{distance_note}"
         )

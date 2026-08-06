@@ -120,6 +120,13 @@ class CoveragePlanner:
             float(self.origin_y + (row + 0.5) * self.resolution),
         )
 
+    @staticmethod
+    def line_cells(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
+        """start-end 사이 grid cell을 잇는 직선(Bresenham) - Instruction-Following의
+        forbidden corridor 마스크 생성(missions/mission3_pipe.py)처럼, 두 셀 사이를
+        따라가며 뭔가 칠해야 할 때 쓴다."""
+        return _bresenham(start[0], start[1], end[0], end[1])
+
     def update_from_scan(self, points_sensor: np.ndarray, pose: dict) -> None:
         if points_sensor.size == 0:
             return
@@ -608,3 +615,43 @@ class CoveragePlanner:
             route.extend(self._leg_waypoints(path, nav_blocking, final_theta, len(credited)))
             leg_start = cell
         return route
+
+    def plan_direct_path(
+        self,
+        start_pose: dict,
+        goal_xy: tuple[float, float],
+        final_theta: float | None = None,
+        forbidden_mask: np.ndarray | None = None,
+    ) -> list[dict] | None:
+        """start_pose에서 goal_xy까지 벽(+옵션으로 forbidden_mask)을 피해가는 A*
+        경로를 waypoint 시퀀스로 만든다. plan_route()와 달리 "다음에 어디를 탐색할지"
+        고르는 게 아니라 이미 정해진 두 점 사이 경로 하나만 필요할 때 쓴다 -
+        Instruction-Following(missions/mission3_pipe.py)의 "avoiding the path between
+        A and B" 같은 negative constraint에서, base autonomy의 point-to-point 이동만
+        으로는 특정 영역을 피해가도록 강제할 수 없기 때문에 우리가 직접 우회 경로를
+        계산해서 여러 waypoint로 잘라 보낸다. 실패(경로 없음/맵 미준비)하면 None."""
+        with self._lock:
+            grid = self.grid.copy()
+            origin_ready = self.origin_x is not None
+        if not origin_ready:
+            return None
+        start_cell = self.world_to_grid(start_pose["x"], start_pose["y"])
+        goal_cell = self.world_to_grid(goal_xy[0], goal_xy[1])
+        if start_cell is None or goal_cell is None:
+            return None
+
+        occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
+        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
+        inflated = cv2.dilate(occupied, np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8)).astype(bool)
+        traversable = (grid == config.OCC_FREE) & (~inflated)
+        if forbidden_mask is not None and forbidden_mask.shape == traversable.shape:
+            traversable = traversable & (~forbidden_mask)
+
+        start = self._nearest_traversable(traversable, *start_cell, radius=10)
+        goal = self._nearest_traversable(traversable, *goal_cell, radius=10)
+        if start is None or goal is None:
+            return None
+        path = self._astar_path(traversable, start, goal)
+        if path is None:
+            return None
+        return self._leg_waypoints(path, inflated, final_theta, credited_len=0)
