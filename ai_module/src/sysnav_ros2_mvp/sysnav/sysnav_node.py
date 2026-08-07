@@ -24,6 +24,7 @@ from sysnav import config
 from sysnav.exploration.coverage_planner import CoveragePlanner
 from sysnav.exploration.exploration_visualizer import export_exploration_debug
 from sysnav.exploration.viewpoint_memory import ViewpointMemory
+from sysnav.mission_dashboard import export_mission_dashboard
 from sysnav.missions import mission1_pipe, mission2_pipe, mission3_pipe
 from sysnav.rooms.room_registry import RoomRegistry
 from sysnav.rooms.room_segmenter import RoomSegmenter
@@ -165,6 +166,11 @@ class SysNavNode(Node):
         self.mission3_leg_queue = deque()
         self.mission3_forbidden_mask = None
 
+        # 디버깅용 미션 상태 대시보드(mission_dashboard.py)용 상태.
+        self.task_start_time: float | None = None
+        self.last_response_summary: str | None = None
+        self._last_dashboard_write_time = 0.0
+
         self.question_sub = self.create_subscription(
             String,
             config.TOPIC_QUESTION,
@@ -238,6 +244,8 @@ class SysNavNode(Node):
             self.mission3_step_index = 0
             self.mission3_leg_queue.clear()
             self.mission3_forbidden_mask = None
+            self.task_start_time = time.monotonic()
+            self.last_response_summary = None
 
         if not config.KEEP_MEMORY_BETWEEN_TASKS:
             self.object_memory.clear()
@@ -677,6 +685,8 @@ class SysNavNode(Node):
             task = None if self.task is None else dict(self.task)
             task_id = self.task_id
 
+        self._update_mission_dashboard(state, task, task_id)
+
         if task is None or state in {"IDLE", "SUCCESS", "FAILED"}:
             return
         if self.active_future is not None:
@@ -823,6 +833,37 @@ class SysNavNode(Node):
             self.get_clock().now().to_msg(),
         )
         self.object_marker_pub.publish(markers)
+
+    # 디버깅용 mission_status_latest.html 갱신 - room_segmentation_latest.png와 같은
+    # "항상 최신 상태 하나만 남기는" 패턴. MISSION_DASHBOARD_REFRESH_SEC로 스로틀링해서
+    # control_loop(0.2초 주기)마다 디스크에 쓰지 않게 한다.
+    def _update_mission_dashboard(self, state: str, task: dict | None, task_id: int) -> None:
+        now = time.monotonic()
+        if now - self._last_dashboard_write_time < config.MISSION_DASHBOARD_REFRESH_SEC:
+            return
+        self._last_dashboard_write_time = now
+
+        with self.sensor_lock:
+            pose = None if self.latest_pose is None else dict(self.latest_pose)
+
+        elapsed = None if self.task_start_time is None else now - self.task_start_time
+        candidate_count = None
+        if task and task.get("target"):
+            candidate_count = len(self.object_memory.find_by_category(task["target"]))
+
+        export_mission_dashboard({
+            "task_id": task_id,
+            "state": state,
+            "task": task,
+            "mission_type": (task or {}).get("mission_type"),
+            "pose": pose,
+            "elapsed_sec": elapsed,
+            "current_goal": dict(self.current_goal) if self.current_goal else None,
+            "mission3_step_index": self.mission3_step_index,
+            "mission3_forbidden_active": self.mission3_forbidden_mask is not None,
+            "last_response_summary": self.last_response_summary,
+            "candidate_count": candidate_count,
+        })
 
     def goal_reached(self, pose: dict) -> bool:
         if self.current_goal is None:

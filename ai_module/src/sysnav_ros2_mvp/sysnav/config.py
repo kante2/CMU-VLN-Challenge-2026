@@ -20,6 +20,10 @@ OBJECT_MARKER_FRAME_ID = "map"
 OBJECT_MARKER_DEFAULT_SIZE_M = 0.3
 
 CONTROL_PERIOD_SEC = 0.20
+# 디버깅용 미션 상태 대시보드(mission_dashboard.py) - ai_module/debug/mission_status_latest.html을
+# 이 주기(초)마다 다시 써서 덮어쓴다. README의 질문당 10분 제한(재탐색+답변 합산) 표시에도 쓴다.
+MISSION_DASHBOARD_REFRESH_SEC = 1.0
+MISSION_TIME_LIMIT_SEC = 600.0
 PERCEPTION_WHILE_MOVING_INTERVAL_SEC = 1.50
 SENSOR_SYNC_TOLERANCE_SEC = 0.30
 SCAN_BUFFER_SIZE = 40

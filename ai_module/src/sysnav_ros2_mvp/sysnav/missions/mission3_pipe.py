@@ -345,6 +345,7 @@ def _on_exploration_result(node, result: dict) -> None:
 def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
     steps = task["steps"]
     if node.mission3_step_index >= len(steps):
+        node.last_response_summary = f"{len(steps)}/{len(steps)} steps completed"
         with node.state_lock:
             node.state = "SUCCESS"
         node.get_logger().info("🚩🏁 ALL STEPS COMPLETE (task SUCCESS)")

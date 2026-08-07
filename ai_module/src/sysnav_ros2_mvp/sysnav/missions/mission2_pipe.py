@@ -92,6 +92,9 @@ def _on_selection_result(node, result: dict) -> None:
     # 같은 시점(선택 확정 시점)에 함께 낸다. 이 토픽이 실제 채점 대상이다.
     marker = build_selected_object_marker(selected, node.get_clock().now().to_msg())
     node.selected_object_marker_pub.publish(marker)
+    node.last_response_summary = (
+        f"/selected_object_marker = {selected['category']} #{selected['object_id']}"
+    )
 
     with node.state_lock:
         node.state = "NAVIGATE_TARGET"

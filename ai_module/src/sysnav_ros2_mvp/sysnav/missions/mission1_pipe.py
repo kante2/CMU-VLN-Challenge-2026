@@ -8,7 +8,12 @@ LLMQueryParser를 재사용하지만, 종료 조건이 근본적으로 다르다
 
 state 흐름: OBSERVE/PLAN_EXPLORATION/FOLLOW_EXPLORATION(공용, sysnav_node.py) ->
 (exploration exhausted) -> MISSION1_FINALIZE_COUNT -> SUCCESS.
+
+탐색 종료 조건: coverage_planner.plan_route()가 빈 route를 반환하는 시점
+(_on_exploration_result 참고) - Object Reference는 같은 상황을 FAILED로 보지만,
+Numerical은 "더 볼 곳이 없다 = 최종 개수를 확정할 시점"으로 정상 종료 처리한다.
 """
+
 
 from __future__ import annotations
 
@@ -101,6 +106,7 @@ def _on_count_result(node, result: dict) -> None:
     message = Int32()
     message.data = count
     node.numerical_response_pub.publish(message)
+    node.last_response_summary = f"/numerical_response = {count}"
     with node.state_lock:
         node.state = "SUCCESS"
     node.get_logger().info(f"🚩🏁 COUNT PUBLISHED (task SUCCESS): count={count}")
