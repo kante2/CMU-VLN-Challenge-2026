@@ -164,11 +164,13 @@ def parse_instruction(node, question: str) -> dict:
     prompt_categories: list[str] = []
 
     raw_steps = _split_clauses(question)
+    splitter = "rules"
     if not raw_steps:
         # 규칙 기반이 트리거 단어를 하나도 못 찾음(questions.json 30문장 밖의 새
         # 표현) - LLM에게 같은 절 분해를 대신 시킨다. 이것도 실패하면 raw_steps가
         # 빈 채로 남고, steps도 비어서 question_callback이 "파싱 실패"로 처리한다.
         raw_steps = node.instruction_splitter.split(question)
+        splitter = "llm" if raw_steps else "rules"  # 대시보드 표시용(mission_dashboard.py)
 
     for raw in raw_steps:
         if raw["kind"] == "destination":
@@ -202,6 +204,9 @@ def parse_instruction(node, question: str) -> dict:
         "raw": question.strip(),
         "steps": steps,
         "global_forbidden": forbidden,
+        # 절 분해를 규칙 기반/LLM 폴백 중 무엇으로 했는지 - mission_dashboard.py 표시용
+        # (다른 미션의 parsed["parser"]와 같은 목적, LLMQueryParser.parse() 참고).
+        "parser": splitter,
         # perception_job/scene_graph가 기대하는 top-level task 필드 - mission3는
         # "하나의 target"이 없으므로 빈 placeholder. detection_prompts만 실질적으로
         # 쓰인다(YOLO-World가 찾아야 할, 모든 절에 등장한 카테고리의 합집합).

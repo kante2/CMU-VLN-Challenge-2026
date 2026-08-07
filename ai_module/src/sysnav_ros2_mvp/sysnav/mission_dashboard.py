@@ -67,6 +67,47 @@ def _time_bar(elapsed_sec: float | None, limit_sec: float) -> str:
     )
 
 
+def _describe_step(step: dict) -> str:
+    if step.get("resolve") == "category":
+        parsed = step["parsed"]
+        desc = parsed.get("target", "?")
+        attrs = parsed.get("attributes") or []
+        if attrs:
+            desc = f"{', '.join(attrs)} {desc}"
+        relation = parsed.get("relation")
+        refs = parsed.get("reference_objects") or []
+        if relation and refs:
+            desc += f" [{relation} {', '.join(refs)}]"
+    else:
+        refs = ", ".join(ref.get("target", "?") for ref in step.get("point_refs", []))
+        desc = f"{step.get('point_mode')}({refs})"
+    kind = "stop" if step.get("is_stop") else "waypoint"
+    return f"[{kind}] {desc}"
+
+
+def _describe_forbidden(forbidden: dict) -> str:
+    refs = ", ".join(ref.get("target", "?") for ref in forbidden.get("point_refs", []))
+    return f"{forbidden.get('point_mode')}({refs})"
+
+
+def _plan_list_html(steps: list[dict], current_index: int) -> str:
+    if not steps:
+        return "<span style=\"color:#9ca3af;\">(no steps)</span>"
+    items = []
+    for index, step in enumerate(steps):
+        if index < current_index:
+            marker, color = "✓", "#15803d"  # done
+        elif index == current_index:
+            marker, color = "▶", "#2563eb"  # in progress
+        else:
+            marker, color = "○", "#9ca3af"  # pending
+        items.append(
+            f'<li style="color:{color};margin-bottom:2px;">{marker} '
+            f'{_esc(_describe_step(step))}</li>'
+        )
+    return f'<ol style="margin:2px 0 0 -18px;padding:0;list-style:none;">{"".join(items)}</ol>'
+
+
 def _mission_detail_rows(snapshot: dict) -> str:
     mission_type = snapshot.get("mission_type")
     task = snapshot.get("task") or {}
@@ -75,24 +116,15 @@ def _mission_detail_rows(snapshot: dict) -> str:
     if mission_type == "instruction_following":
         steps = task.get("steps") or []
         idx = snapshot.get("mission3_step_index", 0)
-        rows.append(_row("Step", f"{min(idx + 1, len(steps))} / {len(steps)}"))
-        if idx < len(steps):
-            step = steps[idx]
-            if step.get("resolve") == "category":
-                parsed = step["parsed"]
-                desc = parsed.get("target", "?")
-                attrs = parsed.get("attributes") or []
-                if attrs:
-                    desc = f"{', '.join(attrs)} {desc}"
-                relation = parsed.get("relation")
-                refs = parsed.get("reference_objects") or []
-                if relation and refs:
-                    desc += f" [{relation} {', '.join(refs)}]"
-            else:
-                desc = f"{step.get('point_mode')}({', '.join(r.get('target', '?') for r in step.get('point_refs', []))})"
-            kind = "stop" if step.get("is_stop") else "waypoint"
-            rows.append(_row("Current step", f"[{kind}] {_esc(desc)}"))
-        rows.append(_row("Forbidden region active", "yes" if snapshot.get("mission3_forbidden_active") else "no"))
+        rows.append(_row("Parsed via", task.get("parser", "rules")))
+        rows.append(_row("Progress", f"{min(idx, len(steps))} / {len(steps)} steps done"))
+        rows.append(_row("Plan", _plan_list_html(steps, idx)))
+        forbidden = task.get("global_forbidden") or []
+        if forbidden:
+            forbidden_desc = ", ".join(_describe_forbidden(item) for item in forbidden)
+            active = snapshot.get("mission3_forbidden_active")
+            status = "active (routing around it)" if active else "not yet resolved"
+            rows.append(_row("Forbidden constraint", f"{_esc(forbidden_desc)} - {status}"))
     elif mission_type == "numerical":
         rows.append(_row("Target category", task.get("target", "?")))
         rows.append(_row("Attributes", ", ".join(task.get("attributes") or []) or "-"))
