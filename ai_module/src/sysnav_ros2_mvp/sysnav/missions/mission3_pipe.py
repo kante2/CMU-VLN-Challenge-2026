@@ -163,7 +163,14 @@ def parse_instruction(node, question: str) -> dict:
     forbidden: list[dict] = []
     prompt_categories: list[str] = []
 
-    for raw in _split_clauses(question):
+    raw_steps = _split_clauses(question)
+    if not raw_steps:
+        # 규칙 기반이 트리거 단어를 하나도 못 찾음(questions.json 30문장 밖의 새
+        # 표현) - LLM에게 같은 절 분해를 대신 시킨다. 이것도 실패하면 raw_steps가
+        # 빈 채로 남고, steps도 비어서 question_callback이 "파싱 실패"로 처리한다.
+        raw_steps = node.instruction_splitter.split(question)
+
+    for raw in raw_steps:
         if raw["kind"] == "destination":
             if "text" in raw:
                 parsed = node.query_parser.parse(raw["text"])

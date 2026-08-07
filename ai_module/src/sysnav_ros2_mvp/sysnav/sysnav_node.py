@@ -46,6 +46,7 @@ from sysnav.ros_helpers import (
     odometry_to_pose,
     pointcloud2_to_xyz,
 )
+from sysnav.task.llm_instruction_splitter import LLMInstructionSplitter
 from sysnav.task.llm_query_parser import LLMQueryParser
 from sysnav.task.mission_classifier import (
     MISSION_INSTRUCTION_FOLLOWING,
@@ -133,6 +134,7 @@ class SysNavNode(Node):
 
         self.perception = PerceptionPipeline()
         self.query_parser = LLMQueryParser()
+        self.instruction_splitter = LLMInstructionSplitter()
         self.object_memory = ObjectMemory()
         # Room/Viewpoint/Object node와 edge를 관리한다. Viewpoint는 매 프레임이 아니라
         # novel LiDAR voxel coverage가 충분할 때만 생성하며 debug graph를 갱신한다.
