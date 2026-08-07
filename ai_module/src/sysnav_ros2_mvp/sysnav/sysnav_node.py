@@ -26,6 +26,7 @@ from sysnav.exploration.exploration_visualizer import export_exploration_debug
 from sysnav.exploration.viewpoint_memory import ViewpointMemory
 from sysnav.mission_dashboard import export_mission_dashboard
 from sysnav.missions import mission1_pipe, mission2_pipe, mission3_pipe
+from sysnav.rooms import cross_room_navigator
 from sysnav.rooms.room_registry import RoomRegistry
 from sysnav.rooms.room_segmenter import RoomSegmenter
 from sysnav.rooms.room_visualizer import export_room_segmentation
@@ -35,6 +36,7 @@ from sysnav.perception.perception_pipeline import PerceptionPipeline
 from sysnav.reasoning.attribute_verifier import AttributeVerifier
 from sysnav.reasoning.gemini_selector import GeminiSelector
 from sysnav.reasoning.room_classifier import RoomClassifier
+from sysnav.reasoning.room_relevance_selector import RoomRelevanceSelector
 from sysnav.scene_graph.scene_graph_manager import SceneGraphManager
 from sysnav.scene_graph.scene_graph_rviz import build_object_marker_array
 from sysnav.ros_helpers import (
@@ -141,6 +143,7 @@ class SysNavNode(Node):
         self.room_segmenter = RoomSegmenter()
         self.room_registry = RoomRegistry()
         self.room_classifier = RoomClassifier()
+        self.room_relevance_selector = RoomRelevanceSelector()
         self.viewpoint_memory = ViewpointMemory()
         self.goal_publisher = GoalPublisher(self)
         self.object_marker_pub = self.create_publisher(MarkerArray, config.TOPIC_OBJECT_MARKERS, 10)
@@ -165,6 +168,10 @@ class SysNavNode(Node):
         self.mission3_step_index = 0
         self.mission3_leg_queue = deque()
         self.mission3_forbidden_mask = None
+
+        # Cross-room navigation(rooms/cross_room_navigator.py) - 이번 task 안에서
+        # 이미 시도해본(가거나, 갔는데 경로가 안 됐던) room_id. 새 질문마다 리셋.
+        self._cross_room_attempted_ids: set[int] = set()
 
         # 디버깅용 미션 상태 대시보드(mission_dashboard.py)용 상태.
         self.task_start_time: float | None = None
@@ -244,6 +251,7 @@ class SysNavNode(Node):
             self.mission3_step_index = 0
             self.mission3_leg_queue.clear()
             self.mission3_forbidden_mask = None
+            self._cross_room_attempted_ids = set()
             self.task_start_time = time.monotonic()
             self.last_response_summary = None
 
@@ -668,10 +676,62 @@ class SysNavNode(Node):
                 )
             self.publish_object_markers()
 
+        # Cross-room navigation(SysNav paper Sec. IV-B-2, room-query navigation mode) -
+        # exploration job이 "이 방(또는 지금 알려진 전체 영역)엔 더 볼 게 없다"는
+        # 빈 route를 반환하면, 미션별 최종 처리(카운트 확정/FAILED)로 바로 넘기기
+        # 전에 아직 안 들어가본 방이 있는지부터 확인한다. 있으면 거기로 가는 job을
+        # 새로 제출하고 이번 사이클엔 미션 쪽에 알리지 않는다 - 안 가본 방이 남아있는데
+        # 성급하게 끝내면 안 되니까(특히 Numerical의 카운트 정확도에 직결).
+        if kind == "cross_room_select":
+            self._on_cross_room_select_result(task, expected_task_id, result)
+            return
+        if kind == "exploration" and not result.get("route"):
+            if self._try_start_cross_room_navigation(task, expected_task_id):
+                return
+
         mission_pipe = _MISSION_PIPES.get(
             (task or {}).get("mission_type", MISSION_OBJECT_REFERENCE), mission2_pipe
         )
         mission_pipe.on_job_result(self, task, kind, result, origin_state)
+
+    def _try_start_cross_room_navigation(self, task: dict | None, task_id: int) -> bool:
+        with self.sensor_lock:
+            pose = None if self.latest_pose is None else dict(self.latest_pose)
+        if pose is None or task is None:
+            return False
+        candidates = [
+            room for room in self.room_registry.unvisited_rooms()
+            if room["room_id"] not in self._cross_room_attempted_ids
+        ]
+        if not candidates:
+            return False
+        self.submit_job(
+            "cross_room_select",
+            cross_room_navigator.select_job,
+            self, task_id, task, pose, candidates,
+            origin_state="PLAN_EXPLORATION",
+        )
+        return True
+
+    def _on_cross_room_select_result(self, task: dict | None, task_id: int, result: dict) -> None:
+        for room_id in result.get("failed_room_ids", []):
+            self._cross_room_attempted_ids.add(int(room_id))
+        room_id = result.get("room_id")
+        path = result.get("path")
+        if room_id is None or not path:
+            # 안 가본 방이 있었지만 전부 경로를 못 찾음(또는 애초에 없었음) - 원래
+            # exploration이 비어있던 상황으로 돌려서 미션별 최종 처리로 넘긴다.
+            mission_pipe = _MISSION_PIPES.get(
+                (task or {}).get("mission_type", MISSION_OBJECT_REFERENCE), mission2_pipe
+            )
+            mission_pipe.on_job_result(
+                self, task, "exploration", {"task_id": task_id, "route": []}, "PLAN_EXPLORATION"
+            )
+            return
+        self._cross_room_attempted_ids.add(int(room_id))
+        self.get_logger().info(f"🚪 CROSS-ROOM - heading to unvisited room_id={room_id}")
+        self.exploration_route = deque(path)
+        self.publish_next_exploration_goal()
 
     # ------------------------------------------------------------------
     # State machine

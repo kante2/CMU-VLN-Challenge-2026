@@ -161,6 +161,22 @@ class RoomRegistry:
             })
         return pending
 
+    def unvisited_rooms(self) -> list[dict]:
+        """SysNav paper Sec. IV-B-2의 room-query navigation mode용 후보 - 기하학적으로는
+        분할됐지만(문 너머로 살짝 스캔만 됨) 로봇이 실제로 들어가서 viewpoint를 남긴 적은
+        없는 방들. category는 대표 viewpoint가 아직 없거나 분류 전이면 None(호출 쪽이
+        "물체 있을법한 방" 우선순위에서 이런 방은 거리순으로만 취급하면 됨)."""
+        return [
+            {
+                "room_id": room["room_id"],
+                "category": room["category"],
+                "centroid_row": room["centroid_row"],
+                "centroid_col": room["centroid_col"],
+            }
+            for room in self._rooms.values()
+            if not room["viewpoint_ids"]
+        ]
+
     def set_category(self, room_id: int, category: str) -> None:
         room = self._rooms.get(int(room_id))
         if room is None:
