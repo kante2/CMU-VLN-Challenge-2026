@@ -35,6 +35,7 @@ from sysnav.navigation.goal_publisher import GoalPublisher
 from sysnav.perception.perception_pipeline import PerceptionPipeline
 from sysnav.reasoning.attribute_verifier import AttributeVerifier
 from sysnav.reasoning.gemini_selector import GeminiSelector
+from sysnav.reasoning.relation_image_verifier import RelationImageVerifier
 from sysnav.reasoning.room_classifier import RoomClassifier
 from sysnav.reasoning.room_relevance_selector import RoomRelevanceSelector
 from sysnav.scene_graph.scene_graph_manager import SceneGraphManager
@@ -141,6 +142,7 @@ class SysNavNode(Node):
         self.scene_graph = SceneGraphManager(debug_dir=config.DEBUG_DIR)
         self.selector = GeminiSelector()
         self.attribute_verifier = AttributeVerifier()
+        self.relation_image_verifier = RelationImageVerifier()
         self.coverage_planner = CoveragePlanner()
         self.room_segmenter = RoomSegmenter()
         self.room_registry = RoomRegistry()
@@ -500,11 +502,29 @@ class SysNavNode(Node):
                 if int(candidate["object_id"]) in relation_candidate_ids
             ]
         elif effective_relation_chain(task):
-            # 문장에 relation 제약(예: "knife rack 근처의")이 있는데 아직 그 제약을
-            # 만족하는 candidate가 하나도 검증 안 됐다 - 보통 참조 물체(knife rack)를
-            # 아직 못 봤기 때문. 검증 안 된 채로 아무 bowl이나 확정지으면 오답으로
-            # navigation을 끝내버리게 되므로, 여기서 확정하지 않고 계속 탐색하게 한다.
-            return {"task_id": task_id, "selected_id": None, "relation_pending": True}
+            # 문장에 relation 제약(예: "knife rack 근처의")이 있는데 geometric/
+            # co-observation 경로로는 아직 하나도 검증 안 됨 - 보통 참조 물체를
+            # 아직 못 봤거나(전역 위치 없음), 유리창처럼 LiDAR grounding이 구조적으로
+            # 실패해서(approximate 등급조차 못 만듦) 3D 위치 자체가 없기 때문.
+            image_verified_ids: set[int] = set()
+            if candidates:
+                # 참조 물체를 3D로 잡을 필요 없이, 후보 자신의 사진만으로 "이 사진에
+                # 참조 물체가 보이는가"를 VLM에게 직접 확인받는다 (attribute_verifier와
+                # 같은 on-demand 이미지 판정 패턴).
+                first_relation, _, first_reference = effective_relation_chain(task)[0]
+                image_verified_ids = self.relation_image_verifier.verify(
+                    candidates, first_relation, first_reference
+                )
+            if image_verified_ids:
+                candidates = [
+                    candidate for candidate in candidates
+                    if int(candidate["object_id"]) in image_verified_ids
+                ]
+            else:
+                # 후보가 아직 없거나, 이미지 확인도 실패(또는 검증 안 됨) - 확정하지
+                # 않고 계속 탐색해서 후보/참조 물체를 더 찾아보거나 다른 각도에서
+                # 다시 시도한다.
+                return {"task_id": task_id, "selected_id": None, "relation_pending": True}
 
         # SysNav paper Sec. IV-A-1 (self-attribute): 문장에 속성 제약(예: "black" chair)이
         # 있으면, 후보가 1개뿐이어도 반드시 VLM으로 확인한다 - "후보가 하나뿐이면 그냥
