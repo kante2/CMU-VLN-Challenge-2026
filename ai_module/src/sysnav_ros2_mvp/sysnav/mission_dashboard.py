@@ -79,7 +79,15 @@ def _mission_detail_rows(snapshot: dict) -> str:
         if idx < len(steps):
             step = steps[idx]
             if step.get("resolve") == "category":
-                desc = step["parsed"].get("target", "?")
+                parsed = step["parsed"]
+                desc = parsed.get("target", "?")
+                attrs = parsed.get("attributes") or []
+                if attrs:
+                    desc = f"{', '.join(attrs)} {desc}"
+                relation = parsed.get("relation")
+                refs = parsed.get("reference_objects") or []
+                if relation and refs:
+                    desc += f" [{relation} {', '.join(refs)}]"
             else:
                 desc = f"{step.get('point_mode')}({', '.join(r.get('target', '?') for r in step.get('point_refs', []))})"
             kind = "stop" if step.get("is_stop") else "waypoint"
