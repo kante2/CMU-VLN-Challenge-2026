@@ -6,10 +6,18 @@ import re
 
 _LEADING_COMMAND = re.compile(
     r"^\s*(?:please\s+)?(?:find|locate|search for|look for|go to|navigate to|"
-    r"take me to|where is|where are|identify|show me)\s+",
+    r"take me to|where is|where are|identify|show me|"
+    # Numerical 문장("How many X are Y?"/"Count the number of X...")도 같은
+    # extract_target()을 타므로, 안 벗겨내면 "how many"/"count"가 그대로 target에
+    # 붙어버린다 (예: "HOW MANY PILLOWS ON THE BED." -> target="how many pillow").
+    r"how many|count(?: of| the number of)?)\s+",
     re.IGNORECASE,
 )
 _ARTICLE = re.compile(r"\b(?:a|an|the|this|that|these|those)\b", re.IGNORECASE)
+# Numerical 문장("How many X are Y?")의 be동사 - 안 걸러내면 target에 그대로 붙는다
+# (예: "pillows are on the sofa" -> target="pillows are"). Object Reference 문장에는
+# 보통 안 나오는 단어들이라 여기서 걸러내도 기존 동작에 영향 없다.
+_COPULA = re.compile(r"\b(?:is|are|was|were)\b", re.IGNORECASE)
 _RELATIONS = [
     ("in front of", "in_front_of"), ("to the left of", "left_of"),
     ("to the right of", "right_of"), ("left of", "left_of"),
@@ -35,6 +43,7 @@ _IRREGULAR = {"chairs": "chair", "tables": "table", "pillows": "pillow", "boxes"
 
 def _clean(text: str) -> str:
     text = _ARTICLE.sub(" ", text)
+    text = _COPULA.sub(" ", text)
     text = re.sub(r"[?!.,;:]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 

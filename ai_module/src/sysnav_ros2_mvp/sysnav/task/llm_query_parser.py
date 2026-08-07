@@ -71,6 +71,10 @@ Instruction: {question}
 Rules:
 - target is only the object category to find (a short noun phrase), never a full
   relation clause.
+- If the instruction is a counting question ("How many X are Y?", "Count the
+  number of X that Y."), target is still just X (the object category being
+  counted) - never include "how many"/"count"/"the number of" or the verb
+  "is"/"are"/"was"/"were" in target.
 - Each constraint has a canonical snake_case relation (near, beside, left_of,
   right_of, in_front_of, behind, on, under, above, between, nearest) and concrete
   reference object categories.
