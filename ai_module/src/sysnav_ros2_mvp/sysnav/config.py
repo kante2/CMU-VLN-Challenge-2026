@@ -164,6 +164,12 @@ ROOM_CLASSIFICATION_ENABLED = os.getenv("SYSNAV_ROOM_CLASSIFICATION_ENABLED", "1
 # 스팸이 되므로, 실패한 room은 이 시간(초)만큼 재시도를 쉰다.
 ROOM_CLASSIFICATION_RETRY_COOLDOWN_SEC = 15.0
 
+# frontier anchor(is_near_visited 예외 대상, 문 통과 문제 때문에 도입)가 plan_route()
+# 호출마다 계속 다시 잡히면(=그 옆 unknown 셀이 영영 안 풀림, 예: 유리창이라 LiDAR가
+# 못 뚫는 경우) 이 횟수를 넘는 순간부터 예외 자격을 박탈해서 결국 후보에서 빠지게 한다.
+# 안 그러면 "도착 -> 같은 지점 재선택 -> 도착 -> ..." 무한 루프에 걸린다(실측으로 확인됨).
+EXPLORATION_ANCHOR_MAX_REVISITS = 5
+
 FRONTIER_MIN_CLUSTER_CELLS = 5
 FRONTIER_COVERAGE_RADIUS_M = 3.0  # 논문의 d_cover
 # candidate에서 surface point가 "보이는지"(LOS) 판정할 때 쓰는 벽 margin. ROBOT_CLEARANCE_M

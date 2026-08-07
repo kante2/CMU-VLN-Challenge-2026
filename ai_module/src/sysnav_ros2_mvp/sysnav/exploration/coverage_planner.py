@@ -67,6 +67,10 @@ class CoveragePlanner:
         # plan_route()가 빈 route를 반환했을 때 "왜"인지 보려고 남기는 진단 정보.
         # sysnav_node.py가 "No reachable frontier remains" 로그에 같이 붙인다.
         self.last_plan_diagnostics: dict = {}
+        # anchor cell(frontier 근처 보장 후보)이 plan_route() 호출마다 몇 번 연속
+        # 다시 잡혔는지 - 유리창처럼 LiDAR가 절대 못 뚫는 frontier 옆에 서 있으면
+        # 이 값이 계속 늘어난다 (anchor_max_revisits 참고).
+        self._anchor_visit_counts: dict[tuple[int, int], int] = {}
 
     def describe_last_plan_failure(self) -> str:
         return ", ".join(f"{key}={value}" for key, value in self.last_plan_diagnostics.items())
@@ -75,6 +79,7 @@ class CoveragePlanner:
         with self._lock:
             self.grid.fill(config.OCC_UNKNOWN)
             self.max_height.fill(-np.inf)
+            self._anchor_visit_counts.clear()
             if robot_pose is None:
                 self.origin_x = None
                 self.origin_y = None
@@ -512,7 +517,23 @@ class CoveragePlanner:
             )
             if anchor is not None:
                 anchor_cells.add(anchor)
-        pool_cells = list(dict.fromkeys(pool_cells + list(anchor_cells)))  # 순서 유지하며 중복 제거
+
+        # 이 anchor가 이번까지 몇 번 연속 다시 잡혔는지 센다. 진짜 갈 수 있는 곳이면
+        # 한두 번 방문 후 그 옆 unknown 셀이 free/occupied로 풀려서 frontier가 사라지고
+        # 다시는 anchor로 안 잡힌다. 계속 잡힌다는 건(예: 유리창이라 LiDAR가 절대
+        # 못 뚫는 경우) 이 지점이 구조적으로 안 풀린다는 뜻이므로, 일정 횟수를 넘으면
+        # is_near_visited 예외 자격을 박탈해서(아래 루프) 결국 후보에서 빠지게 한다 -
+        # 안 그러면 "도착 -> 다시 같은 anchor 선택 -> 도착 -> ..." 무한 루프에 걸린다.
+        stale_anchor_cells: set[tuple[int, int]] = set()
+        for cell in anchor_cells:
+            count = self._anchor_visit_counts.get(cell, 0) + 1
+            self._anchor_visit_counts[cell] = count
+            if count > config.EXPLORATION_ANCHOR_MAX_REVISITS:
+                stale_anchor_cells.add(cell)
+        anchor_cells -= stale_anchor_cells
+        diag["stale_anchor_count"] = len(stale_anchor_cells)
+
+        pool_cells = list(dict.fromkeys(pool_cells + list(anchor_cells) + list(stale_anchor_cells)))  # 순서 유지하며 중복 제거
         diag["anchor_count"] = len(anchor_cells)
         diag["pool_cell_count"] = len(pool_cells)
 
