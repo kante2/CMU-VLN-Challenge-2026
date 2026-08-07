@@ -89,6 +89,47 @@ class SpatialRelationReasoner:
         )
         return geometry_edges
 
+    def infer_global(self, task: dict, object_nodes: list[dict], robot_pose: dict) -> list[dict]:
+        """co-observation(같은 프레임/viewpoint에 동시에 잡혀야 함) 요구 없이,
+        object_memory에 이미 쌓인 전역 위치만으로 관계를 판정한다.
+
+        Lang2LTL-2(Sec IV-C, Spatial Predicate Grounding) 방식: figure/ground를
+        독립적으로(언제 어떤 프레임에서 관측됐든 상관없이) 각자 grounding한 뒤,
+        순수 기하 연산(거리/각도/구간)으로 관계를 판정한다. 우리 기존 infer()는
+        "같은 viewpoint에서 둘 다 보여야" 호출되는데(scene_graph_manager의
+        _viewpoint_can_contain_task_relation), 유리창처럼 LiDAR grounding
+        성공률이 낮은 물체가 reference로 쓰이면 "동시에 보이는 순간"이 영영 안 와서
+        관계 검증 자체가 시작도 못 하는 문제가 있었다 - 이 메서드는 그 제약이 아예
+        없다(따라서 반드시 필요한 "같은 프레임 이미지"도 없으므로 Gemini는 안 쓰고
+        _infer_with_geometry만 돈다 - 어차피 그쪽 relation 판정 자체가 처음부터
+        position/extent_3d/bbox_3d만 쓰고 이미지에 의존하지 않는다).
+        """
+        chain = effective_relation_chain(task)
+        if not chain:
+            return []
+        records = self._build_records_from_nodes(object_nodes)
+        candidates = self._candidate_relations(task, records)
+        if not candidates:
+            return []
+        return self._infer_with_geometry(candidates, records, viewpoint_pose=robot_pose)
+
+    @staticmethod
+    def _build_records_from_nodes(object_nodes: list[dict]) -> dict[int, dict]:
+        records: dict[int, dict] = {}
+        for node in object_nodes:
+            object_id = int(node["object_id"])
+            records[object_id] = {
+                "object_id": object_id,
+                "category": str(node["category"]).lower(),
+                "position": tuple(float(v) for v in node["position"]),
+                "extent_3d": tuple(float(v) for v in node.get("extent_3d", (0, 0, 0))),
+                "bbox_3d_min": tuple(float(v) for v in node.get("bbox_3d_min", (0, 0, 0))),
+                "bbox_3d_max": tuple(float(v) for v in node.get("bbox_3d_max", (0, 0, 0))),
+                "bbox_2d": tuple(int(v) for v in node.get("latest_bbox_2d", (0, 0, 0, 0))),
+                "confidence": float(node.get("confidence", 0.0)),
+            }
+        return records
+
     # ------------------------------------------------------------------
     # Debug: [obj1] [obj2] [문장 속 relation] [LLM/기하 검증 결과] 표를
     # ai_module/debug/sysnav_relation_check.txt 에 계속 append한다.
@@ -451,23 +492,23 @@ ambiguous must be omitted.
     @staticmethod
     def _infer_nearest_with_geometry(candidates: list[dict], records: dict[int, dict]) -> list[dict]:
         """"nearest/closest"는 근접 threshold(near)와 달리 최상급(argmin) relation이다:
-        같은 reference를 두고 경쟁하는 후보(target category가 같은 object들) 중 거리가
-        가장 짧은 하나만 참이 된다. reference별로 그룹을 묶어 argmin을 고른다."""
-        groups: dict[tuple[int, ...], list[dict]] = {}
+        같은 hop(예: "bedside table nearest window")에서 경쟁하는 모든 (source, target)
+        후보 쌍 중 거리가 가장 짧은 단 하나만 참이 된다. hop 식별은 (source_category,
+        target_category) 조합으로 한다 - target object_id로 묶으면 reference 카테고리
+        인스턴스가 2개 이상(예: 창문이 2개) 있을 때 각각 별도 그룹이 되어 버려서
+        argmin이 무력화되는 버그가 있었다(각 그룹이 원소 1개짜리라 전부 "승자"가 됨)."""
+        groups: dict[tuple[str, str], list[tuple[dict, float]]] = {}
         for candidate in candidates:
-            groups.setdefault(tuple(candidate["target_object_ids"]), []).append(candidate)
+            source = records[candidate["source_object_id"]]
+            target = records[candidate["target_object_ids"][0]]
+            distance = float(np.linalg.norm(
+                np.asarray(source["position"][:2], dtype=np.float64)
+                - np.asarray(target["position"][:2], dtype=np.float64)
+            ))
+            groups.setdefault((source["category"], target["category"]), []).append((candidate, distance))
 
         output = []
-        for target_ids, group in groups.items():
-            scored = []
-            for candidate in group:
-                source = records[candidate["source_object_id"]]
-                target = records[target_ids[0]]
-                distance = float(np.linalg.norm(
-                    np.asarray(source["position"][:2], dtype=np.float64)
-                    - np.asarray(target["position"][:2], dtype=np.float64)
-                ))
-                scored.append((candidate, distance))
+        for scored in groups.values():
             if not scored:
                 continue
             winner, winner_distance = min(scored, key=lambda item: item[1])

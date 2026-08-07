@@ -130,6 +130,14 @@ class SceneGraphManager:
             # current frame: previously stored viewpoints that observe both objects are
             # retrieved and their panorama images are reused for relation verification.
             relation_edges = self._infer_task_relations_from_common_viewpoints(task)
+            # Lang2LTL-2(Sec IV-C, Spatial Predicate Grounding) 스타일 보강 - 위
+            # 경로는 두 물체가 "같은 viewpoint에서 동시에" 관측돼야만 검증을 시도한다.
+            # 유리창처럼 LiDAR grounding 성공률이 낮은 물체가 참조 물체로 쓰이면 그
+            # "동시에 보이는 순간"이 영영 안 와서 관계 검증 자체가 시작도 못 하는
+            # 문제가 있었다. 이 보강 경로는 그 제약이 없다 - 두 물체가 각각 언제든
+            # 한 번이라도 grounding만 됐으면(같은 프레임일 필요 없음) 이미 저장된
+            # 전역 위치만으로 순수 기하 판정을 한다.
+            relation_edges = relation_edges + self._infer_task_relations_globally(task, pose)
 
             paths = self._safe_export_locked()
             return {
@@ -403,6 +411,17 @@ class SceneGraphManager:
             # 에 아무 줄도 안 남는다. "왜 relation 검증이 아예 시도조차 안 됐는지"를 별도로
             # 남겨야 사용자가 "이 물체가 아직 한 프레임에 같이 안 보였구나"를 알 수 있다.
             self._relation_reasoner.log_relation_check_skipped(task, chain, self._objects)
+        return inferred
+
+    def _infer_task_relations_globally(self, task: dict, pose: dict) -> list[dict]:
+        """SpatialRelationReasoner.infer_global() 참고 - "같은 viewpoint에서 동시에
+        관측" 제약이 없는 보강 경로. object_id=0을 "특정 viewpoint에 묶이지 않고
+        전역 위치로 판정함"을 나타내는 sentinel로 쓴다(실제 viewpoint_id는 1부터
+        시작하므로 충돌 없음)."""
+        inferred: list[dict] = []
+        for edge in self._relation_reasoner.infer_global(task, list(self._objects.values()), pose):
+            if self._add_object_relation_edge(0, edge):
+                inferred.append({**edge, "viewpoint_id": None})
         return inferred
 
     @staticmethod
