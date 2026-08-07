@@ -102,6 +102,15 @@ GROUNDING_MIN_RANGE_M = 0.30
 GROUNDING_MAX_RANGE_M = 30.0
 GROUNDING_MIN_POINTS = 5
 GROUNDING_MAX_OBJECT_POINTS = 2048
+# 유리창처럼 LiDAR 반사가 잘 안 되는 물체는 GROUNDING_MIN_POINTS(정밀 bbox에 필요한
+# 최소 point 수)를 영영 못 채워서 3D grounding 자체가 항상 버려졌다 - relation 판정
+# (nearest/near/between)은 정밀한 bbox 없이 대략적인 위치만으로도 충분하므로, 이보다
+# 적은(그러나 0은 아닌) point만 있어도 "approximate" 등급으로 위치를 만든다. 특정
+# 카테고리를 하드코딩하는 게 아니라 point 개수 기준의 일반 규칙이라 어떤 물체든
+# 이 상황이면 동일하게 적용된다. object_memory에 들어간 뒤 나중에 더 잘 grounding된
+# 관측이 들어오면 지수이동평균(_merge())으로 자연스럽게 정밀한 위치로 수렴한다.
+GROUNDING_MIN_POINTS_APPROXIMATE = 1
+GROUNDING_APPROXIMATE_DEFAULT_SIZE_M = 0.3
 
 ASSOCIATION_MAX_DISTANCE_M = 1.20
 ASSOCIATION_DISTANCE_SIGMA_M = 0.60

@@ -130,30 +130,47 @@ class PanoramaLidarGrounder:
                 ]
             object_points = points_map[np.flatnonzero(selected)] # np.flatnonzero(selected)는 True인 index를 반환
             object_points = object_points[np.isfinite(object_points).all(axis=1)]
-            # # mask 안에 들어온 lidar point가 최소 개수보다 적으면, 해당 객체는 3D 정보 계산하지 않고 건너뜀
-            if len(object_points) < config.GROUNDING_MIN_POINTS: 
+            # mask 안에 들어온 lidar point가 approximate 등급 최소치보다도 적으면(0개
+            # 포함) 방향/깊이 단서가 아예 없어 위치를 만들 수조차 없으므로 건너뜀
+            if len(object_points) < config.GROUNDING_MIN_POINTS_APPROXIMATE:
                 continue
-            
+
             # mask 안에 들어온 lidar point가 최대 개수보다 많으면, 랜덤하게 최대 개수만큼 샘플링 (연산 과부화 방지)
             if len(object_points) > config.GROUNDING_MAX_OBJECT_POINTS:
                 idx = np.linspace(0, len(object_points) - 1, config.GROUNDING_MAX_OBJECT_POINTS, dtype=np.int64)
                 object_points = object_points[idx]
 
-            # 객체 3D 포인트들의 x, y, z 각각에 대해 중앙값을 계산
             position = np.median(object_points, axis=0)
-            minimum = np.percentile(object_points, 5.0, axis=0)
-            maximum = np.percentile(object_points, 95.0, axis=0)
-            # item에 기존 segmentation 정보(mask, bbox 등)와 새로 계산한 3D 정보(position, point cloud, 3D bounding box 등)를 합쳐서 복사, 
+            if len(object_points) >= config.GROUNDING_MIN_POINTS:
+                # 점이 충분해서 percentile 기반 정밀 bbox를 통계적으로 믿을 수 있음
+                minimum = np.percentile(object_points, 5.0, axis=0)
+                maximum = np.percentile(object_points, 95.0, axis=0)
+                grounding_quality = "precise"
+            else:
+                # 점이 너무 적어서(예: 유리창처럼 LiDAR 반사가 잘 안 되는 물체) percentile
+                # bbox는 통계적으로 못 믿지만, relation 판정(nearest/near/between)은
+                # 정밀한 bbox가 아니라 대략적인 위치만 있어도 충분하다 - 특정 카테고리를
+                # 하드코딩하는 게 아니라 point 개수 기준의 일반 규칙이라 어떤 물체든 이
+                # 상황이면 동일하게 적용된다. object_memory에 들어간 뒤 나중에 더 잘
+                # grounding된 관측이 오면 지수이동평균(_merge())으로 자연스럽게 정밀한
+                # 위치로 수렴한다.
+                half_size = config.GROUNDING_APPROXIMATE_DEFAULT_SIZE_M / 2.0
+                minimum = position - half_size
+                maximum = position + half_size
+                grounding_quality = "approximate"
+
+            # item에 기존 segmentation 정보(mask, bbox 등)와 새로 계산한 3D 정보(position, point cloud, 3D bounding box 등)를 합쳐서 복사,
             item = {key: value for key, value in segmented.items() if key != "mask"}
             # 기존 2d에서, 추가로 계산한 3D 정보를 item에 추가
             item.update({
-                "position": tuple(float(v) for v in position), # <- 3D 중심 좌표 * 
+                "position": tuple(float(v) for v in position), # <- 3D 중심 좌표 *
                 "point_cloud": object_points.astype(np.float32),
                 "bbox_3d_min": tuple(float(v) for v in minimum),
                 "bbox_3d_max": tuple(float(v) for v in maximum),
                 "extent_3d": tuple(float(v) for v in (maximum - minimum)),
                 "crop_image": self._crop(image_rgb, segmented["mask"], segmented["bbox"]),
                 "num_points": int(len(object_points)),
+                "grounding_quality": grounding_quality,
             })
             output_3D_list_.append(item) # 완성된 객체 검출을, output_3D_list_에 추가
         return output_3D_list_

@@ -86,7 +86,7 @@ class PerceptionPipeline:
         grounded = self.grounder.ground(image_rgb, points_sensor, segmented, robot_pose)
         self._logger.info(
             f"[Perception] LiDAR-grounded to 3D: "
-            f"{[(item['category'], tuple(round(v, 2) for v in item['position'])) for item in grounded]}"
+            f"{[(item['category'], tuple(round(v, 2) for v in item['position']), item.get('grounding_quality', '?'), item.get('num_points', 0)) for item in grounded]}"
         )
         save_debug_image(image_rgb, segmented, grounded) # ai_module/debug에 저장
         return grounded
