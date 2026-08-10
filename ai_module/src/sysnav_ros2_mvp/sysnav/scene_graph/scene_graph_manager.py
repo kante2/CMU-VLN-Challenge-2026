@@ -157,6 +157,22 @@ class SceneGraphManager:
             self._selected_object_id = None if object_id is None else int(object_id)
             self._safe_export_locked()
 
+    def infer_relations_for_task(self, task: dict, pose: dict) -> list[dict]:
+        """add_observation()이 매 perception 프레임마다 relation edge를 갱신하긴 하지만,
+        그건 그 순간 perception_job에 넘어간 task(=self.task, 최상위 task) 기준이다.
+        Mission 3(Instruction-Following)는 절마다 독립된 relation을 가진 step 단위
+        task(mission3_pipe.py의 step["parsed"])를 selection_job에 직접 넘기는데, 최상위
+        task는 target/relation이 빈 placeholder라서 그 step의 relation은 add_observation을
+        아무리 거쳐도 절대 edge화되지 않는다(항상 image-verification 폴백으로만 빠짐).
+        selection_job이 실제로 판정하려는 task로 이 메서드를 먼저 호출해서 그 gap을 메운다.
+        같은 (task, viewpoint) 조합은 add_observation과 동일하게 _relation_checks로
+        캐시되므로 반복 호출해도 비용이 크지 않다."""
+        with self._lock:
+            inferred = self._infer_task_relations_from_common_viewpoints(task)
+            inferred = inferred + self._infer_task_relations_globally(task, pose)
+            self._safe_export_locked()
+            return inferred
+
     def find_matching_target_ids(self, task: dict) -> list[int]:
         """target 카테고리에서 시작해서 relation_chain을 hop-by-hop으로 따라가며
         실제 object-object edge가 이어지는 object만 남긴다 (예: "A closest to B near C"는

@@ -503,7 +503,14 @@ class SysNavNode(Node):
         candidates = self.object_memory.find_by_category(task["target"]) # Object Memory에서 어떤 종류의 객체를 후보로 가져올지 결정
 
         # 문장에 spatial constraint가 있고 Scene Graph에 검증된 Object-Object edge가
-        # 존재하면, 해당 edge의 source object만 우선 후보로 사용한다.
+        # 존재하면, 해당 edge의 source object만 우선 후보로 사용한다. mission3는 절마다
+        # 독립된 relation을 가진 step task를 여기로 직접 넘기는데, add_observation은
+        # 최상위 placeholder task(relation 없음) 기준으로만 edge를 갱신하므로 이 task의
+        # relation은 그쪽에서 절대 잡히지 않는다 - 여기서 먼저 직접 시도해서 채운다
+        # (mission1/2는 이미 add_observation이 같은 task로 채워놨을 것이므로 대부분
+        # _relation_checks 캐시에 걸려 사실상 공짜다).
+        if effective_relation_chain(task):
+            self.scene_graph.infer_relations_for_task(task, pose)
         relation_candidate_ids = set(self.scene_graph.find_matching_target_ids(task))
         if relation_candidate_ids:
             candidates = [
