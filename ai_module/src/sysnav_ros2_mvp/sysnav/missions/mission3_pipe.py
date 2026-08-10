@@ -398,22 +398,21 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     # 물체를 바라보라고 강제할 이유가 없어 이동 방향 theta로 유지한다.)
     theta = math.atan2(y - pose["y"], x - pose["x"])
 
-    # 진짜 원인(2026-08-10, base autonomy 소스 waypointConverter.cpp 확인): 목표가
-    # adjDisThre(5m) 안에 들어오면 base autonomy가 우리가 준 좌표를 그대로 안 쓰고 자기
-    # /terrain_map(라이브 지형 스캔) 기준 "가장 가까운 장애물 아닌 traversable point"로
-    # 스스로 미세 조정하는데, 그 스캔이 아직 커버 안 한(로봇이 물리적으로 가까이 가본 적
-    # 없는) 영역엔 그런 점이 없어서 조정이 멈춰버린다. 우리 자체 LiDAR occupancy grid는
-    # 멀리서도 "빈 공간"으로 보여서 plan_direct_path가 2m 넘는 거리를 hop 하나로 뭉쳐
-    # 버리는데, base autonomy 입장에선 "가본 적 없는 땅"이라 못 간다(timeout을 8→30초로
-    # 늘려도 재현 - 시간 문제가 아니라 애초에 못 가는 것). MISSION3_LEG_MAX_HOP_SPACING_M
-    # 으로 hop 간격을 짧게 강제해서, 로봇이 실제로 목표 근처를 단계적으로 지나가며 지형
-    # 스캔 커버리지 자체를 넓히게 만든다. forbidden_mask 유무와 상관없이 항상 이 경로부터
-    # 시도하고, 경로를 못 찾을 때만(맵이 아직 안 뚫렸거나 목표가 unknown 영역) 예전처럼
-    # 직선 단일 leg로 폴백한다.
-    path = node.coverage_planner.plan_direct_path(
-        pose, (x, y), final_theta=theta, forbidden_mask=node.mission3_forbidden_mask,
-        max_hop_spacing_m=config.MISSION3_LEG_MAX_HOP_SPACING_M,
-    )
+    # base autonomy(iros2026_system)엔 localPlanner+pathFollower+terrainAnalysis로
+    # 구성된 실시간 로컬 경로계획기가 이미 떠 있다(2026-08-11 프로세스 확인:
+    # localPlanner/pathFollower가 실제로 동작 중). waypointConverter는 우리 goal을
+    # 그쪽에 넘겨주는 얇은 중계 계층일 뿐이라, 목적지 하나만 던지면 장애물 회피와
+    # 실시간 재계획은 그쪽이 알아서 해주는 게 원래 설계다. 우리 자체 occupancy grid
+    # 기반 A*(plan_direct_path)로 짧은 hop을 강제로 쪼개 넘기면 이 로컬 플래너의 판단을
+    # 방해할 수 있어, forbidden_mask(문장의 "avoid the path" 제약 - base autonomy가
+    # 알 수 없는 우리만의 제약)가 있을 때만 우리 A*로 우회 경로를 계산하고, 그 외엔
+    # 항상 목적지를 그대로 한 번에 던져서 base autonomy의 로컬 플래너를 신뢰한다.
+    path = None
+    if node.mission3_forbidden_mask is not None:
+        path = node.coverage_planner.plan_direct_path(
+            pose, (x, y), final_theta=theta, forbidden_mask=node.mission3_forbidden_mask,
+            max_hop_spacing_m=config.MISSION3_LEG_MAX_HOP_SPACING_M,
+        )
     if path:
         node.mission3_leg_queue = deque(path)
     else:

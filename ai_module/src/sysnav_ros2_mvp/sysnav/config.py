@@ -32,7 +32,11 @@ PERCEPTION_WHILE_MOVING_INTERVAL_SEC = 1.50
 SENSOR_SYNC_TOLERANCE_SEC = 0.30
 SCAN_BUFFER_SIZE = 40
 POSE_BUFFER_SIZE = 100
-GOAL_REACHED_DISTANCE_M = 0.15
+# base autonomy(waypointConverter.cpp)의 자체 도착 판정 반경(waypointXYRadius)이 0.3m라
+# 그보다 타이트하면 base autonomy는 이미 "도착"으로 보고 정지했는데 우리만 계속 기다리다
+# stuck-timeout으로 SKIP되는 근본적 불일치가 생긴다(2026-08-10 실측: 0.15m일 때 0.31~0.34m
+# 남기고 반복 SKIP). 0.3m보다 살짝 여유를 둔다.
+GOAL_REACHED_DISTANCE_M = 0.35
 # exploration goal까지 거리가 이 이상 줄지 않은 채 이 시간(초)이 지나면 도달 불가로 보고 포기한다.
 # (벽 너머 등 실제로는 갈 수 없는 waypoint에 로봇이 영원히 박혀있는 것을 막기 위한 안전장치)
 EXPLORATION_STUCK_TIMEOUT_SEC = 8.0
