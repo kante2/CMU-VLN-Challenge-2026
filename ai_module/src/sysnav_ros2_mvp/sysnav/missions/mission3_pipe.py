@@ -391,26 +391,28 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
         x, y, _ = node.goal_publisher.object_approach_pose(pose, point)
     else:
         x, y = float(point[0]), float(point[1])
-    # object_approach_pose()가 원래 돌려주는 theta는 "도착해서 물체를 바라볼 방향"
-    # (목표->물체 방향)인데, 이동 방향(로봇 현재 위치->목표)이랑 무관하다. 실측(2026-08-10):
-    # 비슷한 거리(~2m)인데 이동방향 theta를 쓴 between-ref step은 5초 만에 도착한 반면,
-    # 이 "바라볼 방향" theta를 쓴 물체 접근 step 2개는 거의 못 움직인 채 30~45초 뒤
-    # SKIP됨 - /way_point_with_heading을 받는 base autonomy가 이 theta를 이동 중에도
-    # 유지하려다 이동 방향과 어긋나서 헤매는 것으로 보인다. README의 "go near"/"stop at"은
-    # 위치 도달만 요구하고 특정 방향을 바라보라는 요구가 없으므로, 항상 이동 방향으로
-    # theta를 통일한다.
+    # object_approach_pose()가 원래 돌려주는 theta("도착해서 물체를 바라볼 방향")
+    # 대신 이동 방향을 쓴다. (참고: waypointConverter.cpp의 yawConfig=-1은 "도착 후
+    # 현재 yaw 유지"라 theta 자체는 실제 원인이 아니었다 - 진짜 원인은 아래 hop 분할
+    # 주석 참고. 그래도 README의 "go near"/"stop at"은 위치 도달만 요구하니 굳이
+    # 물체를 바라보라고 강제할 이유가 없어 이동 방향 theta로 유지한다.)
     theta = math.atan2(y - pose["y"], x - pose["x"])
 
-    # base autonomy에 최종 goal 하나만 던지면, exploration이 짧은 hop들로 잘게 쪼개서
-    # 이동하는 것과 달리 도중 장애물을 우회하는 몫이 전부 base autonomy의 로컬 제어기에만
-    # 맡겨진다 - 그 결과 EXPLORATION_STUCK_TIMEOUT_SEC/MISSION3_LEG_STUCK_TIMEOUT_SEC 창
-    # 안에 진전이 안 잡혀 도착 직전에 SKIP되는 사례가 실측됨(2026-08-10, timeout을 8→30초로
-    # 늘려도 여전히 재현). plan_direct_path()는 이미 아는 free space 기준 A* 경로를
-    # exploration과 같은 방식(_leg_waypoints/line-of-sight hop)으로 짧은 leg들로 쪼개주므로,
-    # forbidden_mask 유무와 상관없이 항상 이 경로부터 시도하고, 경로를 못 찾을 때만(맵이 아직
-    # 안 뚫렸거나 목표가 unknown 영역) 예전처럼 직선 단일 leg로 폴백한다.
+    # 진짜 원인(2026-08-10, base autonomy 소스 waypointConverter.cpp 확인): 목표가
+    # adjDisThre(5m) 안에 들어오면 base autonomy가 우리가 준 좌표를 그대로 안 쓰고 자기
+    # /terrain_map(라이브 지형 스캔) 기준 "가장 가까운 장애물 아닌 traversable point"로
+    # 스스로 미세 조정하는데, 그 스캔이 아직 커버 안 한(로봇이 물리적으로 가까이 가본 적
+    # 없는) 영역엔 그런 점이 없어서 조정이 멈춰버린다. 우리 자체 LiDAR occupancy grid는
+    # 멀리서도 "빈 공간"으로 보여서 plan_direct_path가 2m 넘는 거리를 hop 하나로 뭉쳐
+    # 버리는데, base autonomy 입장에선 "가본 적 없는 땅"이라 못 간다(timeout을 8→30초로
+    # 늘려도 재현 - 시간 문제가 아니라 애초에 못 가는 것). MISSION3_LEG_MAX_HOP_SPACING_M
+    # 으로 hop 간격을 짧게 강제해서, 로봇이 실제로 목표 근처를 단계적으로 지나가며 지형
+    # 스캔 커버리지 자체를 넓히게 만든다. forbidden_mask 유무와 상관없이 항상 이 경로부터
+    # 시도하고, 경로를 못 찾을 때만(맵이 아직 안 뚫렸거나 목표가 unknown 영역) 예전처럼
+    # 직선 단일 leg로 폴백한다.
     path = node.coverage_planner.plan_direct_path(
-        pose, (x, y), final_theta=theta, forbidden_mask=node.mission3_forbidden_mask
+        pose, (x, y), final_theta=theta, forbidden_mask=node.mission3_forbidden_mask,
+        max_hop_spacing_m=config.MISSION3_LEG_MAX_HOP_SPACING_M,
     )
     if path:
         node.mission3_leg_queue = deque(path)

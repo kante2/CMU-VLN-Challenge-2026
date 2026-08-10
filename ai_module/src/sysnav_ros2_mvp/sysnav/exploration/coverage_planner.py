@@ -262,9 +262,11 @@ class CoveragePlanner:
                 heapq.heappush(queue, (next_cost + heuristic, next_cost, neighbor))
         return None
 
-    def _simplify_path_indices(self, path: list[tuple[int, int]], blocking: np.ndarray) -> list[int]:
+    def _simplify_path_indices(
+        self, path: list[tuple[int, int]], blocking: np.ndarray, max_hop_spacing_m: float | None = None
+    ) -> list[int]:
         """A* 경로를 hop index 리스트로 줄인다 (string-pulling). 각 hop에서 다음 hop까지는
-        - EXPLORATION_PATH_WAYPOINT_SPACING_M 이내면서
+        - max_hop_spacing_m(기본 EXPLORATION_PATH_WAYPOINT_SPACING_M) 이내면서
         - inflated 그리드 기준 line-of-sight가 뚫려 있는 한(즉 그 사이에 벽이 없는 한)
         최대한 멀리 건너뛴다. 코너/문틀에서는 LOS가 막히는 지점에서 자동으로 hop이 촘촘해지고,
         뚫린 직선 구간에서는 hop이 줄어든다 - 고정 간격 downsample과 달리 hop 사이 직선이
@@ -272,7 +274,8 @@ class CoveragePlanner:
         n = len(path)
         if n <= 1:
             return [0] if path else []
-        spacing_cells = max(1, int(round(config.EXPLORATION_PATH_WAYPOINT_SPACING_M / self.resolution)))
+        spacing_m = config.EXPLORATION_PATH_WAYPOINT_SPACING_M if max_hop_spacing_m is None else max_hop_spacing_m
+        spacing_cells = max(1, int(round(spacing_m / self.resolution)))
         last_idx = n - 1
         indices = [0]
         i = 0
@@ -291,11 +294,12 @@ class CoveragePlanner:
         blocking: np.ndarray,
         final_theta: float | None,
         credited_len: int,
+        max_hop_spacing_m: float | None = None,
     ) -> list[dict]:
         """A* 경로(path)를 _simplify_path_indices로 줄인 hop들로 waypoint dict 목록을 만든다.
         마지막 hop만 candidate의 실제 score/coverage_score/theta를 지니고, 중간 hop들은
         진행 방향을 바라보며 score 0으로 그냥 지나가는 경유점이다."""
-        hop_indices = self._simplify_path_indices(path, blocking)[1:] or [len(path) - 1]
+        hop_indices = self._simplify_path_indices(path, blocking, max_hop_spacing_m)[1:] or [len(path) - 1]
         last_idx = len(path) - 1
 
         waypoints = []
@@ -658,6 +662,7 @@ class CoveragePlanner:
         goal_xy: tuple[float, float],
         final_theta: float | None = None,
         forbidden_mask: np.ndarray | None = None,
+        max_hop_spacing_m: float | None = None,
     ) -> list[dict] | None:
         """start_pose에서 goal_xy까지 벽(+옵션으로 forbidden_mask)을 피해가는 A*
         경로를 waypoint 시퀀스로 만든다. plan_route()와 달리 "다음에 어디를 탐색할지"
@@ -720,4 +725,4 @@ class CoveragePlanner:
         diag["reason"] = "ok"
         diag["path_len"] = len(path)
         self.last_direct_path_diagnostics = diag
-        return self._leg_waypoints(path, inflated, final_theta, credited_len=0)
+        return self._leg_waypoints(path, inflated, final_theta, credited_len=0, max_hop_spacing_m=max_hop_spacing_m)
