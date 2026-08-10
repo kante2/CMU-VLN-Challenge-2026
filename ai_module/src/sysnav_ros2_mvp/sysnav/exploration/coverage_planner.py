@@ -164,9 +164,20 @@ class CoveragePlanner:
                 if endpoint is None:
                     continue
                 ray = _bresenham(robot_cell[0], robot_cell[1], endpoint[0], endpoint[1])
+                # 이미 벽으로 확정된 셀을 만나면 ray를 거기서 멈춘다 - 실제 LiDAR는
+                # 벽을 못 뚫으므로, 이 point가 그 벽 너머까지 도달했다는 건(반사 노이즈,
+                # multi-path, 혹은 Unity raycast가 얇은 콜라이더를 놓친 경우 등 원인이
+                # 뭐든) 신뢰할 수 없다는 뜻이다. 예전엔 "그 한 칸만 안 덮어쓰고" 계속
+                # 진행해서 벽 너머 공간을 통째로 free로 잘못 마킹했었다(탐색 디버그
+                # 이미지에서 벽을 뚫고 나가는 것처럼 보이는 frontier의 원인).
+                blocked = False
                 for row, col in ray[:-1]:
-                    if self.grid[row, col] != config.OCC_OCCUPIED:
-                        self.grid[row, col] = config.OCC_FREE
+                    if self.grid[row, col] == config.OCC_OCCUPIED:
+                        blocked = True
+                        break
+                    self.grid[row, col] = config.OCC_FREE
+                if blocked:
+                    continue  # 벽 너머로 찍힌 것으로 추정되는 endpoint도 신뢰 안 함(occupied로도 안 찍음)
                 endpoints.append((endpoint[0], endpoint[1], float(z)))
             for row, col, z in endpoints:
                 self.grid[row, col] = config.OCC_OCCUPIED
