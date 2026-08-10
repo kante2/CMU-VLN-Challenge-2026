@@ -32,7 +32,7 @@ PERCEPTION_WHILE_MOVING_INTERVAL_SEC = 1.50
 SENSOR_SYNC_TOLERANCE_SEC = 0.30
 SCAN_BUFFER_SIZE = 40
 POSE_BUFFER_SIZE = 100
-GOAL_REACHED_DISTANCE_M = 0.55
+GOAL_REACHED_DISTANCE_M = 0.15
 # exploration goal까지 거리가 이 이상 줄지 않은 채 이 시간(초)이 지나면 도달 불가로 보고 포기한다.
 # (벽 너머 등 실제로는 갈 수 없는 waypoint에 로봇이 영원히 박혀있는 것을 막기 위한 안전장치)
 EXPLORATION_STUCK_TIMEOUT_SEC = 8.0
