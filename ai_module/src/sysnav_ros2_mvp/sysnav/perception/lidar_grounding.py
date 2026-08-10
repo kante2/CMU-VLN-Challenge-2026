@@ -66,6 +66,30 @@ class PanoramaLidarGrounder:
         return {"indices": indices[keep], "u": u[keep], "v": v[keep]}
 
     @staticmethod
+    def _dominant_depth_cluster(points_map: np.ndarray, robot_xyz: np.ndarray) -> np.ndarray:
+        """SAM2 mask 안에 들어온 point가 전부 같은 물체 표면이라는 보장이 없다 -
+        2D mask 경계가 부정확하거나, 목표 물체 앞/뒤에 다른 물체(가구, 문틀 모서리
+        등)가 살짝 겹쳐 있으면 서로 다른 깊이(depth)의 point가 한 mask 안에 섞여
+        들어온다. 그대로 median을 내면 두 물체 사이 허공에 3D 위치가 잡히는 오검출이
+        생긴다. 로봇 기준 거리로 1차원 클러스터링해서, point가 가장 많이 뭉친(=실제
+        물체 표면일 가능성이 가장 높은) 구간만 남긴다 - tmah_vlm의
+        weighted_centroid_target()과 같은 아이디어."""
+        if len(points_map) < 3:
+            return points_map
+        distances = np.linalg.norm(points_map - robot_xyz, axis=1)
+        order = np.argsort(distances)
+        sorted_distances = distances[order]
+        # 거리값이 DEPTH_CLUSTER_GAP_M 이상 벌어지는 지점마다 새 군집 시작
+        gaps = np.diff(sorted_distances) > config.DEPTH_CLUSTER_GAP_M
+        cluster_ids = np.concatenate([[0], np.cumsum(gaps)])
+        counts = np.bincount(cluster_ids)
+        if len(counts) == 1:
+            return points_map  # 애초에 한 덩어리(gap 없음) - 그대로 사용
+        dominant = int(np.argmax(counts))
+        keep_sorted = cluster_ids == dominant
+        return points_map[order[keep_sorted]]
+
+    @staticmethod
     def _crop(image_rgb: np.ndarray, mask: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray:
         x1, y1, x2, y2 = bbox
         crop = image_rgb[y1:y2, x1:x2].copy()
@@ -138,6 +162,10 @@ class PanoramaLidarGrounder:
         # 3. Sensor frame → Base frame → Map frame
         points_base = _transform(projected_lidar_points_in_SAM2mask, self.t_sensor_to_base)
         points_map = _base_to_map(points_base, robot_pose)
+        robot_xyz = np.array(
+            [float(robot_pose["x"]), float(robot_pose["y"]), float(robot_pose.get("z", 0.0))],
+            dtype=np.float64,
+        )
         output_3D_list_ = [] # 각 객체의 3D 정보를 하나씩 만들어 저장할 리스트
 
         for segmented in segmented_objects:
@@ -147,6 +175,11 @@ class PanoramaLidarGrounder:
                 ]
             object_points = points_map[np.flatnonzero(selected)] # np.flatnonzero(selected)는 True인 index를 반환
             object_points = object_points[np.isfinite(object_points).all(axis=1)]
+            # mask 안에 여러 깊이(depth)의 point가 섞여 들어왔으면(목표 물체 앞뒤로
+            # 다른 물체가 겹쳐 보이는 경우 등) 가장 많이 뭉친 깊이 구간만 남긴다 -
+            # 안 그러면 서로 다른 물체의 point가 섞여 median이 허공을 가리키는
+            # 오검출이 생긴다.
+            object_points = self._dominant_depth_cluster(object_points, robot_xyz)
             # mask 안에 들어온 lidar point가 approximate 등급 최소치보다도 적으면(0개
             # 포함) 방향/깊이 단서가 아예 없어 위치를 만들 수조차 없으므로 건너뜀
             if len(object_points) < config.GROUNDING_MIN_POINTS_APPROXIMATE:

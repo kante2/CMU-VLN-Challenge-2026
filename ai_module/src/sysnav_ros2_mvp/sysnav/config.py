@@ -102,6 +102,11 @@ GROUNDING_MIN_RANGE_M = 0.30
 GROUNDING_MAX_RANGE_M = 30.0
 GROUNDING_MIN_POINTS = 5
 GROUNDING_MAX_OBJECT_POINTS = 2048
+# SAM2 mask 안에 들어온 LiDAR point를 로봇 기준 거리로 1차원 클러스터링할 때, 이
+# 값(m) 이상 거리 차이가 나면 다른 물체(다른 깊이)로 취급해서 군집을 나눈다.
+# 목표 물체 앞/뒤로 다른 물체가 mask 경계에 살짝 겹쳐 들어왔을 때, 가장 점이 많이
+# 뭉친 구간(=진짜 그 물체 표면)만 남기고 나머지는 버린다.
+DEPTH_CLUSTER_GAP_M = 0.3
 # 유리창처럼 LiDAR 반사가 잘 안 되는 물체는 GROUNDING_MIN_POINTS(정밀 bbox에 필요한
 # 최소 point 수)를 영영 못 채워서 3D grounding 자체가 항상 버려졌다 - relation 판정
 # (nearest/near/between)은 정밀한 bbox 없이 대략적인 위치만으로도 충분하므로, 이보다
