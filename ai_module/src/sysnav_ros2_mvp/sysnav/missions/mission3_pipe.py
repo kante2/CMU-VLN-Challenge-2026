@@ -404,6 +404,7 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
         node.mission3_leg_queue = deque(path)
     else:
         node.mission3_leg_queue = deque([{"x": x, "y": y, "theta": theta}])
+    node.mission3_leg_total = len(node.mission3_leg_queue)
 
     # 이 step이 최종적으로 향하는 goal(다중 leg면 마지막 leg) - "success는 떴는데
     # 실제로는 안 갔다"류 문제를 RViz에서 눈으로 확인하기 위한 디버그 마커.
@@ -411,6 +412,14 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     node.goal_publisher.add_step_goal_marker(
         node.mission3_step_index, final_leg["x"], final_leg["y"],
         label=f"goal{node.mission3_step_index + 1}",
+    )
+    # plan_direct_path가 몇 개의 hop으로 쪼갰는지 - "어느 hop에서 SKIP됐는지"를
+    # 나중에 로그만 보고 알 수 있어야 "탐사랑 겹치는 느낌"인지 실제로 이 leg 경로
+    # 자체가 도는 건지 구분할 수 있다.
+    node.get_logger().info(
+        f"🧭 mission3 step {node.mission3_step_index + 1} leg plan: "
+        f"{node.mission3_leg_total} hop(s) via {'A*' if path else 'direct'}, "
+        f"final=({final_leg['x']:.2f}, {final_leg['y']:.2f})"
     )
 
     _publish_next_leg_waypoint(node)
@@ -426,6 +435,11 @@ def _publish_next_leg_waypoint(node) -> None:
     node._exploration_goal_last_progress_time = time.monotonic()
     with node.state_lock:
         node.state = "MISSION3_NAVIGATE_STEP"
+    hop_number = node.mission3_leg_total - len(node.mission3_leg_queue) + 1
+    node.get_logger().info(
+        f"➡️ mission3 hop {hop_number}/{node.mission3_leg_total} -> "
+        f"({goal['x']:.2f}, {goal['y']:.2f})"
+    )
 
 
 def _navigate_step(node, task: dict, pose: dict) -> None:
@@ -438,7 +452,17 @@ def _navigate_step(node, task: dict, pose: dict) -> None:
         # 찍혀서 실제로는 물체 앞까지 못 간 채 성공 처리되는 문제가 있었다(2026-08-10
         # 실측: robot_pose가 거의 안 움직인 채 3 step 전부 정확히 8.0초 간격으로 SKIP됨).
         if node._exploration_goal_unreachable(pose, timeout_sec=config.MISSION3_LEG_STUCK_TIMEOUT_SEC):
-            node.get_logger().warning("⏭️ SKIP - mission3 leg waypoint unreachable, skipping ahead")
+            hop_number = node.mission3_leg_total - len(node.mission3_leg_queue) + 1
+            goal = node.current_goal or {}
+            distance = math.hypot(
+                float(goal.get("x", pose["x"])) - pose["x"],
+                float(goal.get("y", pose["y"])) - pose["y"],
+            )
+            node.get_logger().warning(
+                f"⏭️ SKIP - mission3 hop {hop_number}/{node.mission3_leg_total} unreachable "
+                f"(still {distance:.2f}m from ({goal.get('x', 0):.2f}, {goal.get('y', 0):.2f})), "
+                f"skipping ahead"
+            )
             if node.mission3_leg_queue:
                 node.mission3_leg_queue.popleft()
             _advance_after_leg_hop(node, task, pose, reached=False)
