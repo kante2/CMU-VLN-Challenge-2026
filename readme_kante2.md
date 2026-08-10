@@ -1,4 +1,19 @@
 
+## 빠른 실행 — sh 스크립트 3개 (2026-08-10 추가)
+
+컨테이너가 이미 떠있는 상태(아래 1번 "컨테이너 빌드 & 기동" 완료 후)라면, 터미널 3개를
+열고 각각 아래 스크립트만 실행하면 됨 (전부 `docker exec -it`로 컨테이너 안까지 들어가서
+소싱까지 자동으로 함).
+
+- **터미널 A** — 시뮬레이터: `./docker/A_시뮬레이터.sh`
+  (씬을 바꿔서 켜고 싶으면 대신 `./docker/run_scene.sh <씬이름>`, 예: `./docker/run_scene.sh hotel_room_1`)
+- **터미널 B** — sysnav 노드 실행: `./docker/B_sysnav_실행.sh`
+  (컨테이너 안에서 `source /opt/ros/jazzy/setup.bash && source /home/docker/ai_module/install/setup.bash && ros2 launch sysnav sysnav.launch.py`를 그대로 실행)
+- **터미널 C** — 질의: `./docker/C_질의.sh`
+  (컨테이너 접속 + ROS2 소싱까지만 자동으로 해주고 셸을 넘겨줌 — `ros2 topic pub` 명령은 직접 입력.
+  예: `ros2 topic pub --once /challenge_question std_msgs/msg/String "{data: 'Find the bowl near the trash can.'}"`)
+- **대시보드 확인** (호스트에서, 컨테이너 밖): `./docker/ui_checker.sh`
+
 # sysnav_ros2_mvp 실행 방법 (2026-07-21)
 
 경로: `ai_module/src/sysnav_ros2_mvp/`
@@ -92,6 +107,10 @@ ros2 topic pub --once /challenge_question std_msgs/msg/String \
 
 ros2 topic pub --once /challenge_question std_msgs/msg/String \
 "{data: 'Find the bowl near the trash can.'}"
+
+ros2 topic pub --once /challenge_question std_msgs/msg/String \
+"{data: 'First, go near the bedside table closest to the bench, then take the path between the TV and the bed to the picture closest to the TV.'}"
+
 
 
 ## --------------------------------------------------

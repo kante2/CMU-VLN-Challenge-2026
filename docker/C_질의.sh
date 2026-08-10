@@ -1,9 +1,8 @@
 #!/bin/bash
-# 터미널 C — 질의
-# 사용법: ./C_질의.sh "Find the white chair"   (인자 생략 시 기본 질문 사용)
+# 터미널 C — 질의 (컨테이너 접속 + ROS2 소싱까지만 자동, 퍼블리시 명령은 직접 입력)
+# 사용법: ./C_질의.sh
+# 접속 후 예: ros2 topic pub --once /challenge_question std_msgs/msg/String "{data: 'Find the bowl near the trash can.'}"
 
 set -e
 
-QUESTION="${1:-Find the white chair}"
-
-docker exec -it iros2026_sysnav_module bash -c "source /opt/ros/jazzy/setup.bash && ros2 topic pub --once /challenge_question std_msgs/msg/String \"{data: '${QUESTION}'}\""
+docker exec -it iros2026_sysnav_module bash -c "source /opt/ros/jazzy/setup.bash && exec bash"
