@@ -4,4 +4,4 @@
 
 set -e
 
-docker exec -it iros2026_sysnav_module bash -c "source /opt/ros/jazzy/setup.bash && cd /home/docker/ai_module && colcon build --symlink-install --packages-select sysnav && source install/setup.bash && ros2 launch sysnav sysnav.launch.py"
+docker exec -it iros2026_sysnav_module bash -c "source /opt/ros/jazzy/setup.bash && cd /home/docker/ai_module && colcon build --symlink-install --packages-select sysnav && source install/setup.bash && ros2 launch sysnav sysnav.launch.py; exec bash"
