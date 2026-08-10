@@ -8,7 +8,8 @@
 - **터미널 A** — 시뮬레이터: `./docker/A_시뮬레이터.sh`
   (씬을 바꿔서 켜고 싶으면 대신 `./docker/run_scene.sh <씬이름>`, 예: `./docker/run_scene.sh hotel_room_1`)
 - **터미널 B** — sysnav 노드 실행: `./docker/B_sysnav_실행.sh`
-  (컨테이너 안에서 `source /opt/ros/jazzy/setup.bash && source /home/docker/ai_module/install/setup.bash && ros2 launch sysnav sysnav.launch.py`를 그대로 실행)
+  (컨테이너 안에서 `colcon build --symlink-install --packages-select sysnav`로 재빌드까지 하고
+  나서 `ros2 launch sysnav sysnav.launch.py` 실행 - 호스트에서 src 고친 뒤에도 그냥 이거 한 번이면 됨)
 - **터미널 C** — 질의: `./docker/C_질의.sh`
   (컨테이너 접속 + ROS2 소싱까지만 자동으로 해주고 셸을 넘겨줌 — `ros2 topic pub` 명령은 직접 입력.
   예: `ros2 topic pub --once /challenge_question std_msgs/msg/String "{data: 'Find the bowl near the trash can.'}"`)
