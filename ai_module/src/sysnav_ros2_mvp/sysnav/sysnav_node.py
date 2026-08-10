@@ -13,7 +13,7 @@ import threading
 import time
 
 from nav_msgs.msg import Odometry
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2
@@ -110,6 +110,16 @@ class SysNavNode(Node):
         super().__init__("sysnav_node")
 
         self.callback_group = ReentrantCallbackGroup()
+        # control_timer 전용 - MultiThreadedExecutor + ReentrantCallbackGroup 조합에서는
+        # 이전 control_loop() 호출이 아직 안 끝났는데 다음 타이머 틱이 동시에 또 실행될 수
+        # 있다(실측으로 확인됨 - 같은 좌표의 "SKIP" 로그 2줄이 0.2초가 아니라 0.3ms 간격으로
+        # 찍힘). self.current_goal/self.exploration_route는 어떤 락도 안 걸려있어서 두
+        # 실행이 동시에 건드리면 레이스가 나고, 한쪽이 current_goal을 None으로 만든 직후
+        # 다른 쪽이 그걸 다시 읽다가 TypeError로 죽는 문제가 있었다. control_timer만 별도
+        # MutuallyExclusiveCallbackGroup에 둬서 자기 자신과는 절대 안 겹치게 한다(센서
+        # 콜백들은 원래대로 Reentrant라 control_loop와 동시에 돌아도 무방 - 락으로 보호된
+        # 버퍼 쓰기뿐이라).
+        self.control_callback_group = MutuallyExclusiveCallbackGroup()
         self.sensor_lock = threading.RLock()
         self.state_lock = threading.RLock()
 
@@ -213,7 +223,7 @@ class SysNavNode(Node):
         self.control_timer = self.create_timer(
             config.CONTROL_PERIOD_SEC,
             self.control_loop,
-            callback_group=self.callback_group,
+            callback_group=self.control_callback_group,
         )
         self.get_logger().info("SysNav single-room MVP started")
 
