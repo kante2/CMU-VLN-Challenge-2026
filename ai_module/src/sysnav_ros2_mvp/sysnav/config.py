@@ -49,16 +49,6 @@ EXPLORATION_STUCK_PROGRESS_M = 0.10
 # 건너뛰는 사례가 실측됨(2026-08-10, 3 step 전부 정확히 8.0초 만에 SKIP, robot_pose는 거의
 # 안 움직인 채 그대로 SUCCESS 처리). mission3 leg에는 훨씬 여유 있는 timeout을 따로 쓴다.
 MISSION3_LEG_STUCK_TIMEOUT_SEC = 30.0
-# base autonomy(waypoint_converter.cpp)는 우리가 던진 좌표를 곧이곧대로 안 쓴다 - 목표
-# adjDisThre(5m) 이내로 들어오면 자기가 실측한 /terrain_map 기준 "가장 가까운 장애물 아닌
-# traversable point"로 스스로 미세 조정하는데, 그 지형 스캔이 아직 커버 안 한(로봇이 물리적
-# 으로 가까이 가본 적 없는) 영역엔 그런 점이 없어서 조정 자체가 멈춰버린다(2026-08-10, 소스
-# 확인: obstacleDisThre=0.75, useTerrainAnalysis=true). 우리 자체 LiDAR occupancy grid는
-# 멀리서도 "빈 공간"으로 보여서 plan_direct_path가 2m 넘는 거리를 hop 하나로 뭉쳐버리는데,
-# base autonomy 입장에선 그게 "가본 적 없는 땅"이라 못 간다. EXPLORATION_PATH_WAYPOINT_SPACING_M
-# (3.0m)보다 훨씬 짧게 hop을 강제해서, 로봇이 실제로 목표 근처를 단계적으로 지나가며 지형
-# 스캔 커버리지 자체를 넓히게 만든다.
-MISSION3_LEG_MAX_HOP_SPACING_M = 1.0
 TARGET_STANDOFF_DISTANCE_M = 0.90
 KEEP_MEMORY_BETWEEN_TASKS = True
 

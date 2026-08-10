@@ -403,36 +403,23 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     # localPlanner/pathFollower가 실제로 동작 중). waypointConverter는 우리 goal을
     # 그쪽에 넘겨주는 얇은 중계 계층일 뿐이라, 목적지 하나만 던지면 장애물 회피와
     # 실시간 재계획은 그쪽이 알아서 해주는 게 원래 설계다. 우리 자체 occupancy grid
-    # 기반 A*(plan_direct_path)로 짧은 hop을 강제로 쪼개 넘기면 이 로컬 플래너의 판단을
-    # 방해할 수 있어, forbidden_mask(문장의 "avoid the path" 제약 - base autonomy가
-    # 알 수 없는 우리만의 제약)가 있을 때만 우리 A*로 우회 경로를 계산하고, 그 외엔
-    # 항상 목적지를 그대로 한 번에 던져서 base autonomy의 로컬 플래너를 신뢰한다.
-    path = None
-    if node.mission3_forbidden_mask is not None:
-        path = node.coverage_planner.plan_direct_path(
-            pose, (x, y), final_theta=theta, forbidden_mask=node.mission3_forbidden_mask,
-            max_hop_spacing_m=config.MISSION3_LEG_MAX_HOP_SPACING_M,
-        )
-    if path:
-        node.mission3_leg_queue = deque(path)
-    else:
-        node.mission3_leg_queue = deque([{"x": x, "y": y, "theta": theta}])
+    # 기반 A*(coverage_planner.plan_direct_path)는 mission3 leg 이동엔 아예 안 쓴다 -
+    # 이 로컬 플래너의 판단을 방해하지 않도록, forbidden_mask("avoid the path" 절)가
+    # 있어도 우회 경로 계산 없이 목적지를 그대로 한 번에 던진다(그만큼 avoid 제약은
+    # 더 이상 강제되지 않고, base autonomy 자체의 장애물 회피에만 의존한다).
+    node.mission3_leg_queue = deque([{"x": x, "y": y, "theta": theta}])
     node.mission3_leg_total = len(node.mission3_leg_queue)
 
-    # 이 step이 최종적으로 향하는 goal(다중 leg면 마지막 leg) - "success는 떴는데
-    # 실제로는 안 갔다"류 문제를 RViz에서 눈으로 확인하기 위한 디버그 마커.
+    # 이 step의 최종 goal - "success는 떴는데 실제로는 안 갔다"류 문제를 RViz에서
+    # 눈으로 확인하기 위한 디버그 마커.
     final_leg = node.mission3_leg_queue[-1]
     node.goal_publisher.add_step_goal_marker(
         node.mission3_step_index, final_leg["x"], final_leg["y"],
         label=f"goal{node.mission3_step_index + 1}",
     )
-    # plan_direct_path가 몇 개의 hop으로 쪼갰는지 - "어느 hop에서 SKIP됐는지"를
-    # 나중에 로그만 보고 알 수 있어야 "탐사랑 겹치는 느낌"인지 실제로 이 leg 경로
-    # 자체가 도는 건지 구분할 수 있다.
     node.get_logger().info(
-        f"🧭 mission3 step {node.mission3_step_index + 1} leg plan: "
-        f"{node.mission3_leg_total} hop(s) via {'A*' if path else 'direct'}, "
-        f"final=({final_leg['x']:.2f}, {final_leg['y']:.2f})"
+        f"🧭 mission3 step {node.mission3_step_index + 1} leg: "
+        f"base autonomy에 직접 위임, final=({final_leg['x']:.2f}, {final_leg['y']:.2f})"
     )
 
     _publish_next_leg_waypoint(node)
