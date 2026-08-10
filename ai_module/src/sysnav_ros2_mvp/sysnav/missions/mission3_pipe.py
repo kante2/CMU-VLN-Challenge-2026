@@ -383,20 +383,26 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
 
 
 def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> None:
-    path = None
-    if node.mission3_forbidden_mask is not None:
-        path = node.coverage_planner.plan_direct_path(
-            pose, (float(point[0]), float(point[1])), forbidden_mask=node.mission3_forbidden_mask
-        )
+    if is_object_target:
+        x, y, theta = node.goal_publisher.object_approach_pose(pose, point)
+    else:
+        x, y = float(point[0]), float(point[1])
+        theta = math.atan2(y - pose["y"], x - pose["x"])
 
+    # base autonomy에 최종 goal 하나만 던지면, exploration이 짧은 hop들로 잘게 쪼개서
+    # 이동하는 것과 달리 도중 장애물을 우회하는 몫이 전부 base autonomy의 로컬 제어기에만
+    # 맡겨진다 - 그 결과 EXPLORATION_STUCK_TIMEOUT_SEC/MISSION3_LEG_STUCK_TIMEOUT_SEC 창
+    # 안에 진전이 안 잡혀 도착 직전에 SKIP되는 사례가 실측됨(2026-08-10, timeout을 8→30초로
+    # 늘려도 여전히 재현). plan_direct_path()는 이미 아는 free space 기준 A* 경로를
+    # exploration과 같은 방식(_leg_waypoints/line-of-sight hop)으로 짧은 leg들로 쪼개주므로,
+    # forbidden_mask 유무와 상관없이 항상 이 경로부터 시도하고, 경로를 못 찾을 때만(맵이 아직
+    # 안 뚫렸거나 목표가 unknown 영역) 예전처럼 직선 단일 leg로 폴백한다.
+    path = node.coverage_planner.plan_direct_path(
+        pose, (x, y), final_theta=theta, forbidden_mask=node.mission3_forbidden_mask
+    )
     if path:
         node.mission3_leg_queue = deque(path)
     else:
-        if is_object_target:
-            x, y, theta = node.goal_publisher.object_approach_pose(pose, point)
-        else:
-            x, y = float(point[0]), float(point[1])
-            theta = math.atan2(y - pose["y"], x - pose["x"])
         node.mission3_leg_queue = deque([{"x": x, "y": y, "theta": theta}])
 
     # 이 step이 최종적으로 향하는 goal(다중 leg면 마지막 leg) - "success는 떴는데
