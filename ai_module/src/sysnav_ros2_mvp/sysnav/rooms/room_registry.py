@@ -139,6 +139,11 @@ class RoomRegistry:
             })
         return {"labels": persistent_labels, "rooms": rooms_out}
 
+    def known_room_count(self) -> int:
+        """지금까지 기하학적으로 인식된(segmentation에서 최소 한 번은 매칭된) 방
+        개수 - cross-room 진단 로그용(sysnav_node._try_start_cross_room_navigation)."""
+        return len(self._rooms)
+
     def rooms_needing_classification(self) -> list[dict]:
         """대표 viewpoint가 있는데 아직 그 viewpoint 기준으로 분류를 안 했거나(또는
         대표가 바뀌었거나) 실패 쿨다운이 지난 room만 골라 [{"room_id", "image_path"}]로

@@ -721,10 +721,20 @@ class SysNavNode(Node):
             pose = None if self.latest_pose is None else dict(self.latest_pose)
         if pose is None or task is None:
             return False
+        unvisited = self.room_registry.unvisited_rooms()
         candidates = [
-            room for room in self.room_registry.unvisited_rooms()
+            room for room in unvisited
             if room["room_id"] not in self._cross_room_attempted_ids
         ]
+        # "cross-room이 왜 아무것도 안 했는지"를 로그 없이는 확인할 방법이 없었다 -
+        # known_room_count가 1이면 애초에 room segmentation이 이 씬에서 방을 하나로만
+        # 봤다는 뜻(문 통과를 한 번도 못 했거나, 다른 방이 core 임계값을 못 넘었거나).
+        self.get_logger().info(
+            f"🚪 CROSS-ROOM check - known_rooms={self.room_registry.known_room_count()}, "
+            f"unvisited={len(unvisited)}, "
+            f"already_attempted_this_task={len(self._cross_room_attempted_ids)}, "
+            f"usable_candidates={len(candidates)}"
+        )
         if not candidates:
             return False
         self.submit_job(
