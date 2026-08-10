@@ -278,6 +278,7 @@ class SysNavNode(Node):
             self.coverage_planner.reset(pose)
         self.scene_graph.start_task(self.task_id, parsed)
         self.publish_object_markers()
+        self.goal_publisher.reset_step_markers()
 
         if mission_type == MISSION_INSTRUCTION_FOLLOWING:
             self.get_logger().info(
@@ -996,7 +997,9 @@ class SysNavNode(Node):
     # False로 남아 로봇이 계속 벽에 박혀있는 것을 막기 위한 진행도 기반 stuck 감지.
     # 목표까지 거리가 최근 EXPLORATION_STUCK_TIMEOUT_SEC 안에 EXPLORATION_STUCK_PROGRESS_M 이상
     # 줄어들지 않으면 도달 불가로 판단한다.
-    def _exploration_goal_unreachable(self, pose: dict) -> bool:
+    def _exploration_goal_unreachable(
+        self, pose: dict, timeout_sec: float = config.EXPLORATION_STUCK_TIMEOUT_SEC
+    ) -> bool:
         if self.current_goal is None:
             return False
         distance = math.hypot(
@@ -1012,7 +1015,7 @@ class SysNavNode(Node):
             self._exploration_goal_last_progress_time = now
             return False
         assert self._exploration_goal_last_progress_time is not None
-        return now - self._exploration_goal_last_progress_time >= config.EXPLORATION_STUCK_TIMEOUT_SEC
+        return now - self._exploration_goal_last_progress_time >= timeout_sec
 
     def destroy_node(self):
         self.worker.shutdown(wait=False, cancel_futures=True)

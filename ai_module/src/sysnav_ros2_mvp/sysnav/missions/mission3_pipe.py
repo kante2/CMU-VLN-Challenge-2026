@@ -399,6 +399,14 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
             theta = math.atan2(y - pose["y"], x - pose["x"])
         node.mission3_leg_queue = deque([{"x": x, "y": y, "theta": theta}])
 
+    # 이 step이 최종적으로 향하는 goal(다중 leg면 마지막 leg) - "success는 떴는데
+    # 실제로는 안 갔다"류 문제를 RViz에서 눈으로 확인하기 위한 디버그 마커.
+    final_leg = node.mission3_leg_queue[-1]
+    node.goal_publisher.add_step_goal_marker(
+        node.mission3_step_index, final_leg["x"], final_leg["y"],
+        label=f"goal{node.mission3_step_index + 1}",
+    )
+
     _publish_next_leg_waypoint(node)
 
 
@@ -416,18 +424,25 @@ def _publish_next_leg_waypoint(node) -> None:
 
 def _navigate_step(node, task: dict, pose: dict) -> None:
     if not node.goal_reached(pose):
-        if node._exploration_goal_unreachable(pose):
+        # mission3 goal(특히 is_stop=True인 채점 대상 정지점)은 exploration frontier
+        # hopping과 달리 개수가 1~3개뿐이고 하나하나가 다 중요하다 - exploration용
+        # EXPLORATION_STUCK_TIMEOUT_SEC(8초)를 그대로 쓰면 로봇이 실제로 접근 중인데도
+        # (회전-후-직진 구간, 우회 경로 등으로 8초 창 안에 10cm 진전이 안 잡히면) 도착
+        # 직전에 "도달 불가"로 오판해서 건너뛰고, 그런데도 로그/최종 상태는 "SUCCESS"로
+        # 찍혀서 실제로는 물체 앞까지 못 간 채 성공 처리되는 문제가 있었다(2026-08-10
+        # 실측: robot_pose가 거의 안 움직인 채 3 step 전부 정확히 8.0초 간격으로 SKIP됨).
+        if node._exploration_goal_unreachable(pose, timeout_sec=config.MISSION3_LEG_STUCK_TIMEOUT_SEC):
             node.get_logger().warning("⏭️ SKIP - mission3 leg waypoint unreachable, skipping ahead")
             if node.mission3_leg_queue:
                 node.mission3_leg_queue.popleft()
-            _advance_after_leg_hop(node, task, pose)
+            _advance_after_leg_hop(node, task, pose, reached=False)
         return
     if node.mission3_leg_queue:
         node.mission3_leg_queue.popleft()
-    _advance_after_leg_hop(node, task, pose)
+    _advance_after_leg_hop(node, task, pose, reached=True)
 
 
-def _advance_after_leg_hop(node, task: dict, pose: dict) -> None:
+def _advance_after_leg_hop(node, task: dict, pose: dict, reached: bool) -> None:
     if node.mission3_leg_queue:
         _publish_next_leg_waypoint(node)
         return
@@ -435,7 +450,8 @@ def _advance_after_leg_hop(node, task: dict, pose: dict) -> None:
     steps = task["steps"]
     step = steps[node.mission3_step_index]
     node.get_logger().info(
-        f"🚩 ARRIVED - mission3 step {node.mission3_step_index + 1}/{len(steps)} "
+        f"{'🚩 ARRIVED' if reached else '🚩⏭️ SKIPPED (goal never actually reached)'} - "
+        f"mission3 step {node.mission3_step_index + 1}/{len(steps)} "
         f"({'stop' if step['is_stop'] else 'waypoint'}), "
         f"robot_pose=({pose['x']:.2f}, {pose['y']:.2f})"
     )
