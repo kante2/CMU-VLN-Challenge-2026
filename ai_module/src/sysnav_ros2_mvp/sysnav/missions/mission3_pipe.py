@@ -383,11 +383,23 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
 
 
 def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> None:
+    # 이 step의 목표 지점으로 향하기 시작하는 시점 - 이전에 이 물체/지점을 찾느라
+    # PLAN_EXPLORATION으로 돌았다면 그때 채워진 exploration_route가 남아있을 수 있다.
+    # 지금부턴 mission3 leg만 goal_publisher를 통해 나가야 하므로 남은 탐사 경로를 비운다.
+    node.exploration_route.clear()
     if is_object_target:
-        x, y, theta = node.goal_publisher.object_approach_pose(pose, point)
+        x, y, _ = node.goal_publisher.object_approach_pose(pose, point)
     else:
         x, y = float(point[0]), float(point[1])
-        theta = math.atan2(y - pose["y"], x - pose["x"])
+    # object_approach_pose()가 원래 돌려주는 theta는 "도착해서 물체를 바라볼 방향"
+    # (목표->물체 방향)인데, 이동 방향(로봇 현재 위치->목표)이랑 무관하다. 실측(2026-08-10):
+    # 비슷한 거리(~2m)인데 이동방향 theta를 쓴 between-ref step은 5초 만에 도착한 반면,
+    # 이 "바라볼 방향" theta를 쓴 물체 접근 step 2개는 거의 못 움직인 채 30~45초 뒤
+    # SKIP됨 - /way_point_with_heading을 받는 base autonomy가 이 theta를 이동 중에도
+    # 유지하려다 이동 방향과 어긋나서 헤매는 것으로 보인다. README의 "go near"/"stop at"은
+    # 위치 도달만 요구하고 특정 방향을 바라보라는 요구가 없으므로, 항상 이동 방향으로
+    # theta를 통일한다.
+    theta = math.atan2(y - pose["y"], x - pose["x"])
 
     # base autonomy에 최종 goal 하나만 던지면, exploration이 짧은 hop들로 잘게 쪼개서
     # 이동하는 것과 달리 도중 장애물을 우회하는 몫이 전부 base autonomy의 로컬 제어기에만
