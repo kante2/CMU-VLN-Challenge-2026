@@ -71,6 +71,10 @@ class CoveragePlanner:
         # 다시 잡혔는지 - 유리창처럼 LiDAR가 절대 못 뚫는 frontier 옆에 서 있으면
         # 이 값이 계속 늘어난다 (anchor_max_revisits 참고).
         self._anchor_visit_counts: dict[tuple[int, int], int] = {}
+        # plan_direct_path()가 실패했을 때 "왜"인지 남기는 진단 정보(cross-room
+        # navigation처럼 두 점 사이 경로 하나만 구하는 호출용) - last_plan_diagnostics와
+        # 같은 목적이지만 plan_route()의 후보 샘플링과는 무관한 별도 호출이라 분리했다.
+        self.last_direct_path_diagnostics: dict = {}
 
     def describe_last_plan_failure(self) -> str:
         return ", ".join(f"{key}={value}" for key, value in self.last_plan_diagnostics.items())
@@ -662,14 +666,21 @@ class CoveragePlanner:
         A and B" 같은 negative constraint에서, base autonomy의 point-to-point 이동만
         으로는 특정 영역을 피해가도록 강제할 수 없기 때문에 우리가 직접 우회 경로를
         계산해서 여러 waypoint로 잘라 보낸다. 실패(경로 없음/맵 미준비)하면 None."""
+        diag: dict = {"goal_xy": tuple(float(v) for v in goal_xy)}
         with self._lock:
             grid = self.grid.copy()
             origin_ready = self.origin_x is not None
         if not origin_ready:
+            diag["reason"] = "origin_not_ready"
+            self.last_direct_path_diagnostics = diag
             return None
         start_cell = self.world_to_grid(start_pose["x"], start_pose["y"])
         goal_cell = self.world_to_grid(goal_xy[0], goal_xy[1])
+        diag["start_cell"] = start_cell
+        diag["goal_cell"] = goal_cell
         if start_cell is None or goal_cell is None:
+            diag["reason"] = "cell_out_of_map"
+            self.last_direct_path_diagnostics = diag
             return None
 
         occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
@@ -678,12 +689,35 @@ class CoveragePlanner:
         traversable = (grid == config.OCC_FREE) & (~inflated)
         if forbidden_mask is not None and forbidden_mask.shape == traversable.shape:
             traversable = traversable & (~forbidden_mask)
+        diag["traversable_cell_count"] = int(traversable.sum())
 
         start = self._nearest_traversable(traversable, *start_cell, radius=10)
         goal = self._nearest_traversable(traversable, *goal_cell, radius=10)
+        diag["start_snap"] = start
+        diag["goal_snap"] = goal
         if start is None or goal is None:
+            # 로봇 위치나 목표 지점(예: 방 centroid) 주변 10칸(2m) 안에 갈 수 있는
+            # 셀이 하나도 없다는 뜻 - 목표 지점이 가구 한복판이거나, 그 방 자체가
+            # 아직 거의 안 뚫려있을 때(=segmentation은 됐지만 내부가 대부분 unknown)
+            # 발생한다.
+            diag["reason"] = (
+                "start_snap_failed" if start is None and goal is not None else
+                "goal_snap_failed" if goal is None and start is not None else
+                "both_snap_failed"
+            )
+            self.last_direct_path_diagnostics = diag
             return None
         path = self._astar_path(traversable, start, goal)
         if path is None:
+            # start/goal 둘 다 traversable인 건 확인됐는데, 그 사이를 잇는 경로가
+            # 없다는 뜻 - 즉 로봇이 있는 영역과 목표 지점이 지금 알려진 free space
+            # 기준으로 서로 다른(연결 안 된) 덩어리에 있음. 진짜 통로가 너무 좁아서
+            # clearance 부풀리기 후 끊겼거나, 그 사이 미탐색 구간이 있어서 아직
+            # 연결이 안 잡힌 것.
+            diag["reason"] = "astar_no_path_start_goal_disconnected"
+            self.last_direct_path_diagnostics = diag
             return None
+        diag["reason"] = "ok"
+        diag["path_len"] = len(path)
+        self.last_direct_path_diagnostics = diag
         return self._leg_waypoints(path, inflated, final_theta, credited_len=0)

@@ -47,6 +47,15 @@ def select_job(node, task_id: int, task: dict, pose: dict, candidates: list[dict
                 "task_id": task_id, "room_id": room["room_id"], "path": path,
                 "failed_room_ids": tried_room_ids,
             }
+        # 왜 실패했는지("경로 없음"인지 "목표 지점 자체를 못 잡았는지")를 바로 로그로
+        # 남긴다 - 예전엔 "실패했다"만 알 수 있고 원인은 알 방법이 없었다.
+        diag = node.coverage_planner.last_direct_path_diagnostics
+        node.get_logger().warning(
+            f"🚪 CROSS-ROOM unreachable - room_id={room['room_id']} "
+            f"category={room.get('category')} reason={diag.get('reason')} "
+            f"start_snap={diag.get('start_snap')} goal_snap={diag.get('goal_snap')} "
+            f"traversable_cell_count={diag.get('traversable_cell_count')}"
+        )
         # 경로를 못 찾은 방도 "시도해봤음"으로 남겨서 호출 쪽이 다음 사이클에 또
         # 헛수고로 재시도하지 않게 한다 (A*로 못 가는 방이 갑자기 되지는 않음 - 맵이
         # 더 갱신되기 전까지는).
