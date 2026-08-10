@@ -100,6 +100,27 @@ class CoveragePlanner:
         with self._lock:
             return self.max_height.copy()
 
+    def is_area_known_free(self, x: float, y: float, radius_m: float = 0.5) -> bool:
+        """(x, y) 주변 radius_m 안 셀들이 전부 우리 occupancy grid 기준 OCC_FREE(이미
+        가본/스캔한 known free space)인지 본다. mission3가 goal을 base autonomy에 바로
+        위임할지, 아니면 먼저 그 방향으로 탐색해서 실제로 가까이 가볼지 판단하는 데 쓴다 -
+        base autonomy 자체 지형 스캔은 우리가 못 보지만, 로봇이 실제로 그 근처를 지나가서
+        우리 grid가 OCC_FREE로 채워졌다면 base autonomy 쪽도 같이 스캔했을 가능성이 높다
+        (둘 다 로봇에 달린 센서가 원천이므로)."""
+        with self._lock:
+            if self.origin_x is None:
+                return False
+            grid = self.grid
+            cell = self.world_to_grid(x, y)
+            if cell is None:
+                return False
+            radius_cells = max(1, int(round(radius_m / self.resolution)))
+            row, col = cell
+            r0, r1 = max(0, row - radius_cells), min(self.size_cells, row + radius_cells + 1)
+            c0, c1 = max(0, col - radius_cells), min(self.size_cells, col + radius_cells + 1)
+            region = grid[r0:r1, c0:c1]
+            return bool(region.size) and bool(np.all(region == config.OCC_FREE))
+
     def surface_point_mask(self, grid: np.ndarray) -> np.ndarray:
         """논문의 surface point set S(free/non-free 경계) - plan_route()가 candidate
         점수(wcov)를 매길 때 쓰는 것과 동일한 마스크. 디버그 시각화 전용으로 외부에

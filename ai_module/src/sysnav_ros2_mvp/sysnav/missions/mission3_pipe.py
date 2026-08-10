@@ -337,7 +337,13 @@ def _on_selection_result(node, result: dict) -> None:
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
-    _start_navigate_to_point(node, pose, selected["position"], is_object_target=True)
+    if not _start_navigate_to_point(node, pose, selected["position"], is_object_target=True):
+        node.get_logger().info(
+            "🧭 mission3 target resolved but its approach point is still unexplored - "
+            "exploring toward it before navigating"
+        )
+        with node.state_lock:
+            node.state = "PLAN_EXPLORATION"
 
 
 def _on_exploration_result(node, result: dict) -> None:
@@ -379,34 +385,45 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
-    _start_navigate_to_point(node, pose, point, is_object_target=False)
+    if not _start_navigate_to_point(node, pose, point, is_object_target=False):
+        # 지점은 계산됐지만 그 주변이 아직 미탐색 지역 - 계속 탐색해서 실제로
+        # 가까이 가본 뒤(다음 MISSION3_SELECT_STEP 재진입 때) 다시 시도한다.
+        with node.state_lock:
+            node.state = "PLAN_EXPLORATION"
 
 
-def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> None:
-    # 이 step의 목표 지점으로 향하기 시작하는 시점 - 이전에 이 물체/지점을 찾느라
-    # PLAN_EXPLORATION으로 돌았다면 그때 채워진 exploration_route가 남아있을 수 있다.
-    # 지금부턴 mission3 leg만 goal_publisher를 통해 나가야 하므로 남은 탐사 경로를 비운다.
-    node.exploration_route.clear()
+def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> bool:
+    """base autonomy에 goal을 위임할 수 있으면 위임하고 True, 아직 못 하면(=목표
+    근방이 우리 occupancy grid 기준으로도 미탐색 지역) False를 반환한다 - 호출부가
+    False일 때 PLAN_EXPLORATION으로 보내 계속 탐색하다 다시 이 step을 재시도하게
+    한다."""
     if is_object_target:
         x, y, _ = node.goal_publisher.object_approach_pose(pose, point)
     else:
         x, y = float(point[0]), float(point[1])
+
+    # 2026-08-11 실측(로그 + base autonomy 소스 + /way_point RViz 시각화로 직접 확인):
+    # base autonomy가 목표를 그대로 안 쓰고 자기 /terrain_map 기준으로 조정하는데, 로봇이
+    # 물리적으로 가본 적 없는 영역엔 조정할 데이터가 없어서 조정된 목표가 로봇 제자리
+    # 근처로 수렴해버려 - 그래서 우리 A*로 짧게 쪼개도, base autonomy에 그냥 통째로
+    # 위임해도 똑같이 실패했다(둘 다 "이 목표가 안전한지"를 결국 base autonomy 자신의
+    # 지형 스캔에 의존하기 때문). 우리 자체 occupancy grid도 로봇이 실제로 지나간 곳만
+    # OCC_FREE로 채워지므로(같은 로봇 센서가 출처), "우리 grid 기준 이미 아는 영역"인지를
+    # 대리 신호로 써서 게이트를 건다 - 모르는 영역이면 이미 잘 동작하는 exploration으로
+    # 먼저 그 근처를 실제로 지나가게 하고(전역 프론티어 탐색이라 결국 방 전체를 훑는다),
+    # 다음 MISSION3_SELECT_STEP 재진입 때 다시 이 함수를 불러 재확인한다.
+    if not node.coverage_planner.is_area_known_free(x, y):
+        return False
+
+    # 이 step의 목표 지점으로 향하기 시작하는 시점 - 이전에 이 물체/지점을 찾느라
+    # PLAN_EXPLORATION으로 돌았다면 그때 채워진 exploration_route가 남아있을 수 있다.
+    # 지금부턴 mission3 leg만 goal_publisher를 통해 나가야 하므로 남은 탐사 경로를 비운다.
+    node.exploration_route.clear()
     # object_approach_pose()가 원래 돌려주는 theta("도착해서 물체를 바라볼 방향")
-    # 대신 이동 방향을 쓴다. (참고: waypointConverter.cpp의 yawConfig=-1은 "도착 후
-    # 현재 yaw 유지"라 theta 자체는 실제 원인이 아니었다 - 진짜 원인은 아래 hop 분할
-    # 주석 참고. 그래도 README의 "go near"/"stop at"은 위치 도달만 요구하니 굳이
-    # 물체를 바라보라고 강제할 이유가 없어 이동 방향 theta로 유지한다.)
+    # 대신 이동 방향을 쓴다. README의 "go near"/"stop at"은 위치 도달만 요구하니 굳이
+    # 물체를 바라보라고 강제할 이유가 없다.
     theta = math.atan2(y - pose["y"], x - pose["x"])
 
-    # base autonomy(iros2026_system)엔 localPlanner+pathFollower+terrainAnalysis로
-    # 구성된 실시간 로컬 경로계획기가 이미 떠 있다(2026-08-11 프로세스 확인:
-    # localPlanner/pathFollower가 실제로 동작 중). waypointConverter는 우리 goal을
-    # 그쪽에 넘겨주는 얇은 중계 계층일 뿐이라, 목적지 하나만 던지면 장애물 회피와
-    # 실시간 재계획은 그쪽이 알아서 해주는 게 원래 설계다. 우리 자체 occupancy grid
-    # 기반 A*(coverage_planner.plan_direct_path)는 mission3 leg 이동엔 아예 안 쓴다 -
-    # 이 로컬 플래너의 판단을 방해하지 않도록, forbidden_mask("avoid the path" 절)가
-    # 있어도 우회 경로 계산 없이 목적지를 그대로 한 번에 던진다(그만큼 avoid 제약은
-    # 더 이상 강제되지 않고, base autonomy 자체의 장애물 회피에만 의존한다).
     node.mission3_leg_queue = deque([{"x": x, "y": y, "theta": theta}])
     node.mission3_leg_total = len(node.mission3_leg_queue)
 
@@ -419,10 +436,10 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     )
     node.get_logger().info(
         f"🧭 mission3 step {node.mission3_step_index + 1} leg: "
-        f"base autonomy에 직접 위임, final=({final_leg['x']:.2f}, {final_leg['y']:.2f})"
+        f"known-free 확인됨, base autonomy에 위임, final=({final_leg['x']:.2f}, {final_leg['y']:.2f})"
     )
-
     _publish_next_leg_waypoint(node)
+    return True
 
 
 def _publish_next_leg_waypoint(node) -> None:
