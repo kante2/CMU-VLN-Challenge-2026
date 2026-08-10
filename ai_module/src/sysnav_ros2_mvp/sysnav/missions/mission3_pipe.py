@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import math
 import re
-import time
 from collections import deque
 
 import numpy as np
@@ -337,13 +336,7 @@ def _on_selection_result(node, result: dict) -> None:
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
-    if not _start_navigate_to_point(node, pose, selected["position"], is_object_target=True):
-        node.get_logger().info(
-            "🧭 mission3 target resolved but its approach point is still unexplored - "
-            "exploring toward it before navigating"
-        )
-        with node.state_lock:
-            node.state = "PLAN_EXPLORATION"
+    _start_navigate_to_point(node, pose, selected["position"], is_object_target=True)
 
 
 def _on_exploration_result(node, result: dict) -> None:
@@ -385,120 +378,44 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
-    if not _start_navigate_to_point(node, pose, point, is_object_target=False):
-        # 지점은 계산됐지만 그 주변이 아직 미탐색 지역 - 계속 탐색해서 실제로
-        # 가까이 가본 뒤(다음 MISSION3_SELECT_STEP 재진입 때) 다시 시도한다.
-        with node.state_lock:
-            node.state = "PLAN_EXPLORATION"
+    _start_navigate_to_point(node, pose, point, is_object_target=False)
 
 
-def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> bool:
-    """base autonomy에 goal을 위임할 수 있으면 위임하고 True, 아직 못 하면(=목표
-    근방이 우리 occupancy grid 기준으로도 미탐색 지역) False를 반환한다 - 호출부가
-    False일 때 PLAN_EXPLORATION으로 보내 계속 탐색하다 다시 이 step을 재시도하게
-    한다."""
+def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> None:
+    """mission2(_on_selection_result의 target 이동)와 동일한 패턴: goal을 한 번
+    계산해서 그대로 던지고, 그다음은 _navigate_step이 도착할 때까지 기다린다.
+    우리 쪽에서 "도달 불가"를 자체 판단해서 건너뛰지 않는다 - 그 판단(stuck-timeout/
+    known-free gating)을 넣었다가 오히려 실제로 갈 수 있는데도 중간에 포기하거나
+    엉뚱하게 재탐색으로 빠지는 문제만 키웠다(2026-08-11). base autonomy가 알아서
+    갈 때까지 기다리는 게 mission2에서 이미 검증된 방식이다."""
     if is_object_target:
         x, y, _ = node.goal_publisher.object_approach_pose(pose, point)
     else:
         x, y = float(point[0]), float(point[1])
-
-    # 2026-08-11 실측(로그 + base autonomy 소스 + /way_point RViz 시각화로 직접 확인):
-    # base autonomy가 목표를 그대로 안 쓰고 자기 /terrain_map 기준으로 조정하는데, 로봇이
-    # 물리적으로 가본 적 없는 영역엔 조정할 데이터가 없어서 조정된 목표가 로봇 제자리
-    # 근처로 수렴해버려 - 그래서 우리 A*로 짧게 쪼개도, base autonomy에 그냥 통째로
-    # 위임해도 똑같이 실패했다(둘 다 "이 목표가 안전한지"를 결국 base autonomy 자신의
-    # 지형 스캔에 의존하기 때문). 우리 자체 occupancy grid도 로봇이 실제로 지나간 곳만
-    # OCC_FREE로 채워지므로(같은 로봇 센서가 출처), "우리 grid 기준 이미 아는 영역"인지를
-    # 대리 신호로 써서 게이트를 건다 - 모르는 영역이면 이미 잘 동작하는 exploration으로
-    # 먼저 그 근처를 실제로 지나가게 하고(전역 프론티어 탐색이라 결국 방 전체를 훑는다),
-    # 다음 MISSION3_SELECT_STEP 재진입 때 다시 이 함수를 불러 재확인한다.
-    if not node.coverage_planner.is_area_known_free(x, y):
-        return False
-
-    # 이 step의 목표 지점으로 향하기 시작하는 시점 - 이전에 이 물체/지점을 찾느라
-    # PLAN_EXPLORATION으로 돌았다면 그때 채워진 exploration_route가 남아있을 수 있다.
-    # 지금부턴 mission3 leg만 goal_publisher를 통해 나가야 하므로 남은 탐사 경로를 비운다.
-    node.exploration_route.clear()
     # object_approach_pose()가 원래 돌려주는 theta("도착해서 물체를 바라볼 방향")
     # 대신 이동 방향을 쓴다. README의 "go near"/"stop at"은 위치 도달만 요구하니 굳이
     # 물체를 바라보라고 강제할 이유가 없다.
     theta = math.atan2(y - pose["y"], x - pose["x"])
 
-    node.mission3_leg_queue = deque([{"x": x, "y": y, "theta": theta}])
-    node.mission3_leg_total = len(node.mission3_leg_queue)
-
-    # 이 step의 최종 goal - "success는 떴는데 실제로는 안 갔다"류 문제를 RViz에서
-    # 눈으로 확인하기 위한 디버그 마커.
-    final_leg = node.mission3_leg_queue[-1]
+    node.goal_publisher.publish(x, y, theta)
+    node.current_goal = {"x": x, "y": y, "theta": theta, "type": "mission3_leg"}
     node.goal_publisher.add_step_goal_marker(
-        node.mission3_step_index, final_leg["x"], final_leg["y"],
-        label=f"goal{node.mission3_step_index + 1}",
+        node.mission3_step_index, x, y, label=f"goal{node.mission3_step_index + 1}",
     )
-    node.get_logger().info(
-        f"🧭 mission3 step {node.mission3_step_index + 1} leg: "
-        f"known-free 확인됨, base autonomy에 위임, final=({final_leg['x']:.2f}, {final_leg['y']:.2f})"
-    )
-    _publish_next_leg_waypoint(node)
-    return True
-
-
-def _publish_next_leg_waypoint(node) -> None:
-    if not node.mission3_leg_queue:
-        return
-    goal = node.mission3_leg_queue[0]
-    node.goal_publisher.publish(goal["x"], goal["y"], goal.get("theta", 0.0))
-    node.current_goal = {**goal, "type": "mission3_leg"}
-    node._exploration_goal_best_distance_m = None
-    node._exploration_goal_last_progress_time = time.monotonic()
     with node.state_lock:
         node.state = "MISSION3_NAVIGATE_STEP"
-    hop_number = node.mission3_leg_total - len(node.mission3_leg_queue) + 1
     node.get_logger().info(
-        f"➡️ mission3 hop {hop_number}/{node.mission3_leg_total} -> "
-        f"({goal['x']:.2f}, {goal['y']:.2f})"
+        f"🧭 mission3 step {node.mission3_step_index + 1} -> goal=({x:.2f}, {y:.2f}, {theta:.2f})"
     )
 
 
 def _navigate_step(node, task: dict, pose: dict) -> None:
     if not node.goal_reached(pose):
-        # mission3 goal(특히 is_stop=True인 채점 대상 정지점)은 exploration frontier
-        # hopping과 달리 개수가 1~3개뿐이고 하나하나가 다 중요하다 - exploration용
-        # EXPLORATION_STUCK_TIMEOUT_SEC(8초)를 그대로 쓰면 로봇이 실제로 접근 중인데도
-        # (회전-후-직진 구간, 우회 경로 등으로 8초 창 안에 10cm 진전이 안 잡히면) 도착
-        # 직전에 "도달 불가"로 오판해서 건너뛰고, 그런데도 로그/최종 상태는 "SUCCESS"로
-        # 찍혀서 실제로는 물체 앞까지 못 간 채 성공 처리되는 문제가 있었다(2026-08-10
-        # 실측: robot_pose가 거의 안 움직인 채 3 step 전부 정확히 8.0초 간격으로 SKIP됨).
-        if node._exploration_goal_unreachable(pose, timeout_sec=config.MISSION3_LEG_STUCK_TIMEOUT_SEC):
-            hop_number = node.mission3_leg_total - len(node.mission3_leg_queue) + 1
-            goal = node.current_goal or {}
-            distance = math.hypot(
-                float(goal.get("x", pose["x"])) - pose["x"],
-                float(goal.get("y", pose["y"])) - pose["y"],
-            )
-            node.get_logger().warning(
-                f"⏭️ SKIP - mission3 hop {hop_number}/{node.mission3_leg_total} unreachable "
-                f"(still {distance:.2f}m from ({goal.get('x', 0):.2f}, {goal.get('y', 0):.2f})), "
-                f"skipping ahead"
-            )
-            if node.mission3_leg_queue:
-                node.mission3_leg_queue.popleft()
-            _advance_after_leg_hop(node, task, pose, reached=False)
         return
-    if node.mission3_leg_queue:
-        node.mission3_leg_queue.popleft()
-    _advance_after_leg_hop(node, task, pose, reached=True)
-
-
-def _advance_after_leg_hop(node, task: dict, pose: dict, reached: bool) -> None:
-    if node.mission3_leg_queue:
-        _publish_next_leg_waypoint(node)
-        return
-
     steps = task["steps"]
     step = steps[node.mission3_step_index]
     node.get_logger().info(
-        f"{'🚩 ARRIVED' if reached else '🚩⏭️ SKIPPED (goal never actually reached)'} - "
-        f"mission3 step {node.mission3_step_index + 1}/{len(steps)} "
+        f"🚩 ARRIVED - mission3 step {node.mission3_step_index + 1}/{len(steps)} "
         f"({'stop' if step['is_stop'] else 'waypoint'}), "
         f"robot_pose=({pose['x']:.2f}, {pose['y']:.2f})"
     )

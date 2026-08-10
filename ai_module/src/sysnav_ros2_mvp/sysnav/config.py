@@ -41,14 +41,6 @@ GOAL_REACHED_DISTANCE_M = 0.35
 # (벽 너머 등 실제로는 갈 수 없는 waypoint에 로봇이 영원히 박혀있는 것을 막기 위한 안전장치)
 EXPLORATION_STUCK_TIMEOUT_SEC = 8.0
 EXPLORATION_STUCK_PROGRESS_M = 0.10
-# mission3(Instruction-Following) leg 이동은 exploration frontier hopping과 성격이 다르다 -
-# 후보가 수십 개라 하나가 느리면 빨리 포기하고 다음으로 넘어가는 게 이득인 exploration과 달리,
-# mission3는 goal이 1~3개뿐이고 그중 is_stop=True는 채점 대상 정지점이라 하나하나가 중요하다.
-# EXPLORATION_STUCK_TIMEOUT_SEC(8초)를 그대로 썼더니 회전-후-직진 구간이나 우회 경로 때문에
-# 8초 창 안에 10cm 진전이 안 잡혀서 실제로 접근 중인데도 도착 직전에 "도달 불가"로 오판하고
-# 건너뛰는 사례가 실측됨(2026-08-10, 3 step 전부 정확히 8.0초 만에 SKIP, robot_pose는 거의
-# 안 움직인 채 그대로 SUCCESS 처리). mission3 leg에는 훨씬 여유 있는 timeout을 따로 쓴다.
-MISSION3_LEG_STUCK_TIMEOUT_SEC = 30.0
 TARGET_STANDOFF_DISTANCE_M = 0.90
 KEEP_MEMORY_BETWEEN_TASKS = True
 

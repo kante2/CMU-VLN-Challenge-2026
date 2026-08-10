@@ -180,8 +180,6 @@ class SysNavNode(Node):
         # 여러 목적지를 순서대로 처리해야 해서 mission2/1과 달리 진행 인덱스가
         # 필요하다. 다른 미션에서는 안 쓰이므로 매 새 질문마다 리셋만 하면 무해하다.
         self.mission3_step_index = 0
-        self.mission3_leg_queue = deque()
-        self.mission3_leg_total = 0
         self.mission3_forbidden_mask = None
 
         # Cross-room navigation(rooms/cross_room_navigator.py) - 이번 task 안에서
@@ -264,8 +262,6 @@ class SysNavNode(Node):
             self.exploration_route.clear()
             self.last_processed_image_stamp = -1.0
             self.mission3_step_index = 0
-            self.mission3_leg_queue.clear()
-            self.mission3_leg_total = 0
             self.mission3_forbidden_mask = None
             self._cross_room_attempted_ids = set()
             self.task_start_time = time.monotonic()
