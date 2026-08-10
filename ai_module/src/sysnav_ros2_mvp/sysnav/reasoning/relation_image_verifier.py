@@ -127,3 +127,74 @@ class RelationImageVerifier:
         except Exception as error:
             self._logger.warning(f"Relation image verification skipped (unverified, not fail-open): {error}")
             return set()
+
+    def rank_nearest(self, candidates: list[dict], reference_category: str) -> int | None:
+        """"nearest"/"closest"는 최상급(비교) relation이라 verify()처럼 후보마다
+        독립적으로 yes/no만 물어보면 안 된다 - 예를 들어 bedside table이 2개 있고
+        둘 다 사진에 창문이 보이면 둘 다 "yes"가 나와서 어느 게 진짜 더 가까운지
+        구분이 안 된다. 이 메서드는 후보 전부를 한 번에 보여주고 VLM에게 직접
+        비교시켜서 가장 가까운 후보 하나만 고른다. reference_category가 참조 물체를
+        3D로 grounding 못 해서(0 point) 거리 계산 자체가 불가능할 때(즉 verify()와
+        같은 상황)만 쓴다. 반환: 승자 object_id, 실패/불확실하면 None."""
+        usable = [
+            candidate for candidate in candidates
+            if isinstance(candidate.get("context_image"), np.ndarray)
+            and candidate["context_image"].size
+        ]
+        if len(usable) < 2:
+            return None
+        try:
+            self._load()
+            from google.genai import types
+
+            contents: list[object] = [
+                "Each image below shows a different candidate object and its surrounding "
+                f"context. Decide which single candidate is closest to a {reference_category} "
+                f"visible in its own photo. If a candidate's photo doesn't show a "
+                f"{reference_category} at all, it cannot be the answer. If none of the "
+                f"candidates show a {reference_category}, set reference_visible_in_any to "
+                "false.\n"
+                + json.dumps([{"object_id": int(candidate["object_id"])} for candidate in usable], ensure_ascii=False)
+            ]
+            for candidate in usable:
+                contents.append(f"object_id={int(candidate['object_id'])} image:")
+                contents.append(
+                    types.Part.from_bytes(
+                        data=self._jpeg(candidate["context_image"]), mime_type="image/jpeg"
+                    )
+                )
+
+            response = self._client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                    response_schema={
+                        "type": "object",
+                        "properties": {
+                            "object_id": {"type": "integer"},
+                            "reference_visible_in_any": {"type": "boolean"},
+                        },
+                        "required": ["object_id", "reference_visible_in_any"],
+                    },
+                ),
+            )
+            if not response.text:
+                raise RuntimeError("Gemini가 빈 응답을 반환함")
+            result = json.loads(response.text)
+            if not result.get("reference_visible_in_any"):
+                self._logger.info(
+                    f"Relation image nearest-ranking ({reference_category}): "
+                    "reference not visible in any candidate"
+                )
+                return None
+            allowed = {int(candidate["object_id"]) for candidate in usable}
+            winner = int(result["object_id"])
+            if winner not in allowed:
+                raise RuntimeError(f"Gemini가 후보 밖의 object_id를 반환함: {winner}")
+            self._logger.info(f"Relation image nearest-ranking ({reference_category}): winner={winner}")
+            return winner
+        except Exception as error:
+            self._logger.warning(f"Relation image nearest-ranking skipped (not fail-open): {error}")
+            return None

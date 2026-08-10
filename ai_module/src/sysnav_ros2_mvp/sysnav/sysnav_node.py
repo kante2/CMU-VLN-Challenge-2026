@@ -518,13 +518,23 @@ class SysNavNode(Node):
             # 실패해서(approximate 등급조차 못 만듦) 3D 위치 자체가 없기 때문.
             image_verified_ids: set[int] = set()
             if candidates:
-                # 참조 물체를 3D로 잡을 필요 없이, 후보 자신의 사진만으로 "이 사진에
-                # 참조 물체가 보이는가"를 VLM에게 직접 확인받는다 (attribute_verifier와
-                # 같은 on-demand 이미지 판정 패턴).
                 first_relation, _, first_reference = effective_relation_chain(task)[0]
-                image_verified_ids = self.relation_image_verifier.verify(
-                    candidates, first_relation, first_reference
-                )
+                if first_relation in ("nearest", "closest") and len(candidates) > 1:
+                    # "nearest"는 최상급(비교) relation이라 후보마다 독립적으로
+                    # yes/no만 물으면 안 된다 - bedside table이 2개 있고 둘 다 사진에
+                    # 창문이 보이면 verify()는 둘 다 통과시켜버려서 어느 게 진짜
+                    # 가까운지 못 가린다. 후보 전부를 한 번에 놓고 VLM이 직접
+                    # 비교해서 하나만 고르게 한다.
+                    winner_id = self.relation_image_verifier.rank_nearest(candidates, first_reference)
+                    if winner_id is not None:
+                        image_verified_ids = {winner_id}
+                else:
+                    # 참조 물체를 3D로 잡을 필요 없이, 후보 자신의 사진만으로 "이 사진에
+                    # 참조 물체가 보이는가"를 VLM에게 직접 확인받는다 (attribute_verifier와
+                    # 같은 on-demand 이미지 판정 패턴).
+                    image_verified_ids = self.relation_image_verifier.verify(
+                        candidates, first_relation, first_reference
+                    )
             if image_verified_ids:
                 candidates = [
                     candidate for candidate in candidates
