@@ -111,6 +111,12 @@ GROUNDING_MAX_OBJECT_POINTS = 2048
 # 관측이 들어오면 지수이동평균(_merge())으로 자연스럽게 정밀한 위치로 수렴한다.
 GROUNDING_MIN_POINTS_APPROXIMATE = 1
 GROUNDING_APPROXIMATE_DEFAULT_SIZE_M = 0.3
+# crop_image(attribute_verifier/gemini_selector용)는 배경을 회색으로 지운 물체
+# 단독 이미지라 relation 판정("이 물체 주변에 참조 물체가 보이는가",
+# reasoning/relation_image_verifier.py)엔 못 쓴다 - 배경 자체가 없으니까. bbox
+# 한 변 길이의 이 비율만큼 여유를 두고, 배경은 안 지운 채 잘라내는
+# context_image를 따로 만든다.
+CONTEXT_CROP_MARGIN_RATIO = 1.0
 
 ASSOCIATION_MAX_DISTANCE_M = 1.20
 ASSOCIATION_DISTANCE_SIGMA_M = 0.60

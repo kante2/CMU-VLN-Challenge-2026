@@ -57,8 +57,12 @@ class ObjectMemory:
             "bbox_3d_min": tuple(observation.get("bbox_3d_min", (0, 0, 0))),
             "bbox_3d_max": tuple(observation.get("bbox_3d_max", (0, 0, 0))),
             "extent_3d": tuple(observation.get("extent_3d", (0, 0, 0))),
-            # 대표 이미지
+            # 대표 이미지 - 배경을 지운 물체 단독 사진(속성 판정용). 반면 context_image는
+            # 배경을 안 지운 채 여유를 두고 자른 사진(relation_image_verifier.py처럼
+            # "주변에 참조 물체가 보이는가"를 판단할 때 씀 - representative_image엔
+            # 배경 자체가 없어서 못 씀).
             "representative_image": observation.get("crop_image").copy() if isinstance(observation.get("crop_image"), np.ndarray) else None,
+            "context_image": observation.get("context_image").copy() if isinstance(observation.get("context_image"), np.ndarray) else None,
             "representative_confidence": float(observation.get("confidence", 0.0)),
             # 대표 이미지의 confidence
             "confidence": float(observation.get("confidence", 0.0)),
@@ -137,6 +141,9 @@ class ObjectMemory:
         if isinstance(crop, np.ndarray) and crop.size and confidence >= node["representative_confidence"]:
             node["representative_image"] = crop.copy()
             node["representative_confidence"] = confidence
+        context = observation.get("context_image")
+        if isinstance(context, np.ndarray) and context.size and confidence >= node["representative_confidence"]:
+            node["context_image"] = context.copy()
 
     def update(self, observations: list[dict], timestamp: float | None = None) -> list[int]:
         timestamp = time.time() if timestamp is None else float(timestamp)

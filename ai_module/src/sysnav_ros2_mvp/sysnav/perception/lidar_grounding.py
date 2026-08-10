@@ -74,6 +74,23 @@ class PanoramaLidarGrounder:
             return crop
         return np.where(crop_mask[..., None], crop, np.full_like(crop, 127))
 
+    @staticmethod
+    def _context_crop(image_rgb: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray:
+        """attribute_verifier/gemini_selector가 쓰는 _crop()과 달리, 배경을 안 지우고
+        bbox 주변에 여유(margin)를 둬서 잘라낸다 - relation_image_verifier.py처럼
+        "이 물체 주변에 참조 물체가 보이는가"를 판단하려면 배경(주변 맥락)이 반드시
+        보여야 하는데, _crop()의 마스크 바깥 회색 처리는 그 배경을 통째로 지워버려서
+        애초에 참조 물체가 사진에 나타날 수가 없었다."""
+        height, width = image_rgb.shape[:2]
+        x1, y1, x2, y2 = bbox
+        margin_x = int(round((x2 - x1) * config.CONTEXT_CROP_MARGIN_RATIO))
+        margin_y = int(round((y2 - y1) * config.CONTEXT_CROP_MARGIN_RATIO))
+        x1 = max(0, x1 - margin_x)
+        y1 = max(0, y1 - margin_y)
+        x2 = min(width, x2 + margin_x)
+        y2 = min(height, y2 + margin_y)
+        return image_rgb[y1:y2, x1:x2].copy()
+
     # self.grounder.ground(image_rgb, points_sensor, segmented, robot_pose) -> list[dict]
     # observations = self.grounder.ground
     # SAM2가 만든 2D 객체 마스크 안에 들어오는 LiDAR 포인트만 골라서, 객체의 3D 위치와 크기를 계산하는 함수
@@ -169,6 +186,7 @@ class PanoramaLidarGrounder:
                 "bbox_3d_max": tuple(float(v) for v in maximum),
                 "extent_3d": tuple(float(v) for v in (maximum - minimum)),
                 "crop_image": self._crop(image_rgb, segmented["mask"], segmented["bbox"]),
+                "context_image": self._context_crop(image_rgb, segmented["bbox"]),
                 "num_points": int(len(object_points)),
                 "grounding_quality": grounding_quality,
             })

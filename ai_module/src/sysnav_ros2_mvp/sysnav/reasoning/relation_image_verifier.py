@@ -54,11 +54,17 @@ class RelationImageVerifier:
         """candidates: object_memory 노드 리스트(representative_image 포함).
         relation/reference_category(예: "nearest"/"window")가 각 후보 자신의 대표
         이미지에서 시각적으로 참인지 VLM에게 직접 확인받는다 - reference 물체를 3D로
-        grounding할 필요가 아예 없다. 반환: 통과한 object_id 집합(실패하면 빈 set)."""
+        grounding할 필요가 아예 없다. 반환: 통과한 object_id 집합(실패하면 빈 set).
+
+        반드시 context_image를 써야 한다 - representative_image(attribute_verifier가
+        쓰는 것)는 배경을 회색으로 지운 물체 단독 사진이라 애초에 참조 물체가 그
+        사진 안에 나타날 수가 없다(항상 확인 불가로 실패하게 됨). context_image는
+        같은 detection에서 배경을 안 지우고 여유를 두고 자른 사진이라 주변 맥락이
+        보인다."""
         usable = [
             candidate for candidate in candidates
-            if isinstance(candidate.get("representative_image"), np.ndarray)
-            and candidate["representative_image"].size
+            if isinstance(candidate.get("context_image"), np.ndarray)
+            and candidate["context_image"].size
         ]
         if not usable:
             return set()
@@ -79,7 +85,7 @@ class RelationImageVerifier:
                 contents.append(f"object_id={int(candidate['object_id'])} image:")
                 contents.append(
                     types.Part.from_bytes(
-                        data=self._jpeg(candidate["representative_image"]), mime_type="image/jpeg"
+                        data=self._jpeg(candidate["context_image"]), mime_type="image/jpeg"
                     )
                 )
 
