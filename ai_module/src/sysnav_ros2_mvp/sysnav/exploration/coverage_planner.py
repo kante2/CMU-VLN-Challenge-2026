@@ -191,6 +191,68 @@ class CoveragePlanner:
             radius = max(1, int(round(0.35 / self.resolution)))
             self.grid[max(0, rr - radius):min(self.size_cells, rr + radius + 1), max(0, cc - radius):min(self.size_cells, cc + radius + 1)] = config.OCC_FREE
 
+    def _build_traversable(self, grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """occupancy grid -> (traversable, inflated).
+
+        traversable: 로봇 몸체(ROBOT_CLEARANCE_M)를 부풀린 장애물을 뺀 free 셀.
+          unknown 셀은 traversable이 아니다 - "아직 안 본 곳"을 통과 가능하다고
+          가정하면 벽 너머로 경로가 나버린다.
+        inflated: hop 사이 line-of-sight 판정에 쓰는 차단 마스크(같은 clearance).
+
+        plan_route()/plan_direct_path()/hop_still_reachable()이 똑같이 쓰던 3줄이라
+        하나로 모았다 - 셋이 서로 다른 clearance를 쓰기 시작하면 "계획은 됐는데
+        검사에서 막힌다"는 식으로 조용히 어긋난다.
+        """
+        occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
+        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
+        inflated = cv2.dilate(
+            occupied, np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8)
+        ).astype(bool)
+        traversable = (grid == config.OCC_FREE) & (~inflated)
+        return traversable, inflated
+
+    def hop_still_reachable(self, from_xy: tuple[float, float], to_xy: tuple[float, float]) -> bool:
+        """"지금 향하고 있는 hop이 최신 지도 기준으로 아직 유효한가"를 싸게 판정한다.
+
+        주행 중(control_loop, 0.2초)마다 불리는 검사라 A*를 돌리지 않고 두 가지만 본다:
+          1. hop 셀이 아직 traversable인가 (주행 중 그 자리가 occupied로 밝혀졌을 수 있음)
+          2. 로봇 현재 위치 -> hop 직선이 아직 뚫려 있는가 (Bresenham 1회)
+
+        2번이 깨졌다는 건 base autonomy가 직선으로는 못 간다는 뜻이고, 그때가 우리가
+        우회 hop을 새로 계산해줘야 하는 시점이다. 여기서 False가 나와도 "도달 불가"로
+        확정하는 게 아니라 재계획을 트리거할 뿐이므로(A*가 우회로를 찾으면 그대로 진행),
+        조금 보수적으로 판정해도 목적지를 잃지 않는다.
+
+        맵이 아직 준비 안 됐거나 좌표가 맵 밖이면 True(=판단 보류)를 돌려준다 - 정보가
+        없다는 이유로 재계획을 트리거하면 안 된다.
+        """
+        with self._lock:
+            grid = self.grid.copy()
+            origin_ready = self.origin_x is not None
+        if not origin_ready:
+            return True
+
+        from_cell = self.world_to_grid(from_xy[0], from_xy[1])
+        to_cell = self.world_to_grid(to_xy[0], to_xy[1])
+        if from_cell is None or to_cell is None:
+            return True
+
+        traversable, inflated = self._build_traversable(grid)
+
+        # hop 자체가 막혔는지. 정확히 그 셀만 보면 셀 경계 문제로 과민해지므로,
+        # plan_direct_path()의 goal snap과 같은 반경(10셀=2m) 안에 갈 수 있는 셀이
+        # 하나도 없을 때만 막힌 것으로 본다.
+        if self._nearest_traversable(traversable, *to_cell, radius=10) is None:
+            return False
+
+        # 로봇이 지금 clearance 버퍼 안에 있으면(벽에 바짝 붙어 회전 중 등) LOS 시작점이
+        # 막힌 것으로 나와 매번 False가 된다 - 시작점은 검사에서 제외되도록 스냅한다.
+        start = self._nearest_traversable(traversable, *from_cell, radius=10)
+        if start is None:
+            return True
+
+        return self._line_of_sight(inflated, start, to_cell)
+
     @staticmethod
     def _nearest_traversable(traversable: np.ndarray, row: int, col: int, radius: int = 8) -> tuple[int, int] | None:
         rows, cols = traversable.shape
@@ -449,10 +511,8 @@ class CoveragePlanner:
         robot_cell = self.world_to_grid(robot_pose["x"], robot_pose["y"])
         if robot_cell is None:
             return self._fail(diag, "robot_cell_out_of_map")
+        traversable, inflated = self._build_traversable(grid)
         occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
-        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
-        inflated = cv2.dilate(occupied, np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8)).astype(bool)
-        traversable = (grid == config.OCC_FREE) & (~inflated)
         start = self._nearest_traversable(traversable, *robot_cell, radius=10)
         diag["robot_cell"] = robot_cell
         if start is None:
@@ -688,10 +748,7 @@ class CoveragePlanner:
             self.last_direct_path_diagnostics = diag
             return None
 
-        occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
-        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
-        inflated = cv2.dilate(occupied, np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8)).astype(bool)
-        traversable = (grid == config.OCC_FREE) & (~inflated)
+        traversable, inflated = self._build_traversable(grid)
         if forbidden_mask is not None and forbidden_mask.shape == traversable.shape:
             traversable = traversable & (~forbidden_mask)
         diag["traversable_cell_count"] = int(traversable.sum())

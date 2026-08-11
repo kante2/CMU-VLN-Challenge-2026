@@ -382,12 +382,21 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
 
 
 def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> None:
-    """mission2(_on_selection_result의 target 이동)와 동일한 패턴: goal을 한 번
-    계산해서 그대로 던지고, 그다음은 _navigate_step이 도착할 때까지 기다린다.
-    우리 쪽에서 "도달 불가"를 자체 판단해서 건너뛰지 않는다 - 그 판단(stuck-timeout/
-    known-free gating)을 넣었다가 오히려 실제로 갈 수 있는데도 중간에 포기하거나
-    엉뚱하게 재탐색으로 빠지는 문제만 키웠다(2026-08-11). base autonomy가 알아서
-    갈 때까지 기다리는 게 mission2에서 이미 검증된 방식이다."""
+    """mission2와 동일하게 node.start_target_navigation()으로 이동한다 - 목적지 좌표
+    하나를 던지고 마는 대신, 현재 지도로 A* 경로를 만들어 hop 단위로 가면서 hop에
+    도착할 때마다(그리고 주행 중 hop이 막히면 즉시) 경로를 다시 계산한다.
+
+    이력: 한때 우리 쪽 "도달 불가" 판단(stuck-timeout/known-free gating)을 넣었다가
+    실제로 갈 수 있는 목표를 중간에 포기하는 문제만 키워서 전부 걷어냈었다(2026-08-11,
+    ad323c7/a6a7fa7). 그런데 그 상태에서는 반대로, 목적지가 가구 옆이라 도착 판정
+    반경(0.35m) 안에 절대 못 들어가는 경우 로봇은 멈춰 있는데 step이 영원히 넘어가지
+    않았다(실측: 0.43m 남기고 7분 정지, step 0/2). 지금 방식은 그때와 달리 "포기"가
+    아니라 "재계획"이 기본이고, 포기는 A*가 경로 없음을 반환할 때만 한다.
+
+    global_forbidden("avoiding the path between A and B")도 여기서 경로 계획에 넘긴다 -
+    base autonomy의 point-to-point 이동으로는 특정 영역을 피하도록 강제할 수 없어서,
+    이 제약은 우리가 직접 우회 경로를 만들어야만 지켜진다.
+    """
     if is_object_target:
         x, y, _ = node.goal_publisher.object_approach_pose(pose, point)
     else:
@@ -397,21 +406,38 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     # 물체를 바라보라고 강제할 이유가 없다.
     theta = math.atan2(y - pose["y"], x - pose["x"])
 
-    node.goal_publisher.publish(x, y, theta)
-    node.current_goal = {"x": x, "y": y, "theta": theta, "type": "mission3_leg"}
     node.goal_publisher.add_step_goal_marker(
         node.mission3_step_index, x, y, label=f"goal{node.mission3_step_index + 1}",
     )
-    with node.state_lock:
-        node.state = "MISSION3_NAVIGATE_STEP"
     node.get_logger().info(
         f"🧭 mission3 step {node.mission3_step_index + 1} -> goal=({x:.2f}, {y:.2f}, {theta:.2f})"
     )
+    # goal을 실제로 발행한 뒤에 state를 옮긴다(mission2와 같은 순서) - 먼저 옮기면
+    # start_target_navigation()이 예외로 죽었을 때 goal 없이 NAVIGATE_STEP에 들어가서
+    # 직전 step의 stale goal로 도착 판정이 날 수 있다.
+    node.start_target_navigation(
+        pose, (x, y), theta, forbidden_mask=node.mission3_forbidden_mask,
+    )
+    with node.state_lock:
+        node.state = "MISSION3_NAVIGATE_STEP"
 
 
 def _navigate_step(node, task: dict, pose: dict) -> None:
-    if not node.goal_reached(pose):
+    outcome = node.step_target_navigation(pose)
+    if outcome == "driving":
         return
+    if outcome == "unreachable":
+        # 지금 지도로는 이 step의 목적지까지 갈 길이 없다 - 맵을 더 뚫고 다시 시도한다.
+        # step_index는 올리지 않으므로 탐색 후 같은 step을 다시 resolve한다.
+        node.clear_target_navigation()
+        with node.state_lock:
+            node.state = "PLAN_EXPLORATION"
+        node.get_logger().warning(
+            f"🧭 mission3 step {node.mission3_step_index + 1} unreachable for now - "
+            f"back to exploration to open up the map"
+        )
+        return
+
     steps = task["steps"]
     step = steps[node.mission3_step_index]
     node.get_logger().info(
@@ -419,6 +445,7 @@ def _navigate_step(node, task: dict, pose: dict) -> None:
         f"({'stop' if step['is_stop'] else 'waypoint'}), "
         f"robot_pose=({pose['x']:.2f}, {pose['y']:.2f})"
     )
+    node.clear_target_navigation()
     node.mission3_step_index += 1
     with node.state_lock:
         node.state = "MISSION3_SELECT_STEP"

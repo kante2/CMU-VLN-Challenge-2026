@@ -42,6 +42,44 @@ GOAL_REACHED_DISTANCE_M = 0.35
 EXPLORATION_STUCK_TIMEOUT_SEC = 8.0
 EXPLORATION_STUCK_PROGRESS_M = 0.10
 TARGET_STANDOFF_DISTANCE_M = 0.90
+
+# 확정된 목적지로 가는 주행(mission2 NAVIGATE_TARGET)의 경로 재계획 설정.
+# 탐색(EXPLORATION_*)과 값을 공유하지 않고 따로 두는 이유: 탐색 쪽 값은 "이 후보는
+# 포기하고 다음 후보로 넘어간다"는 판단용이라 짧아도 되지만(8초), 확정된 목적지는
+# 포기할 대상이 아니라 끝까지 가야 하는 곳이라 훨씬 보수적이어야 한다.
+#
+# 목적지까지 A* 경로를 이 간격으로 잘라 hop을 만든다. 탐색용 3.0m보다 짧게 두는 이유는
+# 접근 주행이라 마지막 구간에서 경로가 촘촘해야 재계획 기회도 자주 생기기 때문.
+TARGET_PATH_WAYPOINT_SPACING_M = 1.5
+
+# 주 재계획 트리거는 (1) hop 도착 (2) hop line-of-sight 차단이고, 이 타임아웃은 둘 다
+# 안 걸리는 경우(지도상으론 멀쩡한데 base autonomy가 실제로 못 가는 경우)만 잡는
+# 최후 백스톱이다. 8초(EXPLORATION_STUCK_TIMEOUT_SEC)는 실제로 갈 수 있는 목표를
+# 성급하게 포기하게 만들어서(2026-08-11) 여기서는 훨씬 길게 잡는다.
+TARGET_REPLAN_STUCK_TIMEOUT_SEC = 30.0
+
+# 진전 없이(=hop 도착 없이) 연속으로 재계획한 횟수 상한. 넘으면 지금 지도로는 못 가는
+# 것으로 보고 탐사 재계획으로 넘긴다.
+#
+# 주의: hop 도착으로 인한 재계획은 여기에 안 센다(그건 정상 진행이다). 1.5m마다 한 번씩
+# 도착하므로 10m만 가도 6~7번인데 그걸 세면 정상 주행 중에 상한을 넘어버린다.
+TARGET_REPLAN_MAX_COUNT = 3
+
+# "목적지 판정 반경(GOAL_REACHED_DISTANCE_M) 밖이지만 지금 지도로는 더 가까이 갈 수 없다"고
+# 확인됐을 때, 목적지에서 이 거리 안이면 도달로 인정한다.
+#
+# 필요한 이유: 목적지가 가구 바로 옆이면 plan_direct_path()가 목표를 통행 가능한 셀로
+# 최대 2m(_nearest_traversable radius=10) 스냅하므로, 실제 목적지까지 0.35m 안으로는
+# 절대 못 들어간다. 그 상태로 도착 판정을 고집하면 로봇은 멈춰 있는데 미션은 영원히
+# 진행되지 않는다(2026-08-11 mission3 실측: 0.43m 남기고 7분 정지, step 0/2).
+# 스냅 반경 2.0m보다 보수적으로 잡아서, 정말 엉뚱한 곳에서 끝났다고 우기지 않게 한다.
+TARGET_ARRIVAL_FALLBACK_MAX_M = 1.5
+
+# 재계획 최소 간격(초). hop이 막혔다는 판정은 control_loop(0.2초)마다 나올 수 있어서,
+# 간격 제한이 없으면 "막힘 판정 -> 재계획 -> 같은 경로 -> 또 막힘 판정"이 0.2초마다
+# 반복되어 1초도 안 되어 상한을 소진한다.
+TARGET_REPLAN_MIN_INTERVAL_SEC = 1.0
+
 KEEP_MEMORY_BETWEEN_TASKS = True
 
 YOLO_WORLD_WEIGHTS = os.getenv("YOLO_WORLD_WEIGHTS", "yolov8x-worldv2.pt")

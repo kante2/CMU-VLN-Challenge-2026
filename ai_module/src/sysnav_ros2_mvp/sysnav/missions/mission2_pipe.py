@@ -75,14 +75,13 @@ def _on_selection_result(node, result: dict) -> None:
         return
 
     x, y, theta = node.goal_publisher.object_approach_pose(pose, selected["position"])
-    node.goal_publisher.publish(x, y, theta)
-    node.current_goal = {
-        "x": x,
-        "y": y,
-        "theta": theta,
-        "type": "target",
-        "object_id": selected["object_id"],
-    }
+    # 목적지 좌표 하나를 그대로 던지지 않고, 현재 지도로 A* 경로를 만들어 hop 단위로
+    # 이동한다 - hop에 도착할 때마다(그리고 주행 중 hop이 막히면 즉시) 최신 지도로
+    # 경로를 다시 계산하기 위해서다. 경로를 못 만들면 start_target_navigation()이
+    # 알아서 기존 동작(목적지 직접 발행)으로 폴백한다.
+    node.start_target_navigation(
+        pose, (x, y), theta, object_id=selected["object_id"],
+    )
     # 선택된 target object를 Scene Graph에 표시하고 debug PNG/JSON/DOT을 갱신한다.
     node.scene_graph.mark_selected_object(selected["object_id"])
     node.publish_object_markers()
@@ -120,11 +119,26 @@ def _on_exploration_result(node, result: dict) -> None:
 
 
 def _run_navigate_target(node, pose: dict) -> None:
-    if not node.goal_reached(pose):
-        return
-    object_id = node.current_goal.get("object_id") if node.current_goal else None
+    """확정된 목적지로 가는 주행. 한 번 계산한 경로를 끝까지 고집하지 않고, 아래 순서로
+    판단해서 필요하면 최신 지도로 A*를 다시 돌린다 (sysnav_node.py의 target navigation
+    섹션 주석 참고).
+
+    예전에는 `if not goal_reached(pose): return`이 전부였다 - 접근 포즈에 도달하지
+    못하면 SUCCESS도 FAILED도 아닌 채로 영원히 대기했고, 주행 중 지도가 갱신돼서 그
+    경로가 막힌 게 드러나도 반영할 방법이 없었다.
+    """
+    outcome = node.step_target_navigation(pose)
+    if outcome == "arrived":
+        _finish_navigate_target(node, pose)
+    elif outcome == "unreachable":
+        _give_up_target(node)
+
+
+def _finish_navigate_target(node, pose: dict) -> None:
+    object_id = node.target_object_id
     obj = None if object_id is None else node.object_memory.get(object_id)
     category = obj["category"] if obj else "?"
+    node.clear_target_navigation()
     with node.state_lock:
         node.state = "SUCCESS"
     node.get_logger().info(
@@ -132,3 +146,16 @@ def _run_navigate_target(node, pose: dict) -> None:
         f"object_id={object_id} category={category}, "
         f"robot_pose=({pose['x']:.2f}, {pose['y']:.2f})"
     )
+
+
+def _give_up_target(node) -> None:
+    """step_target_navigation()이 "지금 지도로는 갈 방법이 없다"고 판단했을 때 불린다.
+
+    바로 FAILED로 끝내지 않고 탐사로 되돌리는 이유: "지금 아는 지도로 길이 없다"는
+    "갈 수 없다"가 아니라 "아직 안 뚫었다"인 경우가 많다. 맵을 더 넓힌 뒤 다시 이
+    물체가 선택되면 그때는 경로가 나올 수 있다.
+    """
+    node.clear_target_navigation()
+    with node.state_lock:
+        node.state = "PLAN_EXPLORATION"
+    node.get_logger().warning("🧭 back to exploration to open up the map")

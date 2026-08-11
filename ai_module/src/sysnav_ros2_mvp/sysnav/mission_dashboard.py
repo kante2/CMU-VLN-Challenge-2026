@@ -171,6 +171,16 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
     goal = snapshot.get("current_goal")
     if goal:
         rows.append(_row("Current goal", f"({goal.get('x', 0):.2f}, {goal.get('y', 0):.2f}) type={goal.get('type', '-')}"))
+    target_xy = snapshot.get("target_goal_xy")
+    if target_xy:
+        distance = snapshot.get("target_distance_m")
+        distance_text = "-" if distance is None else f"{distance:.2f}m"
+        rows.append(_row(
+            "Target progress",
+            f"dest=({target_xy[0]:.2f}, {target_xy[1]:.2f}), dist={distance_text}, "
+            f"hops_left={snapshot.get('target_hops_remaining', 0)}, "
+            f"replans={snapshot.get('target_replans', 0)}",
+        ))
 
     doc = f"""<!doctype html>
 <html>

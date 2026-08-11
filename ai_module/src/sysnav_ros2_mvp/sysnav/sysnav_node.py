@@ -176,6 +176,22 @@ class SysNavNode(Node):
         self._exploration_goal_best_distance_m: float | None = None
         self._exploration_goal_last_progress_time: float | None = None
 
+        # 확정된 목적지로 가는 주행(mission2 NAVIGATE_TARGET) 전용 상태.
+        # exploration_route/publish_next_exploration_goal()을 재사용하지 않는 이유:
+        # 그쪽은 route를 소진하면 state를 OBSERVE로 강제해서 미션 흐름과 충돌한다.
+        self.target_route = deque()
+        self.target_goal_xy: tuple[float, float] | None = None
+        self.target_final_theta: float | None = None
+        # mission3의 "avoiding the path between A and B" 제약(missions/mission3_pipe.py가
+        # 만든 mission3_forbidden_mask)을 경로 계획에 그대로 넘기기 위한 보관 필드.
+        # 재계획 때도 같은 제약이 유지돼야 하므로 목적지와 함께 들고 있는다.
+        self.target_forbidden_mask = None
+        self.target_object_id: int | None = None
+        self._target_replan_count = 0
+        self._target_last_replan_time: float | None = None
+        self._target_goal_best_distance_m: float | None = None
+        self._target_goal_last_progress_time: float | None = None
+
         # Mission 3(Instruction-Following, missions/mission3_pipe.py) 전용 상태 -
         # 여러 목적지를 순서대로 처리해야 해서 mission2/1과 달리 진행 인덱스가
         # 필요하다. 다른 미션에서는 안 쓰이므로 매 새 질문마다 리셋만 하면 무해하다.
@@ -260,6 +276,7 @@ class SysNavNode(Node):
             self.state = "OBSERVE"
             self.current_goal = None
             self.exploration_route.clear()
+            self.clear_target_navigation()
             self.last_processed_image_stamp = -1.0
             self.mission3_step_index = 0
             self.mission3_forbidden_mask = None
@@ -943,6 +960,325 @@ class SysNavNode(Node):
             f"remaining_in_route={remaining}{distance_note}"
         )
 
+    # ------------------------------------------------------------------
+    # Target navigation (확정된 목적지로 가는 주행 + 경로 재계획)
+    #
+    # 탐색(FOLLOW_EXPLORATION)과 달리, 여기서 다루는 목적지는 "포기하고 다음 후보로
+    # 넘어갈" 대상이 아니라 끝까지 가야 하는 곳이다. 그래서 한 번 계산한 경로를 끝까지
+    # 고집하지 않고, 아래 세 시점에 최신 지도로 A*를 다시 돌린다:
+    #   1. hop 도착 (아직 목적지가 아니면 다음 구간을 새로 계산)
+    #   2. 주행 중 hop line-of-sight 차단 (지도가 "이 길 막혔다"고 알려준 즉시)
+    #   3. TARGET_REPLAN_STUCK_TIMEOUT_SEC 동안 진전 없음 (1,2가 못 잡는 경우의 백스톱)
+    # A*가 경로를 못 찾을 때만 목적지를 포기하고 탐사 재계획으로 넘긴다.
+    # ------------------------------------------------------------------
+
+    def clear_target_navigation(self) -> None:
+        self.target_route.clear()
+        self.target_goal_xy = None
+        self.target_final_theta = None
+        self.target_forbidden_mask = None
+        self.target_object_id = None
+        # current_goal도 같이 지운다 - 안 지우면 도착/포기 후에도 직전 hop이 남아서,
+        # 다음 step을 resolve하는 동안(mission3) 그 stale goal로 goal_reached()가
+        # 참이 되어 "도착했다"고 잘못 판정될 수 있다.
+        if self.current_goal is not None and self.current_goal.get("type") == "target":
+            self.current_goal = None
+        self._target_replan_count = 0
+        self._target_last_replan_time = None
+        self._target_goal_best_distance_m = None
+        self._target_goal_last_progress_time = None
+
+    def start_target_navigation(
+        self,
+        pose: dict,
+        goal_xy: tuple[float, float],
+        final_theta: float,
+        forbidden_mask=None,
+        object_id: int | None = None,
+    ) -> None:
+        """확정된 목적지로 가는 주행을 시작한다.
+
+        A* 경로를 hop으로 잘라 첫 hop부터 발행한다. 경로 계산에 실패하면(목적지가 아직
+        미탐색 영역이거나 가구 속이라 스냅이 안 되는 등) 예전처럼 목적지 좌표를 그대로
+        발행하고 base autonomy에 맡긴다 - 여기서 곧바로 탐사로 빠지면 "실제로는 갈 수
+        있는데 known-free가 아니라는 이유로 포기"하는 예전 실패(2026-08-11, b66adde)를
+        그대로 반복하게 된다. 즉 A*가 도움이 될 때만 쓰고, 아니면 기존 동작 그대로다.
+        """
+        self.clear_target_navigation()
+        self.target_goal_xy = (float(goal_xy[0]), float(goal_xy[1]))
+        self.target_final_theta = float(final_theta)
+        self.target_forbidden_mask = forbidden_mask
+        self.target_object_id = object_id
+
+        path, elapsed_ms = self._plan_target_path(pose)
+        if path:
+            self.target_route = deque(path)
+            self.get_logger().info(
+                f"🧭 TARGET PATH planned - {len(path)} hops to "
+                f"({self.target_goal_xy[0]:.2f}, {self.target_goal_xy[1]:.2f}), "
+                f"{elapsed_ms:.1f}ms, forbidden={'yes' if forbidden_mask is not None else 'no'}"
+            )
+            self.publish_next_target_hop()
+            return
+
+        diag = self.coverage_planner.last_direct_path_diagnostics
+        self.get_logger().info(
+            f"🧭 TARGET PATH unavailable ({diag.get('reason')}, {elapsed_ms:.1f}ms) - publishing "
+            f"goal directly and letting base autonomy drive (replan backstop stays armed)"
+        )
+        self._publish_target_goal(
+            self.target_goal_xy[0], self.target_goal_xy[1], self.target_final_theta,
+            is_final=True,
+        )
+
+    def publish_next_target_hop(self) -> None:
+        """target_route에서 다음 hop을 꺼내 발행한다. state는 건드리지 않는다
+        (미션별 state는 missions/*.py가 관리한다)."""
+        if not self.target_route:
+            return
+        hop = self.target_route.popleft()
+        self._publish_target_goal(
+            hop["x"], hop["y"], hop["theta"], is_final=not self.target_route
+        )
+
+    def _publish_target_goal(self, x: float, y: float, theta: float, is_final: bool) -> None:
+        self.goal_publisher.publish(x, y, theta)
+        self.current_goal = {
+            "x": float(x),
+            "y": float(y),
+            "theta": float(theta),
+            "type": "target",
+            "is_final_hop": bool(is_final),
+            # 어느 물체로 가는 중인지(도착 로그와 mission2의 SUCCESS 처리가 쓴다).
+            # current_goal에서 이어받지 않고 target_object_id를 쓰는 이유: 그러면
+            # 호출 쪽이 start_target_navigation() 전에 current_goal에 object_id만 든
+            # 반쪽짜리 dict를 심어둬야 하는데, 그 사이에 goal_reached()가 불리면
+            # x/y가 없어서 KeyError가 난다.
+            "object_id": self.target_object_id,
+        }
+        # 진행도 감시(백스톱)는 hop이 바뀔 때마다 리셋한다 - 새 hop은 새로 재는 것이 맞다.
+        self._target_goal_best_distance_m = None
+        self._target_goal_last_progress_time = time.monotonic()
+        self.get_logger().info(
+            f"➡️ TARGET HOP - goal=({x:.2f}, {y:.2f}, {theta:.2f}), "
+            f"is_final={is_final}, remaining_hops={len(self.target_route)}, "
+            f"replans={self._target_replan_count}"
+        )
+
+    def target_destination_reached(self, pose: dict) -> bool:
+        """최종 목적지(마지막 hop이 아니라 목적지 좌표 자체)에 도달했는지."""
+        if self.target_goal_xy is None:
+            return False
+        return math.hypot(
+            self.target_goal_xy[0] - float(pose["x"]),
+            self.target_goal_xy[1] - float(pose["y"]),
+        ) <= config.GOAL_REACHED_DISTANCE_M
+
+    def target_hop_blocked(self, pose: dict) -> bool:
+        """주행 중 트리거: 지금 향하는 hop이 최신 지도 기준으로 막혔는지."""
+        if self.current_goal is None or self.current_goal.get("type") != "target":
+            return False
+        return not self.coverage_planner.hop_still_reachable(
+            (float(pose["x"]), float(pose["y"])),
+            (float(self.current_goal["x"]), float(self.current_goal["y"])),
+        )
+
+    def target_progress_stalled(self, pose: dict) -> bool:
+        """백스톱 트리거: TARGET_REPLAN_STUCK_TIMEOUT_SEC 동안 목표에 가까워지지 못함."""
+        distance, best, last_progress = self._track_goal_progress(
+            pose,
+            self._target_goal_best_distance_m,
+            self._target_goal_last_progress_time,
+        )
+        self._target_goal_best_distance_m = best
+        self._target_goal_last_progress_time = last_progress
+        if distance is None or last_progress is None:
+            return False
+        return (
+            time.monotonic() - last_progress >= config.TARGET_REPLAN_STUCK_TIMEOUT_SEC
+        )
+
+    def replan_target_route(self, pose: dict, reason: str) -> str:
+        """최신 지도로 목적지까지의 경로를 다시 계산하고, 무슨 일이 있었는지 문자열로
+        돌려준다. bool이 아닌 이유: 호출한 미션이 "재계획됨"과 "더 갈 곳이 없음"을
+        구분해야 하는데(전자는 계속 주행, 후자는 도달 인정), bool로는 그 둘이 같아진다.
+
+          "replanned" - 새 경로로 첫 hop까지 발행함
+          "unchanged" - 계산은 됐는데 지금 향하던 hop 그대로다. hop에 이미 도착한
+                        상태에서 이 값이 나오면 "지금 지도로 여기보다 더 가까이는
+                        못 간다"는 뜻이다.
+          "cooldown"  - 최소 간격 안이라 이번엔 건너뜀 (실패 아님, 보류)
+          "failed"    - A*가 경로를 못 찾음
+          "limit"     - hop 도착 없이 연속 재계획 상한 초과
+        """
+        if self.target_goal_xy is None:
+            return "failed"
+
+        now = time.monotonic()
+        # 같은 트리거가 control_loop(0.2초)마다 반복해서 걸릴 수 있으므로 최소 간격을 둔다.
+        if (
+            self._target_last_replan_time is not None
+            and now - self._target_last_replan_time < config.TARGET_REPLAN_MIN_INTERVAL_SEC
+        ):
+            return "cooldown"
+
+        # hop 도착으로 인한 재계획은 정상 진행이므로 상한에 세지 않고 오히려 카운터를
+        # 리셋한다 - 한 hop이라도 실제로 도착했다는 건 경로가 통하고 있다는 뜻이다.
+        if reason.endswith("arrival"):
+            self._target_replan_count = 0
+        elif self._target_replan_count >= config.TARGET_REPLAN_MAX_COUNT:
+            self.get_logger().warning(
+                f"🧭 TARGET REPLAN limit reached ({self._target_replan_count} consecutive "
+                f"replans without arriving at a hop) - giving up on "
+                f"goal=({self.target_goal_xy[0]:.2f}, {self.target_goal_xy[1]:.2f})"
+            )
+            return "limit"
+        else:
+            self._target_replan_count += 1
+
+        self._target_last_replan_time = now
+        path, elapsed_ms = self._plan_target_path(pose)
+        if not path:
+            diag = self.coverage_planner.last_direct_path_diagnostics
+            self.get_logger().warning(
+                f"🧭 TARGET REPLAN failed (trigger={reason}, reason={diag.get('reason')}, "
+                f"attempt={self._target_replan_count}, {elapsed_ms:.1f}ms)"
+            )
+            return "failed"
+
+        # 새 경로가 지금 향하던 hop과 사실상 같으면 재발행하지 않는다 - 같은 목표를
+        # 반복해서 다시 쏘면 base autonomy의 추종이 오히려 흔들린다.
+        if self.current_goal is not None and self._same_hop(path[0], self.current_goal):
+            self.target_route = deque(path[1:])
+            self.get_logger().info(
+                f"🧭 TARGET REPLAN (trigger={reason}) - path unchanged at current hop, "
+                f"hops={len(self.target_route) + 1}, {elapsed_ms:.1f}ms"
+            )
+            return "unchanged"
+
+        self.target_route = deque(path)
+        self.get_logger().info(
+            f"🧭 TARGET REPLAN (trigger={reason}, attempt={self._target_replan_count}) - "
+            f"new path with {len(path)} hops, {elapsed_ms:.1f}ms"
+        )
+        self.publish_next_target_hop()
+        return "replanned"
+
+    def _plan_target_path(self, pose: dict) -> tuple[list[dict] | None, float]:
+        """plan_direct_path 호출 + 소요 시간(ms) 측정.
+
+        소요 시간을 재는 이유: 이 A*는 worker가 아니라 control_loop 스레드에서 도는데,
+        목적지가 멀면(맵이 넓고 이미 많이 탐색된 상태) 탐색 노드가 늘어 control 주기
+        (CONTROL_PERIOD_SEC=0.2초)를 잡아먹을 수 있다. 실제 맵에서 몇 ms가 나오는지
+        로그로 남겨두면 worker 스레드로 옮길 필요가 있는지 실측으로 판단할 수 있다.
+        """
+        started = time.perf_counter()
+        path = self.coverage_planner.plan_direct_path(
+            pose,
+            self.target_goal_xy,
+            final_theta=self.target_final_theta,
+            forbidden_mask=self.target_forbidden_mask,
+            max_hop_spacing_m=config.TARGET_PATH_WAYPOINT_SPACING_M,
+        )
+        return path, (time.perf_counter() - started) * 1000.0
+
+    def target_arrival_acceptable(self, pose: dict) -> bool:
+        """목적지 판정 반경 밖이지만 "여기가 갈 수 있는 최선"일 때 도달로 인정할지.
+
+        목적지가 가구 옆이면 경로 계획이 목표를 통행 가능한 셀로 최대 2m 스냅하므로
+        GOAL_REACHED_DISTANCE_M(0.35m) 안으로는 애초에 들어갈 수 없다. 이때 도착을
+        고집하면 로봇은 멈춰 있는데 미션만 영원히 안 끝난다. 다만 아무 데서나 끝났다고
+        하면 안 되므로 TARGET_ARRIVAL_FALLBACK_MAX_M 안일 때만 인정한다.
+        """
+        if self.target_goal_xy is None:
+            return False
+        return math.hypot(
+            self.target_goal_xy[0] - float(pose["x"]),
+            self.target_goal_xy[1] - float(pose["y"]),
+        ) <= config.TARGET_ARRIVAL_FALLBACK_MAX_M
+
+    def step_target_navigation(self, pose: dict) -> str:
+        """목적지 주행 1 tick. 미션(mission2/mission3)이 매 control_loop마다 호출한다.
+
+        반환:
+          "driving"     - 계속 가는 중 (필요하면 이 안에서 경로를 다시 계산했다)
+          "arrived"     - 목적지 도달. 목적지 판정 반경 안이거나, "지금 지도로는 여기가
+                          최선"이 확인되고 TARGET_ARRIVAL_FALLBACK_MAX_M 안인 경우.
+          "unreachable" - 지금 지도로는 갈 방법이 없음. 미션이 탐사로 되돌릴지 결정한다.
+
+        미션별로 도착 후 할 일만 다르고(mission2는 SUCCESS, mission3는 다음 step) 판단
+        자체는 같아서 여기 한 곳에 둔다.
+        """
+        # 1. 목적지 도달 -> 끝.
+        if self.target_destination_reached(pose):
+            return "arrived"
+
+        # 2. hop 도착.
+        if self.goal_reached(pose):
+            # 중간 hop이면 이미 만들어둔 다음 hop을 그대로 발행한다. 여기서 매번
+            # 재계획하지 않는 이유: (1) 경로가 도중에 무효화되는 진짜 위험은 아래 3번
+            # LOS 감시가 0.2초 안에 잡으므로 매 hop 재계산은 최적화일 뿐이고,
+            # (2) 코너/문틀에서는 hop이 0.2m까지 촘촘해져서 도착이 0.2초마다 발생하는데,
+            # 그때마다 재계획을 시도하면 최소 간격(TARGET_REPLAN_MIN_INTERVAL_SEC)에
+            # 걸려 다음 hop을 못 내보내고 로봇이 hop마다 멈춰 선다.
+            if self.target_route:
+                self.publish_next_target_hop()
+                return "driving"
+
+            # 마지막 hop인데 목적지에 못 닿았다 - 이제서야 최신 지도로 다시 계산한다.
+            # 계획 당시보다 맵이 넓어져서 더 갈 수 있게 됐을 수 있다.
+            status = self.replan_target_route(pose, reason="final_hop_arrival")
+            if status in ("replanned", "cooldown"):
+                return "driving"
+            # "unchanged"(여기가 갈 수 있는 최선) / "failed" / "limit"
+            return self._accept_or_reject_arrival(pose, "no closer waypoint exists")
+
+        # 3. 주행 중 지도가 "이 hop 막혔다"고 알려주면 즉시 우회 경로를 만든다.
+        if self.target_hop_blocked(pose):
+            status = self.replan_target_route(pose, reason="hop_blocked")
+            if status in ("replanned", "cooldown", "unchanged"):
+                return "driving"
+            return "unreachable"
+
+        # 4. 1~3이 못 잡는 경우의 최후 백스톱(로봇이 그냥 멈춰 서 있는 경우 등).
+        if self.target_progress_stalled(pose):
+            status = self.replan_target_route(pose, reason="progress_stalled")
+            if status in ("replanned", "cooldown"):
+                return "driving"
+            if status == "unchanged":
+                return self._accept_or_reject_arrival(pose, "stalled at closest reachable point")
+            return "unreachable"
+
+        return "driving"
+
+    def _accept_or_reject_arrival(self, pose: dict, why: str) -> str:
+        distance = self.distance_to_target(pose)
+        if self.target_arrival_acceptable(pose):
+            self.get_logger().info(
+                f"🚩 ARRIVAL accepted at closest reachable point ({why}) - "
+                f"{distance:.2f}m from goal (limit {config.TARGET_ARRIVAL_FALLBACK_MAX_M:.2f}m)"
+            )
+            return "arrived"
+        self.get_logger().warning(
+            f"🧭 TARGET unreachable ({why}) - {distance:.2f}m from goal, "
+            f"beyond {config.TARGET_ARRIVAL_FALLBACK_MAX_M:.2f}m"
+        )
+        return "unreachable"
+
+    def distance_to_target(self, pose: dict) -> float:
+        if self.target_goal_xy is None:
+            return float("inf")
+        return math.hypot(
+            self.target_goal_xy[0] - float(pose["x"]),
+            self.target_goal_xy[1] - float(pose["y"]),
+        )
+
+    @staticmethod
+    def _same_hop(hop: dict, goal: dict, tolerance_m: float = 0.10) -> bool:
+        return math.hypot(
+            float(hop["x"]) - float(goal["x"]), float(hop["y"]) - float(goal["y"])
+        ) <= tolerance_m
+
     def publish_object_markers(self) -> None:
         snapshot = self.scene_graph.snapshot()
         markers = build_object_marker_array(
@@ -977,6 +1313,13 @@ class SysNavNode(Node):
             "pose": pose,
             "elapsed_sec": elapsed,
             "current_goal": dict(self.current_goal) if self.current_goal else None,
+            # 목적지 주행 진행 상황 - "로봇이 멈춰 있는데 왜 안 끝나는지"를 대시보드만
+            # 보고 판단할 수 있게 남긴다(현재 hop이 아니라 진짜 목적지까지의 거리와
+            # 남은 hop 수가 있어야 도착 판정 문제인지 경로 문제인지 구분된다).
+            "target_goal_xy": self.target_goal_xy,
+            "target_distance_m": None if pose is None else self.distance_to_target(pose),
+            "target_hops_remaining": len(self.target_route),
+            "target_replans": self._target_replan_count,
             "mission3_step_index": self.mission3_step_index,
             "mission3_forbidden_active": self.mission3_forbidden_mask is not None,
             "last_response_summary": self.last_response_summary,
@@ -995,25 +1338,46 @@ class SysNavNode(Node):
     # False로 남아 로봇이 계속 벽에 박혀있는 것을 막기 위한 진행도 기반 stuck 감지.
     # 목표까지 거리가 최근 EXPLORATION_STUCK_TIMEOUT_SEC 안에 EXPLORATION_STUCK_PROGRESS_M 이상
     # 줄어들지 않으면 도달 불가로 판단한다.
-    def _exploration_goal_unreachable(
-        self, pose: dict, timeout_sec: float = config.EXPLORATION_STUCK_TIMEOUT_SEC
-    ) -> bool:
+    def _track_goal_progress(
+        self,
+        pose: dict,
+        best_distance_m: float | None,
+        last_progress_time: float | None,
+    ) -> tuple[float | None, float | None, float | None]:
+        """current_goal까지의 "역대 최단거리"를 갱신하고 (거리, 최단거리, 마지막 갱신시각)을
+        돌려준다.
+
+        직전 대비가 아니라 역대 최단거리 대비로 재는 이유: 제자리에서 흔들리거나 벽을
+        따라 좌우로 움직이는 건 진전이 아닌데, 직전 대비로 재면 그것도 진전으로 잡힌다.
+        exploration/target 두 감시가 임계값만 다르고 로직은 같아서 여기로 모았다.
+        """
         if self.current_goal is None:
-            return False
+            return None, best_distance_m, last_progress_time
         distance = math.hypot(
             float(self.current_goal["x"]) - float(pose["x"]),
             float(self.current_goal["y"]) - float(pose["y"]),
         )
         now = time.monotonic()
         if (
-            self._exploration_goal_best_distance_m is None
-            or distance <= self._exploration_goal_best_distance_m - config.EXPLORATION_STUCK_PROGRESS_M
+            best_distance_m is None
+            or distance <= best_distance_m - config.EXPLORATION_STUCK_PROGRESS_M
         ):
-            self._exploration_goal_best_distance_m = distance
-            self._exploration_goal_last_progress_time = now
+            return distance, distance, now
+        return distance, best_distance_m, last_progress_time
+
+    def _exploration_goal_unreachable(
+        self, pose: dict, timeout_sec: float = config.EXPLORATION_STUCK_TIMEOUT_SEC
+    ) -> bool:
+        distance, best, last_progress = self._track_goal_progress(
+            pose,
+            self._exploration_goal_best_distance_m,
+            self._exploration_goal_last_progress_time,
+        )
+        self._exploration_goal_best_distance_m = best
+        self._exploration_goal_last_progress_time = last_progress
+        if distance is None or last_progress is None:
             return False
-        assert self._exploration_goal_last_progress_time is not None
-        return now - self._exploration_goal_last_progress_time >= timeout_sec
+        return time.monotonic() - last_progress >= timeout_sec
 
     def destroy_node(self):
         self.worker.shutdown(wait=False, cancel_futures=True)
