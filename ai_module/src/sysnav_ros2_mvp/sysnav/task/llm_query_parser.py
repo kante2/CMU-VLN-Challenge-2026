@@ -80,6 +80,14 @@ Rules:
   reference object categories.
 - Keep multiword categories intact (e.g. "trash can", "knife rack").
 - Do not invent objects or constraints that are not stated in the instruction.
+- Preserve nested reference-object relations as additional constraints. A
+  relation modifying a reference object is still required even though it does
+  not directly modify the target. For example, "the pillow on the chair that
+  is closest to the TV" must produce, in this exact order:
+  target="pillow", constraints=[
+    {{"relation":"on", "references":["chair"]}},
+    {{"relation":"nearest", "references":["tv"]}}
+  ]. Never shorten that example to only pillow-on-chair.
 """.strip()
 
 
@@ -191,6 +199,21 @@ class LLMQueryParser:
             if not response.text:
                 raise RuntimeError("Gemini가 빈 응답을 반환함")
             parsed = normalize_llm_result(question, json.loads(response.text))
+            # Gemini occasionally keeps only the target's direct relation and
+            # drops a relative clause on its reference ("pillow on the chair
+            # that is closest to TV"). The deterministic parser handles this
+            # grammar well, so never accept a shorter LLM chain than the one
+            # explicitly present in the sentence.
+            rule_parsed = extract_target(question)
+            if len(rule_parsed.get("relation_chain") or []) > len(
+                parsed.get("relation_chain") or []
+            ):
+                self._logger.warning(
+                    "LLM omitted a nested relation; using the complete rule-based chain: "
+                    f"{rule_parsed['relation_chain']}"
+                )
+                rule_parsed["parser"] = "rules_relation_chain_guard"
+                parsed = rule_parsed
             self._logger.info(
                 f"LLM parse: target={parsed['target']}, attributes={parsed['attributes']}, "
                 f"relation_chain={parsed['relation_chain']}"

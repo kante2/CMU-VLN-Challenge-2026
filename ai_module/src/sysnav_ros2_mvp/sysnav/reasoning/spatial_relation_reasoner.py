@@ -509,7 +509,11 @@ ambiguous must be omitted.
 
         output = []
         for scored in groups.values():
-            if not scored:
+            # Multiple reference instances do not constitute a comparison when
+            # there is still only one source instance.  Do not emit a global
+            # superlative edge until at least two target objects can compete.
+            source_ids = {int(item[0]["source_object_id"]) for item in scored}
+            if len(source_ids) < 2:
                 continue
             winner, winner_distance = min(scored, key=lambda item: item[1])
             output.append({

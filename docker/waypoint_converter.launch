@@ -1,0 +1,36 @@
+<launch>
+
+  <arg name="world_name" default="unity"/>
+
+  <node pkg="waypoint_converter" exec="waypointConverter" name="waypointConverter" output="screen">
+    <param name="trav_area_file_dir" value="$(find-pkg-prefix vehicle_simulator)/mesh/$(var world_name)/traversable_area.ply" />
+    <param name="boundary_file_dir" value="$(find-pkg-prefix vehicle_simulator)/mesh/$(var world_name)/boundary.ply" />
+    <param name="waypointXYRadius" value="0.3" />
+    <param name="waypointProjDis" value="0.5" />
+    <param name="twoWayHeading" value="false" />
+    <param name="frameRate" value="10.0" />
+    <param name="useTerrainAnalysis" value="true" />
+    <param name="terrainVoxelSize" value="0.05" />
+    <param name="obstacleHeightThre" value="0.05" />
+    <!-- The upstream 0.75 m clearance over-adjusts valid indoor goals far
+         behind the robot.  Keep collision clearance while allowing furniture
+         standoff goals to remain reachable. -->
+    <param name="obstacleDisThre" value="0.40" />
+    <param name="checkTravArea" value="true" />
+    <param name="waypointTravAdj" value="true" />
+    <!-- Do not pull a valid target goal toward the robot while it is still
+         metres away. Only snap the final approach to a traversable cell. -->
+    <param name="adjDisThre" value="0.8" />
+    <param name="searchDisThre" value="1.5" />
+    <!-- Among safe cells, preserve the original requested goal instead of
+         rewarding a cell merely because it is close to the vehicle. -->
+    <param name="vehicleDisWeight" value="0.0" />
+    <param name="travDisThre" value="0.1" />
+    <param name="extDis" value="0.0" />
+    <param name="yawConfig" value="-1" />
+    <param name="speed" value="0.875" />
+    <param name="sendSpeed" value="true" />
+    <param name="sendBoundary" value="false" />
+  </node>
+
+</launch>

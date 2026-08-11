@@ -721,3 +721,59 @@ class CoveragePlanner:
         diag["path_len"] = len(path)
         self.last_direct_path_diagnostics = diag
         return self._leg_waypoints(path, inflated, final_theta, credited_len=0)
+
+    def plan_recovery_patrol(
+        self,
+        start_pose: dict,
+        previous_points: list[tuple[float, float]],
+    ) -> list[dict]:
+        """Plan to a distinct known-free point after frontier exhaustion.
+
+        Frontier score can be zero while a visual target remains unseen.  This
+        fallback deliberately ignores surface-coverage gain and selects the
+        reachable traversable cell farthest from the current/recent recovery
+        locations, producing a bounded room patrol rather than retrying the
+        same exhausted frontier computation forever.
+        """
+        with self._lock:
+            grid = self.grid.copy()
+            origin_ready = self.origin_x is not None
+        if not origin_ready:
+            return []
+        start_cell = self.world_to_grid(start_pose["x"], start_pose["y"])
+        if start_cell is None:
+            return []
+
+        occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
+        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
+        inflated = cv2.dilate(
+            occupied,
+            np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8),
+        ).astype(bool)
+        traversable = (grid == config.OCC_FREE) & (~inflated)
+        start = self._nearest_traversable(traversable, *start_cell, radius=10)
+        if start is None:
+            return []
+
+        spacing = float(config.MISSION3_RECOVERY_PATROL_MIN_SPACING_M)
+        anchors = [(float(start_pose["x"]), float(start_pose["y"])), *previous_points]
+        stride = max(1, int(round(0.4 / self.resolution)))
+        scored: list[tuple[float, tuple[int, int]]] = []
+        for row, col in np.argwhere(traversable)[::stride]:
+            cell = (int(row), int(col))
+            x, y = self.grid_to_world(*cell)
+            min_distance = min(math.hypot(x - ax, y - ay) for ax, ay in anchors)
+            if min_distance >= spacing:
+                scored.append((min_distance, cell))
+
+        for _, goal in sorted(scored, reverse=True):
+            path = self._astar_path(traversable, start, goal)
+            if path is None:
+                continue
+            x, y = self.grid_to_world(*goal)
+            theta = math.atan2(
+                float(start_pose["y"]) - y,
+                float(start_pose["x"]) - x,
+            )
+            return self._leg_waypoints(path, inflated, theta, credited_len=0)
+        return []

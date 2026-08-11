@@ -52,6 +52,23 @@ sleep 1
 echo "[run_scene] 씬 준비 중: ${SCENE}"
 docker exec "$CONTAINER" bash -lc "
   set -e
+  LOCAL_PLANNER_SRC=/home/docker/autonomy_stack_mecanum_wheel_platform/src/base_autonomy/local_planner/src/localPlanner.cpp
+  # localPlanner의 narrow-passage corridor 반경은 ROS parameter가 아니라 C++
+  # 상수다. 새 컨테이너에서도 동일한 튜닝이 재현되도록 최초 한 번만 바꾸고 해당
+  # package만 다시 빌드한다.
+  if grep -q 'float searchRadius = 0.45;' \"\$LOCAL_PLANNER_SRC\"; then
+    sed -i 's/float searchRadius = 0.45;/float searchRadius = 0.32;/' \"\$LOCAL_PLANNER_SRC\"
+    source /opt/ros/jazzy/setup.bash
+    cd /home/docker/autonomy_stack_mecanum_wheel_platform
+    colcon build --packages-select local_planner
+  fi
+  # compose가 제공한 tuned launch overlay는 local_planner 빌드가 끝난 뒤 설치
+  # 공간에 복사해야 빌드가 upstream 기본값(0.5m footprint 등)으로 되돌리지 않는다.
+  if [ -f /tmp/sysnav_local_planner.launch ]; then
+    cp /tmp/sysnav_local_planner.launch \
+      /home/docker/autonomy_stack_mecanum_wheel_platform/install/local_planner/share/local_planner/launch/local_planner.launch
+  fi
+
   MESH_DIR=/home/docker/autonomy_stack_mecanum_wheel_platform/src/base_autonomy/vehicle_simulator/mesh
   SCENES_DIR=\$MESH_DIR/scenes
   mkdir -p \"\$SCENES_DIR\"

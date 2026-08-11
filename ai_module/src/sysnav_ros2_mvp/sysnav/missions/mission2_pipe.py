@@ -12,7 +12,10 @@ SELECT_TARGET -> NAVIGATE_TARGET -> SUCCESS.
 from __future__ import annotations
 
 from collections import deque
+import math
+import time
 
+from sysnav import config
 from sysnav.scene_graph.scene_graph_rviz import build_selected_object_marker
 
 
@@ -82,6 +85,10 @@ def _on_selection_result(node, result: dict) -> None:
         "theta": theta,
         "type": "target",
         "object_id": selected["object_id"],
+        # Progress is always measured against this original SysNav goal, never
+        # against waypointConverter's internally adjusted /way_point output.
+        "best_distance_m": math.hypot(x - pose["x"], y - pose["y"]),
+        "last_progress_time": time.monotonic(),
     }
     # 선택된 target object를 Scene Graph에 표시하고 debug PNG/JSON/DOT을 갱신한다.
     node.scene_graph.mark_selected_object(selected["object_id"])
@@ -120,7 +127,32 @@ def _on_exploration_result(node, result: dict) -> None:
 
 
 def _run_navigate_target(node, pose: dict) -> None:
+    if node.current_goal is None:
+        return
     if not node.goal_reached(pose):
+        goal = node.current_goal
+        distance = math.hypot(
+            float(goal["x"]) - float(pose["x"]),
+            float(goal["y"]) - float(pose["y"]),
+        )
+        now = time.monotonic()
+        best_distance = float(goal.get("best_distance_m", distance))
+        if distance <= best_distance - config.TARGET_STUCK_PROGRESS_M:
+            goal["best_distance_m"] = distance
+            goal["last_progress_time"] = now
+            return
+
+        last_progress = float(goal.get("last_progress_time", now))
+        if now - last_progress >= config.TARGET_STUCK_TIMEOUT_SEC:
+            node.get_logger().warning(
+                "♻️ TARGET GOAL STILL ACTIVE - no recent progress; "
+                f"re-publishing original goal ({goal['x']:.2f}, {goal['y']:.2f}), "
+                f"remaining={distance:.2f}m"
+            )
+            node.goal_publisher.publish(goal["x"], goal["y"], goal["theta"])
+            # Start a fresh watchdog interval. Keep the best distance so small
+            # pose noise cannot masquerade as meaningful progress.
+            goal["last_progress_time"] = now
         return
     object_id = node.current_goal.get("object_id") if node.current_goal else None
     obj = None if object_id is None else node.object_memory.get(object_id)

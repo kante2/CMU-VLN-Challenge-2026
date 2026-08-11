@@ -181,3 +181,14 @@ def effective_relation_chain(task: dict) -> list[tuple[str, str, str]]:
         return []
     target = str(task.get("target", "")).lower()
     return [(target, str(relation), str(references[0]).lower())]
+
+
+def requires_comparative_ranking(task: dict) -> bool:
+    """Whether selecting the target requires comparing multiple instances.
+
+    The first observed object cannot establish a ``nearest``/``closest``
+    superlative; it is only the nearest object seen so far.  Only the first
+    relation hop is relevant because later hops constrain reference objects.
+    """
+    chain = effective_relation_chain(task)
+    return bool(chain and chain[0][1] in ("nearest", "closest"))
