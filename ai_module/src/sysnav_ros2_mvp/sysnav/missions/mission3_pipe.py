@@ -397,27 +397,38 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     base autonomy의 point-to-point 이동으로는 특정 영역을 피하도록 강제할 수 없어서,
     이 제약은 우리가 직접 우회 경로를 만들어야만 지켜진다.
     """
+    object_xy = None
     if is_object_target:
-        x, y, _ = node.goal_publisher.object_approach_pose(pose, point)
+        # 접근 지점은 /terrain_map 기준으로 고른다 (navigation/terrain_monitor.py) -
+        # base autonomy가 받아들일 지점을 처음부터 찍어야 엉뚱한 데로 끌려가지 않는다.
+        x, y, _ = node.approach_pose_for(pose, point)
+        object_xy = (float(point[0]), float(point[1]))
     else:
+        # "take the path between A and B" 같은 경유점은 그 좌표 자체가 제약이라
+        # terrain 기준으로 옮기면 안 된다.
         x, y = float(point[0]), float(point[1])
-    # object_approach_pose()가 원래 돌려주는 theta("도착해서 물체를 바라볼 방향")
-    # 대신 이동 방향을 쓴다. README의 "go near"/"stop at"은 위치 도달만 요구하니 굳이
-    # 물체를 바라보라고 강제할 이유가 없다.
+    # approach_pose_for()가 돌려주는 theta("도착해서 물체를 바라볼 방향") 대신 이동
+    # 방향을 쓴다. README의 "go near"/"stop at"은 위치 도달만 요구하니 굳이 물체를
+    # 바라보라고 강제할 이유가 없다.
     theta = math.atan2(y - pose["y"], x - pose["x"])
 
-    node.goal_publisher.add_step_goal_marker(
-        node.mission3_step_index, x, y, label=f"goal{node.mission3_step_index + 1}",
-    )
     node.get_logger().info(
         f"🧭 mission3 step {node.mission3_step_index + 1} -> goal=({x:.2f}, {y:.2f}, {theta:.2f})"
     )
     # goal을 실제로 발행한 뒤에 state를 옮긴다(mission2와 같은 순서) - 먼저 옮기면
     # start_target_navigation()이 예외로 죽었을 때 goal 없이 NAVIGATE_STEP에 들어가서
     # 직전 step의 stale goal로 도착 판정이 날 수 있다.
+    #
+    # marker_index를 넘기면 주행 중 목표가 다시 잡힐 때 RViz 마커도 따라 옮겨진다
+    # (node.refresh_goal_marker()). 마커를 여기서 직접 그리지 않는 이유도 그것이다 -
+    # 그리는 곳이 두 군데면 한쪽만 갱신되어 어긋난다.
     node.start_target_navigation(
-        pose, (x, y), theta, forbidden_mask=node.mission3_forbidden_mask,
+        pose, (x, y), theta,
+        forbidden_mask=node.mission3_forbidden_mask,
+        object_xy=object_xy,
+        marker_index=node.mission3_step_index,
     )
+    node.refresh_goal_marker()
     with node.state_lock:
         node.state = "MISSION3_NAVIGATE_STEP"
 

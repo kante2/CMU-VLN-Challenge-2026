@@ -9,6 +9,11 @@ TOPIC_STATE = "/state_estimation"
 TOPIC_IMAGE = "/camera/image"
 TOPIC_SCAN = "/sensor_scan"
 TOPIC_WAYPOINT = "/way_point_with_heading"
+# base autonomy(terrainAnalysis)의 지형 분석 결과. README의 System Outputs 표에 있는
+# 테스트 때도 사용 허용된 토픽이다. waypointConverter가 우리 waypoint를 받아들일지
+# 판정할 때 쓰는 것과 동일한 데이터라, 우리도 같은 걸 보고 목표를 찍는다
+# (navigation/terrain_monitor.py).
+TOPIC_TERRAIN_MAP = "/terrain_map"
 TOPIC_OBJECT_MARKERS = "/sysnav/object_markers"
 # mission3(Instruction-Following)가 각 step에서 실제로 찍은 goal 좌표를 디버그용으로
 # 남긴다 - "success는 떴는데 실제로는 물체 앞까지 안 갔다"류 문제를 RViz에서 눈으로
@@ -35,13 +40,46 @@ POSE_BUFFER_SIZE = 100
 # base autonomy(waypointConverter.cpp)의 자체 도착 판정 반경(waypointXYRadius)이 0.3m라
 # 그보다 타이트하면 base autonomy는 이미 "도착"으로 보고 정지했는데 우리만 계속 기다리다
 # stuck-timeout으로 SKIP되는 근본적 불일치가 생긴다(2026-08-10 실측: 0.15m일 때 0.31~0.34m
-# 남기고 반복 SKIP). 0.3m보다 살짝 여유를 둔다.
-GOAL_REACHED_DISTANCE_M = 0.35
+# 남기고 반복 SKIP). 즉 0.3m가 하한이다.
+#
+# 0.35 -> 0.5 (2026-08-12): 0.35에서는 목적지 주행 6건이 전부 이 판정을 못 넘기고
+# 정지-폴백(TARGET_ARRIVAL_FALLBACK_MAX_M)으로 처리됐다. 실측 도달 거리가 0.41~0.64m에
+# 몰려 있어서 0.5면 상당수가 즉시 도달로 잡히고, 그만큼 정지 대기 시간을 아낀다.
+# 주의: 탐색 waypoint 도착 판정에도 같이 쓰이는 공유 상수다.
+GOAL_REACHED_DISTANCE_M = 0.5
 # exploration goal까지 거리가 이 이상 줄지 않은 채 이 시간(초)이 지나면 도달 불가로 보고 포기한다.
 # (벽 너머 등 실제로는 갈 수 없는 waypoint에 로봇이 영원히 박혀있는 것을 막기 위한 안전장치)
 EXPLORATION_STUCK_TIMEOUT_SEC = 8.0
 EXPLORATION_STUCK_PROGRESS_M = 0.10
 TARGET_STANDOFF_DISTANCE_M = 0.90
+
+# ---------------------------------------------------------------------------
+# Terrain 기반 접근 지점 판정 (navigation/terrain_monitor.py)
+#
+# 아래 두 값은 base autonomy waypointConverter 파라미터의 복제본이다. 그쪽이 바뀌면
+# 여기도 같이 바꿔야 우리 판정이 의미를 갖는다 (2026-08-12 라이브 확인값):
+#   obstacleHeightThre = 0.05   -> TERRAIN_OBSTACLE_INTENSITY
+#   obstacleDisThre    = 0.75   -> TERRAIN_CLEARANCE_M
+# ---------------------------------------------------------------------------
+TERRAIN_OBSTACLE_INTENSITY = 0.05
+TERRAIN_CLEARANCE_M = 0.75
+
+# 목표 지점 근처 이 반경 안에 travArea 점이 있어야 "커버리지 있음"으로 본다.
+# waypointConverter는 travArea 점들 중에서만 고르므로, 로봇이 아직 가본 적 없어서
+# travArea가 비어 있는 곳은 우리 목표가 free여도 후보가 될 수 없다.
+TERRAIN_SUPPORT_RADIUS_M = 0.35
+
+# 접근 지점 탐색 범위. 물체에서 이만큼 떨어진 지점부터 훑는다. 하한이 1.0인 이유:
+# 물체 자체가 obstacleArea에 들어가므로 클리어런스 0.75m + 물체 반지름을 감안하면
+# 그보다 가까운 지점은 구조적으로 통과할 수 없다.
+TERRAIN_APPROACH_MIN_M = 1.00
+TERRAIN_APPROACH_MAX_M = 2.20
+TERRAIN_APPROACH_STEP_M = 0.20
+# 로봇->물체 방향 기준 각도 오프셋(도). 정면 접근이 막혀도 옆에서 되는 경우가 많다.
+TERRAIN_APPROACH_ANGLES_DEG = (0.0, 20.0, -20.0, 40.0, -40.0, 60.0, -60.0)
+
+# terrain 데이터가 이보다 오래되면 판정하지 않는다(보류).
+TERRAIN_STALE_SEC = 3.0
 
 # 확정된 목적지로 가는 주행(mission2 NAVIGATE_TARGET)의 경로 재계획 설정.
 # 탐색(EXPLORATION_*)과 값을 공유하지 않고 따로 두는 이유: 탐색 쪽 값은 "이 후보는
@@ -52,11 +90,20 @@ TARGET_STANDOFF_DISTANCE_M = 0.90
 # 접근 주행이라 마지막 구간에서 경로가 촘촘해야 재계획 기회도 자주 생기기 때문.
 TARGET_PATH_WAYPOINT_SPACING_M = 1.5
 
-# 주 재계획 트리거는 (1) hop 도착 (2) hop line-of-sight 차단이고, 이 타임아웃은 둘 다
-# 안 걸리는 경우(지도상으론 멀쩡한데 base autonomy가 실제로 못 가는 경우)만 잡는
-# 최후 백스톱이다. 8초(EXPLORATION_STUCK_TIMEOUT_SEC)는 실제로 갈 수 있는 목표를
-# 성급하게 포기하게 만들어서(2026-08-11) 여기서는 훨씬 길게 잡는다.
-TARGET_REPLAN_STUCK_TIMEOUT_SEC = 30.0
+# 목표에 가까워지지 못한 채 이 시간이 지나면 "base autonomy가 갈 수 있는 만큼 갔다"로
+# 보고 도달 판정으로 넘어간다.
+#
+# 30 -> 10 -> 20 (2026-08-12).
+#
+# 10초로 줄였더니 목표 6개가 전부 이 폴백으로 끝났고(정상 도달 0건), 도달 인정 거리가
+# 0.41~1.08m였다. 처음엔 "로봇이 물리적으로 더 못 붙는다"고 봤으나 RViz에서는 로봇이
+# goal에 거의 올라타 있었다 - 즉 우리가 접근을 중간에 끊고 있었을 가능성이 크다.
+#
+# 판정 기준이 "역대 최단거리가 EXPLORATION_STUCK_PROGRESS_M(10cm) 이상 줄었나"인데,
+# base autonomy는 목표에 가까워질수록 감속하므로 마지막 구간에서 10초 안에 10cm를
+# 못 줄이는 일이 생긴다. 그러면 아직 다가가는 중인데도 정지로 판정해버린다.
+# 시간을 늘려 그 조기 종료를 막는다.
+TARGET_REPLAN_STUCK_TIMEOUT_SEC = 20.0
 
 # 진전 없이(=hop 도착 없이) 연속으로 재계획한 횟수 상한. 넘으면 지금 지도로는 못 가는
 # 것으로 보고 탐사 재계획으로 넘긴다.
@@ -68,12 +115,21 @@ TARGET_REPLAN_MAX_COUNT = 3
 # "목적지 판정 반경(GOAL_REACHED_DISTANCE_M) 밖이지만 지금 지도로는 더 가까이 갈 수 없다"고
 # 확인됐을 때, 목적지에서 이 거리 안이면 도달로 인정한다.
 #
-# 필요한 이유: 목적지가 가구 바로 옆이면 plan_direct_path()가 목표를 통행 가능한 셀로
-# 최대 2m(_nearest_traversable radius=10) 스냅하므로, 실제 목적지까지 0.35m 안으로는
-# 절대 못 들어간다. 그 상태로 도착 판정을 고집하면 로봇은 멈춰 있는데 미션은 영원히
-# 진행되지 않는다(2026-08-11 mission3 실측: 0.43m 남기고 7분 정지, step 0/2).
-# 스냅 반경 2.0m보다 보수적으로 잡아서, 정말 엉뚱한 곳에서 끝났다고 우기지 않게 한다.
-TARGET_ARRIVAL_FALLBACK_MAX_M = 1.5
+# 필요한 이유: base autonomy의 waypointConverter가 우리 목표를 자기 traversable 지점
+# 으로 옮겨서 거기 주차하면(waypointTravAdj=true), 로봇은 이미 "갈 수 있는 만큼 간 것"
+# 이다. 그 상태에서 0.35m를 고집하는 건 시스템이 물리적으로 줄 수 없는 정밀도를
+# 요구하는 것이다(2026-08-11 실측: 0.43m 남기고 7분 정지, step 0/2).
+#
+# 기준점은 "우리가 발행한 goal marker"다(물체가 아니라). 접근 지점 자체가 이미 물체
+# 에서 갈 수 있는 만큼 가까이 잡힌 값(TERRAIN_APPROACH_*)이므로, 여기서는 "의도한
+# 지점까지 실제로 갔는가"만 본다.
+#
+# 2.2 -> 1.2 -> 0.5 -> 0.7 (2026-08-12): 2.2는 접근 지점 오차(최대
+# TERRAIN_APPROACH_MAX_M)와 더해져 물체에서 4m 넘게 떨어진 곳도 도달로 인정할 수 있어
+# 지나치게 관대했다. 반대로 너무 낮추면 0.43m 남기고 7분 정지하던 실패가 돌아온다.
+# 실측 도달 거리가 0.41~0.64m에 몰려 있어 그 위인 0.7로 잡았다.
+# GOAL_REACHED_DISTANCE_M(정상 판정)보다는 확실히 커야 두 판정이 구분된다.
+TARGET_ARRIVAL_FALLBACK_MAX_M = 0.7
 
 # 재계획 최소 간격(초). hop이 막혔다는 판정은 control_loop(0.2초)마다 나올 수 있어서,
 # 간격 제한이 없으면 "막힘 판정 -> 재계획 -> 같은 경로 -> 또 막힘 판정"이 0.2초마다

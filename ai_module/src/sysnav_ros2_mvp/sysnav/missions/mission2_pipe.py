@@ -74,13 +74,14 @@ def _on_selection_result(node, result: dict) -> None:
             node.state = "PLAN_EXPLORATION"
         return
 
-    x, y, theta = node.goal_publisher.object_approach_pose(pose, selected["position"])
-    # 목적지 좌표 하나를 그대로 던지지 않고, 현재 지도로 A* 경로를 만들어 hop 단위로
-    # 이동한다 - hop에 도착할 때마다(그리고 주행 중 hop이 막히면 즉시) 최신 지도로
-    # 경로를 다시 계산하기 위해서다. 경로를 못 만들면 start_target_navigation()이
-    # 알아서 기존 동작(목적지 직접 발행)으로 폴백한다.
+    # 접근 지점은 /terrain_map 기준으로 고른다 - base autonomy의 waypointConverter가
+    # 우리 좌표를 자기 traversable area로 스냅해버리므로, 그쪽이 받아들일 지점을
+    # 처음부터 찍어야 엉뚱한 데로 끌려가지 않는다 (navigation/terrain_monitor.py).
+    x, y, theta = node.approach_pose_for(pose, selected["position"])
     node.start_target_navigation(
-        pose, (x, y), theta, object_id=selected["object_id"],
+        pose, (x, y), theta,
+        object_id=selected["object_id"],
+        object_xy=selected["position"][:2],
     )
     # 선택된 target object를 Scene Graph에 표시하고 debug PNG/JSON/DOT을 갱신한다.
     node.scene_graph.mark_selected_object(selected["object_id"])

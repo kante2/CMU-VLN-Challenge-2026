@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 import math
+import os
 import threading
 import time
 
@@ -32,6 +33,7 @@ from sysnav.rooms.room_segmenter import RoomSegmenter
 from sysnav.rooms.room_visualizer import export_room_segmentation
 from sysnav.memory.object_memory import ObjectMemory
 from sysnav.navigation.goal_publisher import GoalPublisher
+from sysnav.navigation.terrain_monitor import TerrainMonitor
 from sysnav.perception.perception_pipeline import PerceptionPipeline
 from sysnav.reasoning.attribute_verifier import AttributeVerifier
 from sysnav.reasoning.gemini_selector import GeminiSelector
@@ -160,6 +162,7 @@ class SysNavNode(Node):
         self.room_relevance_selector = RoomRelevanceSelector()
         self.viewpoint_memory = ViewpointMemory()
         self.goal_publisher = GoalPublisher(self)
+        self.terrain_monitor = TerrainMonitor()
         self.object_marker_pub = self.create_publisher(MarkerArray, config.TOPIC_OBJECT_MARKERS, 10)
         # 채점 대상 토픽(README) - Object Reference/Numerical. 절대 이름/타입을 바꾸지
         # 말 것 (Marker 단수, MarkerArray 아님 - CLAUDE.md 하드-룰).
@@ -187,10 +190,15 @@ class SysNavNode(Node):
         # 재계획 때도 같은 제약이 유지돼야 하므로 목적지와 함께 들고 있는다.
         self.target_forbidden_mask = None
         self.target_object_id: int | None = None
+        self.target_object_xy: tuple[float, float] | None = None
+        self.target_marker_index: int | None = None
         self._target_replan_count = 0
         self._target_last_replan_time: float | None = None
         self._target_goal_best_distance_m: float | None = None
         self._target_goal_last_progress_time: float | None = None
+        # 진단용(동작 영향 없음)
+        self._target_retarget_count = 0
+        self._target_unreachable_reason: str | None = None
 
         # Mission 3(Instruction-Following, missions/mission3_pipe.py) 전용 상태 -
         # 여러 목적지를 순서대로 처리해야 해서 mission2/1과 달리 진행 인덱스가
@@ -232,6 +240,13 @@ class SysNavNode(Node):
             PointCloud2,
             config.TOPIC_SCAN,
             self.scan_callback,
+            qos_profile_sensor_data,
+            callback_group=self.callback_group,
+        )
+        self.terrain_sub = self.create_subscription(
+            PointCloud2,
+            config.TOPIC_TERRAIN_MAP,
+            self.terrain_callback,
             qos_profile_sensor_data,
             callback_group=self.callback_group,
         )
@@ -317,6 +332,14 @@ class SysNavNode(Node):
     def image_callback(self, msg: Image) -> None:
         with self.sensor_lock:
             self.latest_image = msg
+
+    def terrain_callback(self, msg: PointCloud2) -> None:
+        """base autonomy의 지형 분석 결과를 그대로 받아둔다. 목표를 어디에 찍을지
+        판정하는 데만 쓰고 주행 제어에는 관여하지 않는다."""
+        try:
+            self.terrain_monitor.update(msg)
+        except Exception as error:
+            self.get_logger().warning(f"terrain_map parse failed: {error}")
 
     def scan_callback(self, msg: PointCloud2) -> None:
         stamp = message_stamp_to_sec(msg) # ROS 메시지에는 촬영 시간이 존재, 이를 추출
@@ -978,6 +1001,8 @@ class SysNavNode(Node):
         self.target_final_theta = None
         self.target_forbidden_mask = None
         self.target_object_id = None
+        self.target_object_xy = None
+        self.target_marker_index = None
         # current_goal도 같이 지운다 - 안 지우면 도착/포기 후에도 직전 hop이 남아서,
         # 다음 step을 resolve하는 동안(mission3) 그 stale goal로 goal_reached()가
         # 참이 되어 "도착했다"고 잘못 판정될 수 있다.
@@ -987,6 +1012,7 @@ class SysNavNode(Node):
         self._target_last_replan_time = None
         self._target_goal_best_distance_m = None
         self._target_goal_last_progress_time = None
+        self._target_retarget_count = 0
 
     def start_target_navigation(
         self,
@@ -995,36 +1021,54 @@ class SysNavNode(Node):
         final_theta: float,
         forbidden_mask=None,
         object_id: int | None = None,
+        object_xy: tuple[float, float] | None = None,
+        marker_index: int | None = None,
     ) -> None:
         """확정된 목적지로 가는 주행을 시작한다.
 
-        A* 경로를 hop으로 잘라 첫 hop부터 발행한다. 경로 계산에 실패하면(목적지가 아직
-        미탐색 영역이거나 가구 속이라 스냅이 안 되는 등) 예전처럼 목적지 좌표를 그대로
-        발행하고 base autonomy에 맡긴다 - 여기서 곧바로 탐사로 빠지면 "실제로는 갈 수
-        있는데 known-free가 아니라는 이유로 포기"하는 예전 실패(2026-08-11, b66adde)를
-        그대로 반복하게 된다. 즉 A*가 도움이 될 때만 쓰고, 아니면 기존 동작 그대로다.
+        기본은 목적지 하나만 발행하고 base autonomy에 맡긴다. localPlanner + pathFollower가
+        이미 실시간 지형 기반 로컬 플래너로 돌고 있어서, 우리가 A*로 짧은 hop을 강제하면
+        도움이 아니라 그 판단과 싸우게 된다(5c12691에서 소스 확인 후 내린 결론).
+
+        예외는 forbidden_mask("avoid the path between A and B")뿐이다. 이 제약은 base
+        autonomy가 알 방법이 없으므로 우리가 우회 경로를 만들어 hop으로 내보내야 한다.
+
+        object_xy: 목표 물체 좌표. 주행 중 terrain이 갱신되어 지금 목표가 못 쓰게 되면
+          이걸로 접근 지점을 다시 고른다(step_target_navigation 참고).
+        marker_index: RViz goal 마커의 id(mission3의 step 인덱스). 주행 중 목표를 다시
+          고르면 이 id로 마커도 새 위치에 다시 그린다 - 안 그러면 마커는 옛 위치에
+          남고 실제 목표만 옮겨져서, RViz로 보는 거리와 로그의 dist_to_goal이 어긋난다.
         """
         self.clear_target_navigation()
         self.target_goal_xy = (float(goal_xy[0]), float(goal_xy[1]))
         self.target_final_theta = float(final_theta)
         self.target_forbidden_mask = forbidden_mask
         self.target_object_id = object_id
+        self.target_object_xy = None if object_xy is None else (
+            float(object_xy[0]), float(object_xy[1])
+        )
+        self.target_marker_index = marker_index
 
-        path, elapsed_ms = self._plan_target_path(pose)
-        if path:
-            self.target_route = deque(path)
-            self.get_logger().info(
-                f"🧭 TARGET PATH planned - {len(path)} hops to "
-                f"({self.target_goal_xy[0]:.2f}, {self.target_goal_xy[1]:.2f}), "
-                f"{elapsed_ms:.1f}ms, forbidden={'yes' if forbidden_mask is not None else 'no'}"
+        if forbidden_mask is not None:
+            path, elapsed_ms = self._plan_target_path(pose)
+            if path:
+                self.target_route = deque(path)
+                self.get_logger().info(
+                    f"🧭 TARGET PATH planned (forbidden constraint) - {len(path)} hops to "
+                    f"({self.target_goal_xy[0]:.2f}, {self.target_goal_xy[1]:.2f}), {elapsed_ms:.1f}ms"
+                )
+                self.publish_next_target_hop()
+                return
+            diag = self.coverage_planner.last_direct_path_diagnostics
+            self.get_logger().warning(
+                f"🧭 TARGET PATH unavailable ({diag.get('reason')}, {elapsed_ms:.1f}ms) - "
+                f"publishing goal directly; the forbidden-area constraint cannot be enforced"
             )
-            self.publish_next_target_hop()
-            return
 
-        diag = self.coverage_planner.last_direct_path_diagnostics
-        self.get_logger().info(
-            f"🧭 TARGET PATH unavailable ({diag.get('reason')}, {elapsed_ms:.1f}ms) - publishing "
-            f"goal directly and letting base autonomy drive (replan backstop stays armed)"
+        self._trace_navigation(
+            "GOAL",
+            f"({self.target_goal_xy[0]:.2f},{self.target_goal_xy[1]:.2f}) "
+            f"terrain[{self.terrain_monitor.describe()}]",
         )
         self._publish_target_goal(
             self.target_goal_xy[0], self.target_goal_xy[1], self.target_final_theta,
@@ -1074,14 +1118,33 @@ class SysNavNode(Node):
             self.target_goal_xy[1] - float(pose["y"]),
         ) <= config.GOAL_REACHED_DISTANCE_M
 
-    def target_hop_blocked(self, pose: dict) -> bool:
-        """주행 중 트리거: 지금 향하는 hop이 최신 지도 기준으로 막혔는지."""
-        if self.current_goal is None or self.current_goal.get("type") != "target":
-            return False
-        return not self.coverage_planner.hop_still_reachable(
-            (float(pose["x"]), float(pose["y"])),
-            (float(self.current_goal["x"]), float(self.current_goal["y"])),
+    def approach_pose_for(self, pose: dict, object_position) -> tuple[float, float, float]:
+        """물체로 접근할 (x, y, theta)를 정한다. mission2/3가 공용으로 쓴다.
+
+        1순위는 /terrain_map 기준으로 base autonomy가 받아들일 지점(TerrainMonitor).
+        terrain 데이터가 없거나 통과 지점을 못 찾으면 기존 고정 standoff 방식으로
+        폴백한다 - terrain 판정 실패가 주행 자체를 막으면 안 된다.
+        """
+        object_xy = (float(object_position[0]), float(object_position[1]))
+        robot_xy = (float(pose["x"]), float(pose["y"]))
+        chosen = self.terrain_monitor.choose_approach_point(object_xy, robot_xy)
+        if chosen is not None:
+            theta = math.atan2(object_xy[1] - chosen[1], object_xy[0] - chosen[0])
+            self._trace_navigation(
+                "APPROACH",
+                f"terrain ({chosen[0]:.2f},{chosen[1]:.2f}) "
+                f"obj=({object_xy[0]:.2f},{object_xy[1]:.2f}) "
+                f"{self.terrain_monitor.last_selection}",
+            )
+            return chosen[0], chosen[1], theta
+
+        x, y, theta = self.goal_publisher.object_approach_pose(pose, object_position)
+        self._trace_navigation(
+            "APPROACH",
+            f"fallback ({x:.2f},{y:.2f}) obj=({object_xy[0]:.2f},{object_xy[1]:.2f}) "
+            f"{self.terrain_monitor.last_selection}",
         )
+        return x, y, theta
 
     def target_progress_stalled(self, pose: dict) -> bool:
         """백스톱 트리거: TARGET_REPLAN_STUCK_TIMEOUT_SEC 동안 목표에 가까워지지 못함."""
@@ -1213,57 +1276,129 @@ class SysNavNode(Node):
         if self.target_destination_reached(pose):
             return "arrived"
 
-        # 2. hop 도착.
-        if self.goal_reached(pose):
-            # 중간 hop이면 이미 만들어둔 다음 hop을 그대로 발행한다. 여기서 매번
-            # 재계획하지 않는 이유: (1) 경로가 도중에 무효화되는 진짜 위험은 아래 3번
-            # LOS 감시가 0.2초 안에 잡으므로 매 hop 재계산은 최적화일 뿐이고,
-            # (2) 코너/문틀에서는 hop이 0.2m까지 촘촘해져서 도착이 0.2초마다 발생하는데,
-            # 그때마다 재계획을 시도하면 최소 간격(TARGET_REPLAN_MIN_INTERVAL_SEC)에
-            # 걸려 다음 hop을 못 내보내고 로봇이 hop마다 멈춰 선다.
-            if self.target_route:
-                self.publish_next_target_hop()
-                return "driving"
+        # 2. forbidden 경로일 때만 존재하는 중간 hop. 도착했으면 다음 hop을 낸다.
+        if self.target_route and self.goal_reached(pose):
+            self.publish_next_target_hop()
+            return "driving"
 
-            # 마지막 hop인데 목적지에 못 닿았다 - 이제서야 최신 지도로 다시 계산한다.
-            # 계획 당시보다 맵이 넓어져서 더 갈 수 있게 됐을 수 있다.
-            status = self.replan_target_route(pose, reason="final_hop_arrival")
-            if status in ("replanned", "cooldown"):
-                return "driving"
-            # "unchanged"(여기가 갈 수 있는 최선) / "failed" / "limit"
-            return self._accept_or_reject_arrival(pose, "no closer waypoint exists")
+        # 3. 주행 중 terrain이 갱신되어 지금 목표를 base autonomy가 못 받아들이게
+        #    됐으면 접근 지점을 다시 고른다. 판정 근거가 우리 occupancy grid가 아니라
+        #    /terrain_map인 게 핵심이다 - 로봇을 실제로 움직이는 쪽과 같은 데이터를
+        #    봐야 판정이 의미가 있다.
+        if self._retarget_if_unsupported(pose):
+            return "driving"
 
-        # 3. 주행 중 지도가 "이 hop 막혔다"고 알려주면 즉시 우회 경로를 만든다.
-        if self.target_hop_blocked(pose):
-            status = self.replan_target_route(pose, reason="hop_blocked")
-            if status in ("replanned", "cooldown", "unchanged"):
-                return "driving"
-            return "unreachable"
-
-        # 4. 1~3이 못 잡는 경우의 최후 백스톱(로봇이 그냥 멈춰 서 있는 경우 등).
+        # 4. 최후 백스톱. base autonomy가 스스로 멈춘 것이므로 "더 못 간다"는 판단은
+        #    우리 지도가 아니라 로봇의 실제 거동에서 온다.
         if self.target_progress_stalled(pose):
-            status = self.replan_target_route(pose, reason="progress_stalled")
-            if status in ("replanned", "cooldown"):
-                return "driving"
-            if status == "unchanged":
-                return self._accept_or_reject_arrival(pose, "stalled at closest reachable point")
-            return "unreachable"
+            return self._accept_or_reject_arrival(
+                pose, "stalled", "progress_stalled", "-"
+            )
 
         return "driving"
 
-    def _accept_or_reject_arrival(self, pose: dict, why: str) -> str:
-        distance = self.distance_to_target(pose)
-        if self.target_arrival_acceptable(pose):
-            self.get_logger().info(
-                f"🚩 ARRIVAL accepted at closest reachable point ({why}) - "
-                f"{distance:.2f}m from goal (limit {config.TARGET_ARRIVAL_FALLBACK_MAX_M:.2f}m)"
+    def _retarget_if_unsupported(self, pose: dict) -> bool:
+        """지금 목표가 terrain 기준으로 못 쓰게 됐으면 접근 지점을 다시 골라 발행한다.
+
+        재선택하려면 물체 좌표가 있어야 하므로 target_object_xy가 없으면(경유점 등)
+        아무것도 하지 않는다. forbidden 경로(hop 주행 중)도 건너뛴다 - 그건 우리가
+        만든 우회로라 여기서 덮으면 제약이 깨진다.
+        """
+        if self.target_object_xy is None or self.target_route or self.target_goal_xy is None:
+            return False
+        if not self.terrain_monitor.ready():
+            return False
+        if self.terrain_monitor.is_waypoint_supported(*self.target_goal_xy):
+            return False
+
+        now = time.monotonic()
+        if (
+            self._target_last_replan_time is not None
+            and now - self._target_last_replan_time < config.TARGET_REPLAN_MIN_INTERVAL_SEC
+        ):
+            return False
+        self._target_last_replan_time = now
+
+        robot_xy = (float(pose["x"]), float(pose["y"]))
+        chosen = self.terrain_monitor.choose_approach_point(self.target_object_xy, robot_xy)
+        if chosen is None:
+            self._trace_navigation(
+                "RETARGET_FAIL",
+                f"goal=({self.target_goal_xy[0]:.2f},{self.target_goal_xy[1]:.2f}) "
+                f"{self.terrain_monitor.last_selection}",
             )
-            return "arrived"
-        self.get_logger().warning(
-            f"🧭 TARGET unreachable ({why}) - {distance:.2f}m from goal, "
-            f"beyond {config.TARGET_ARRIVAL_FALLBACK_MAX_M:.2f}m"
+            return False
+
+        theta = math.atan2(
+            self.target_object_xy[1] - chosen[1], self.target_object_xy[0] - chosen[0]
         )
+        self._trace_navigation(
+            "RETARGET",
+            f"({self.target_goal_xy[0]:.2f},{self.target_goal_xy[1]:.2f}) -> "
+            f"({chosen[0]:.2f},{chosen[1]:.2f}) {self.terrain_monitor.last_selection}",
+        )
+        self.target_goal_xy = chosen
+        self.target_final_theta = theta
+        self._target_retarget_count += 1
+        self._publish_target_goal(chosen[0], chosen[1], theta, is_final=True)
+        self.refresh_goal_marker()
+        return True
+
+    def refresh_goal_marker(self) -> None:
+        """RViz goal 마커를 현재 목표 위치로 다시 그린다.
+
+        add_step_goal_marker()는 마커 id를 step 인덱스로만 결정하므로, 같은 인덱스로
+        다시 부르면 그 자리의 마커가 새 좌표로 교체된다. 목표를 옮기고 이걸 안 부르면
+        마커만 옛 위치에 남아서, 눈으로 보는 거리와 로그의 dist_to_goal이 어긋난다.
+        """
+        if self.target_marker_index is None or self.target_goal_xy is None:
+            return
+        self.goal_publisher.add_step_goal_marker(
+            self.target_marker_index,
+            self.target_goal_xy[0],
+            self.target_goal_xy[1],
+            label=f"goal{self.target_marker_index + 1}",
+        )
+
+    def _trace_navigation(self, event: str, detail: str) -> None:
+        """debug/sysnav_navigation_trace.txt에 한 줄 append (진단 전용, 동작 영향 없음)."""
+        if not config.SAVE_DEBUG_IMAGES:
+            return
+        try:
+            os.makedirs(config.DEBUG_DIR, exist_ok=True)
+            with open(os.path.join(config.DEBUG_DIR, "sysnav_navigation_trace.txt"), "a") as file:
+                file.write(f"{time.strftime('%H:%M:%S')} {event:12s} {detail}\n")
+        except Exception:
+            pass
+
+    def _note_unreachable(self, pose: dict, trigger: str, status: str) -> str:
+        """unreachable 사유를 한 줄로 모은다 - trigger/재계획 결과/A* 실패 사유가
+        원래 서로 다른 줄에 흩어져 있어서 이어붙여야만 원인을 알 수 있었다."""
+        diag = self.coverage_planner.last_direct_path_diagnostics
+        self._target_unreachable_reason = (
+            f"trigger={trigger} replan={status} planner={diag.get('reason')} "
+            f"dist_to_goal={self.distance_to_target(pose):.2f}m "
+            f"retargets={self._target_retarget_count} replans={self._target_replan_count}"
+        )
+        self._trace_navigation("UNREACHABLE", self._target_unreachable_reason)
+        self.get_logger().warning(f"🧭 TARGET unreachable - {self._target_unreachable_reason}")
         return "unreachable"
+
+    def _accept_or_reject_arrival(
+        self, pose: dict, why: str, trigger: str = "?", status: str = "?"
+    ) -> str:
+        distance = self.distance_to_target(pose)
+        if not self.target_arrival_acceptable(pose):
+            return self._note_unreachable(pose, trigger, status)
+        self._trace_navigation(
+            "ARRIVED",
+            f"{why} dist_to_goal={distance:.2f}m retargets={self._target_retarget_count}",
+        )
+        self.get_logger().info(
+            f"🚩 ARRIVAL accepted at closest reachable point ({why}) - "
+            f"{distance:.2f}m from goal (limit {config.TARGET_ARRIVAL_FALLBACK_MAX_M:.2f}m)"
+        )
+        return "arrived"
 
     def distance_to_target(self, pose: dict) -> float:
         if self.target_goal_xy is None:
