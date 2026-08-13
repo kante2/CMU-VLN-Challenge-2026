@@ -12,10 +12,7 @@ SELECT_TARGET -> NAVIGATE_TARGET -> SUCCESS.
 from __future__ import annotations
 
 from collections import deque
-import math
-import time
 
-from sysnav import config
 from sysnav.scene_graph.scene_graph_rviz import build_selected_object_marker
 
 

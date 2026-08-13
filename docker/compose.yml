@@ -16,8 +16,6 @@ services:
       - /dev/input:/dev/input
       - /dev/bus/usb:/dev/bus/usb
       - ../map:/home/docker/maps:ro
-      - ./waypoint_converter.launch:/home/docker/autonomy_stack_mecanum_wheel_platform/install/waypoint_converter/share/waypoint_converter/launch/waypoint_converter.launch:ro
-      - ./local_planner.launch:/tmp/sysnav_local_planner.launch:ro
     stdin_open: true
     tty: true
 

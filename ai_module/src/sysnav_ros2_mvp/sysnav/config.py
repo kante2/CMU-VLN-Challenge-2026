@@ -19,6 +19,10 @@ TOPIC_OBJECT_MARKERS = "/sysnav/object_markers"
 # 남긴다 - "success는 떴는데 실제로는 물체 앞까지 안 갔다"류 문제를 RViz에서 눈으로
 # 바로 확인하기 위함(goal_reached()의 도달 판정 반경 자체는 로봇 실제 위치와 별개).
 TOPIC_MISSION3_GOAL_MARKERS = "/sysnav/mission3_goal_markers"
+# mission3의 각 step 목적지(물체 위치)를 라벨과 함께 누적 표시하는 토픽
+# (missions/mission3_rviz.py). 위 GOAL_MARKERS가 "지금 주행 중인 접근 지점"이라면
+# 이쪽은 "이 step이 최종적으로 가리키는 대상"이라 목적이 다르다.
+TOPIC_MISSION3_STEP_MARKERS = "/sysnav/mission3_step_markers"
 # 채점 대상 토픽(README) - Object Reference: 이 두 개는 절대 이름/타입을 바꾸지 말 것
 # (Marker 단수, MarkerArray 아님 - CLAUDE.md의 하드-런 규칙).
 TOPIC_SELECTED_OBJECT_MARKER = "/selected_object_marker"
@@ -47,6 +51,11 @@ POSE_BUFFER_SIZE = 100
 # 몰려 있어서 0.5면 상당수가 즉시 도달로 잡히고, 그만큼 정지 대기 시간을 아낀다.
 # 주의: 탐색 waypoint 도착 판정에도 같이 쓰이는 공유 상수다.
 GOAL_REACHED_DISTANCE_M = 0.5
+# mission3는 탐색보다 엄격한 반경을 쓴다. 탐색용 반경을 그대로 쓰면 갓 발행한 step
+# goal이 로봇이 움직이기도 전에 도달로 처리될 수 있다. MIN_ACTIVE_SEC는 같은 이유로,
+# goal이 활성화된 직후에는 도착 판정을 아예 하지 않는 최소 시간이다.
+MISSION3_GOAL_REACHED_DISTANCE_M = 0.50
+MISSION3_GOAL_MIN_ACTIVE_SEC = 0.50
 # exploration goal까지 거리가 이 이상 줄지 않은 채 이 시간(초)이 지나면 도달 불가로 보고 포기한다.
 # (벽 너머 등 실제로는 갈 수 없는 waypoint에 로봇이 영원히 박혀있는 것을 막기 위한 안전장치)
 EXPLORATION_STUCK_TIMEOUT_SEC = 8.0
@@ -135,6 +144,11 @@ TARGET_REPLAN_MAX_COUNT = 3
 # 실측 도달 거리가 0.41~0.64m에 몰려 있어 그 위인 0.7로 잡았다.
 # GOAL_REACHED_DISTANCE_M(정상 판정)보다는 확실히 커야 두 판정이 구분된다.
 TARGET_ARRIVAL_FALLBACK_MAX_M = 0.7
+
+# 진전이 없을 때 "도달 인정/포기"로 넘어가기 전에 같은 goal을 몇 번까지 다시 쏴볼지.
+# base autonomy가 목표를 놓쳤을 뿐인 경우가 있고(waypointConverter 재타게팅, 메시지
+# 유실 등) 재발행은 비용이 없어서, 판정 전에 한 번은 시도해 보는 게 이득이다.
+TARGET_REPUBLISH_MAX_COUNT = 1
 
 # 재계획 최소 간격(초). hop이 막혔다는 판정은 control_loop(0.2초)마다 나올 수 있어서,
 # 간격 제한이 없으면 "막힘 판정 -> 재계획 -> 같은 경로 -> 또 막힘 판정"이 0.2초마다

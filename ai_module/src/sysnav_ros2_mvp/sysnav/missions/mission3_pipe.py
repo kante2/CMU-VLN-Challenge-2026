@@ -456,7 +456,16 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
     _start_navigate_to_point(node, task, pose, point, is_object_target=False)
 
 
-def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> None:
+def _step_label(step: dict) -> str:
+    """로그/마커에 쓸 step 설명. category step은 target 이름, point step은 mode(refs)."""
+    if step["resolve"] == "category":
+        return step["parsed"].get("target", "destination")
+    refs = step.get("point_refs", [])
+    categories = [ref.get("target", "?") for ref in refs]
+    return f"{step.get('point_mode', 'point')}({', '.join(categories)})"
+
+
+def _start_navigate_to_point(node, task: dict, pose: dict, point, is_object_target: bool) -> None:
     """mission2와 동일하게 node.start_target_navigation()으로 이동한다 - 목적지 좌표
     하나를 던지고 마는 대신, 현재 지도로 A* 경로를 만들어 hop 단위로 가면서 hop에
     도착할 때마다(그리고 주행 중 hop이 막히면 즉시) 경로를 다시 계산한다.
@@ -472,6 +481,13 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     base autonomy의 point-to-point 이동으로는 특정 영역을 피하도록 강제할 수 없어서,
     이 제약은 우리가 직접 우회 경로를 만들어야만 지켜진다.
     """
+    # 이 step이 가리키는 "대상" 자체를 라벨과 함께 RViz에 남긴다
+    # (TOPIC_MISSION3_STEP_MARKERS). 아래 goal 마커와 목적이 다르다 - 이건 "무엇을 향한
+    # step인가"이고 저건 "지금 어디로 주행 중인가"라서 둘 다 필요하다.
+    node.publish_mission3_step_destination(
+        node.mission3_step_index, point, _step_label(task["steps"][node.mission3_step_index])
+    )
+
     object_xy = None
     if is_object_target:
         # 접근 지점은 /terrain_map 기준으로 고른다 (navigation/terrain_monitor.py) -
@@ -507,34 +523,6 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     with node.state_lock:
         node.state = "MISSION3_NAVIGATE_STEP"
 
-    with node.sensor_lock:
-        pose = None if node.latest_pose is None else dict(node.latest_pose)
-    distance_note = ""
-    if pose is not None:
-        distance = math.hypot(float(goal["x"]) - pose["x"], float(goal["y"]) - pose["y"])
-        distance_note = f", robot_distance={distance:.2f}m"
-    node.get_logger().info(
-        f"🎯 STEP {node.mission3_step_index + 1} GOAL ACTIVE - "
-        f"({float(goal['x']):.2f}, {float(goal['y']):.2f}), "
-        f"arrival_radius={config.MISSION3_GOAL_REACHED_DISTANCE_M:.2f}m{distance_note}"
-    )
-
-
-def _mission3_goal_reached(node, pose: dict) -> bool:
-    """Accept arrival only for the currently active goal of this exact step."""
-    goal = node.current_goal
-    if not goal or goal.get("type") != "mission3_leg":
-        return False
-    if int(goal.get("step_index", -1)) != int(node.mission3_step_index):
-        return False
-    active_for = time.monotonic() - float(goal.get("activated_at_monotonic", 0.0))
-    if active_for < config.MISSION3_GOAL_MIN_ACTIVE_SEC:
-        return False
-    distance = math.hypot(
-        float(goal["x"]) - float(pose["x"]),
-        float(goal["y"]) - float(pose["y"]),
-    )
-    return distance <= config.MISSION3_GOAL_REACHED_DISTANCE_M
 
 
 def _navigate_step(node, task: dict, pose: dict) -> None:

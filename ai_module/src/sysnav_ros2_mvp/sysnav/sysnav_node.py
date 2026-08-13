@@ -212,6 +212,7 @@ class SysNavNode(Node):
         self._target_goal_last_progress_time: float | None = None
         # 진단용(동작 영향 없음)
         self._target_retarget_count = 0
+        self._target_republish_count = 0
         self._target_unreachable_reason: str | None = None
 
         # Mission 3(Instruction-Following, missions/mission3_pipe.py) 전용 상태 -
@@ -1055,6 +1056,7 @@ class SysNavNode(Node):
         self._target_goal_best_distance_m = None
         self._target_goal_last_progress_time = None
         self._target_retarget_count = 0
+        self._target_republish_count = 0
 
     def start_target_navigation(
         self,
@@ -1333,6 +1335,28 @@ class SysNavNode(Node):
         # 4. 최후 백스톱. base autonomy가 스스로 멈춘 것이므로 "더 못 간다"는 판단은
         #    우리 지도가 아니라 로봇의 실제 거동에서 온다.
         if self.target_progress_stalled(pose):
+            # 포기하기 전에 같은 goal을 한 번 다시 쏴본다. base autonomy가 어떤 이유로든
+            # (waypointConverter의 재타게팅, 메시지 유실 등) 목표를 놓았을 수 있는데,
+            # 재발행은 공짜이고 실패해도 잃는 게 없다. 그래도 진전이 없으면 그때 판정한다.
+            if self._target_republish_count < config.TARGET_REPUBLISH_MAX_COUNT:
+                self._target_republish_count += 1
+                goal = self.current_goal or {}
+                self._trace_navigation(
+                    "REPUBLISH",
+                    f"#{self._target_republish_count} goal=({goal.get('x', 0.0):.2f},"
+                    f"{goal.get('y', 0.0):.2f}) dist_to_goal={self.distance_to_target(pose):.2f}m",
+                )
+                self.get_logger().warning(
+                    f"♻️ TARGET GOAL STILL ACTIVE - no recent progress; re-publishing "
+                    f"({goal.get('x', 0.0):.2f}, {goal.get('y', 0.0):.2f})"
+                )
+                self.goal_publisher.publish(
+                    goal.get("x", 0.0), goal.get("y", 0.0), goal.get("theta", 0.0)
+                )
+                # 진행도 감시만 새로 시작한다. 최단거리 기록은 유지해서 pose 노이즈가
+                # 진전으로 둔갑하지 않게 한다.
+                self._target_goal_last_progress_time = time.monotonic()
+                return "driving"
             return self._accept_or_reject_arrival(
                 pose, "stalled", "progress_stalled", "-"
             )
