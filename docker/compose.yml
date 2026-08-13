@@ -4,6 +4,8 @@ services:
     container_name: iros2026_system
     privileged: true
     network_mode: host
+    # Keep Fast DDS shared-memory transport usable across ROS containers.
+    ipc: host
     environment:
       - DISPLAY
       - QT_X11_NO_MITSHM=1
@@ -14,6 +16,8 @@ services:
       - /dev/input:/dev/input
       - /dev/bus/usb:/dev/bus/usb
       - ../map:/home/docker/maps:ro
+      - ./waypoint_converter.launch:/home/docker/autonomy_stack_mecanum_wheel_platform/install/waypoint_converter/share/waypoint_converter/launch/waypoint_converter.launch:ro
+      - ./local_planner.launch:/tmp/sysnav_local_planner.launch:ro
     stdin_open: true
     tty: true
 
@@ -23,5 +27,6 @@ services:
       dockerfile: docker/Dockerfile
     container_name: iros2026_ai_module
     network_mode: host
+    ipc: host
     stdin_open: true
     tty: true

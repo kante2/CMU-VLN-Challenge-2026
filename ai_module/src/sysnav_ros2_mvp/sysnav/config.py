@@ -51,6 +51,11 @@ GOAL_REACHED_DISTANCE_M = 0.5
 # (벽 너머 등 실제로는 갈 수 없는 waypoint에 로봇이 영원히 박혀있는 것을 막기 위한 안전장치)
 EXPLORATION_STUCK_TIMEOUT_SEC = 8.0
 EXPLORATION_STUCK_PROGRESS_M = 0.10
+# Mission 2 target navigation keeps the original SysNav goal. If base autonomy
+# stops making progress (for example after waypointConverter prematurely
+# reports its adjusted point reached), republish that same original goal.
+TARGET_STUCK_TIMEOUT_SEC = 8.0
+TARGET_STUCK_PROGRESS_M = 0.10
 TARGET_STANDOFF_DISTANCE_M = 0.90
 
 # ---------------------------------------------------------------------------
@@ -153,6 +158,20 @@ SAM2_MIN_MASK_AREA_PX = 80
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_TEMPERATURE = 0.0
 
+# Natural-language categories are not always the visual vocabulary that
+# YOLO-World was trained to recognize (for example, "painting" may be detected
+# much more reliably as "wall picture").  Gemini proposes a few conservative
+# visual aliases once per question; detections are mapped back to the canonical
+# category before entering object memory and reasoning.
+LLM_VISUAL_ALIASES_ENABLED = os.getenv(
+    "LLM_VISUAL_ALIASES_ENABLED", "1"
+) not in ("0", "false", "False")
+LLM_VISUAL_ALIAS_MAX_PER_CATEGORY = int(
+    os.getenv("LLM_VISUAL_ALIAS_MAX_PER_CATEGORY", "3")
+)
+LLM_VISUAL_ALIAS_MAX_WORDS = int(os.getenv("LLM_VISUAL_ALIAS_MAX_WORDS", "4"))
+YOLO_ALIAS_DEDUP_IOU = float(os.getenv("YOLO_ALIAS_DEDUP_IOU", "0.70"))
+
 # 문장 -> (target, attributes, relation_chain) 파싱을 LLM(Gemini)이 하도록 켤지.
 # SysNav 논문 Sec. III의 G=(c_tgt, Φ) 정의를 그대로 따르는 task/llm_query_parser.py가
 # 이걸 담당한다 - 실패(키 없음/에러/빈 응답 등 무엇이든)하면 항상 정규식 기반
@@ -248,7 +267,7 @@ OCC_OCCUPIED = 100
 # 원래 0.45 -> 0.30으로 낮췄는데도 문 통과가 잘 안 돼서 더 낮춤(최소 통과 폭 0.4m).
 # 실제 로봇 폭을 몰라 정확한 값은 아니니, 나중에 실측되면 갱신할 것 - 로봇이 문틀에
 # 부딪히면 다시 올려야 한다.
-ROBOT_CLEARANCE_M = 0.20
+ROBOT_CLEARANCE_M = 0.21
 
 # Room Node segmentation (SysNav paper Sec. IV-A-1, "Scene Representation Building").
 # 논문은 3D point cloud에서 벽 평면을 피팅해서 방을 나누지만, 우리는 이미 2D top-down
@@ -333,6 +352,11 @@ VIEWPOINT_MIN_DISTANCE_M = 1.0
 # 주변 이 반경(m)만큼 non-traversable로 마킹해서 plan_direct_path()가 우회하게 한다.
 # 실제 문/복도 폭을 모르므로 대략적인 근사치 - 너무 크면 우회 자체가 불가능해질 수 있다.
 INSTRUCTION_FORBIDDEN_RADIUS_M = 0.8
+# Frontier coverage can be exhausted even when a camera-only target (painting,
+# picture, etc.) has not been detected. Mission 3 then patrols distinct known
+# traversable locations before declaring failure.
+MISSION3_RECOVERY_PATROL_MAX_POINTS = 10
+MISSION3_RECOVERY_PATROL_MIN_SPACING_M = 1.2
 
 # ---------------------------------------------------------------------------
 # Single-room scene graph

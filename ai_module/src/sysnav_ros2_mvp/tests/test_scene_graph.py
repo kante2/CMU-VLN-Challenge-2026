@@ -233,6 +233,41 @@ class SceneGraphManagerTest(unittest.TestCase):
             )
             self.assertEqual(saved["selected_object_id"], 7)
 
+    def test_single_nearest_candidate_waits_until_exploration_exhaustion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = SceneGraphManager(debug_dir=directory)
+            table, window = self._nodes()
+            table["category"] = "bedside table"
+            window["category"] = "window"
+            task = {
+                "raw": "the bedside table closest to the window",
+                "target": "bedside table",
+                "relation": "nearest",
+                "reference_objects": ["window"],
+                "relation_chain": [("bedside table", "nearest", "window")],
+            }
+            manager.start_task(1, task)
+            result = manager.add_observation(
+                image_rgb=np.zeros((480, 640, 3), dtype=np.uint8),
+                points_sensor=self._scan(),
+                pose={"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+                timestamp=10.0,
+                observations=[
+                    {"category": "bedside table", "bbox": (50, 180, 500, 430), "confidence": 0.90},
+                    {"category": "window", "bbox": (270, 100, 350, 210), "confidence": 0.92},
+                ],
+                object_ids=[1, 2],
+                object_nodes=[table, window],
+                task=task,
+            )
+
+            self.assertFalse(result["relation_edges"])
+            self.assertEqual(manager.find_matching_target_ids(task), [])
+            self.assertEqual(manager.finalize_unique_comparative_relation(task), 1)
+            self.assertEqual(manager.find_matching_target_ids(task), [1])
+            dot = (Path(directory) / "scene_graph_latest.dot").read_text(encoding="utf-8")
+            self.assertIn('label="nearest"', dot)
+
 
 if __name__ == "__main__":
     unittest.main()

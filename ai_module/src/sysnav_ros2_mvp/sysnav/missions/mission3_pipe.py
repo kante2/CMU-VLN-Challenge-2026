@@ -309,23 +309,58 @@ def loop(node, state: str, task: dict, task_id: int, pose: dict) -> None:
 
 def on_job_result(node, task: dict, kind: str, result: dict, origin_state: str) -> None:
     if kind == "perception":
-        _on_perception_result(node, origin_state)
+        _on_perception_result(node, task, origin_state)
     elif kind == "selection":
-        _on_selection_result(node, result)
+        _on_selection_result(node, task, result)
     elif kind == "exploration":
         _on_exploration_result(node, result)
 
 
-def _on_perception_result(node, origin_state: str) -> None:
+def _on_perception_result(node, task: dict, origin_state: str) -> None:
     # mission1과 같은 이유로 FOLLOW_EXPLORATION 중 관측은 이동을 방해하지 않는다.
     # OBSERVE에서 온 관측만 "이제 이번 step을 resolve할 수 있는지" 재시도한다.
     if origin_state == "OBSERVE":
         with node.state_lock:
             node.state = "MISSION3_SELECT_STEP"
+        return
+
+    # Recovery/regular exploration perception may discover the current target
+    # before the patrol route is finished. Stop exploration immediately and let
+    # selection verify attributes/relations instead of driving the stale route.
+    if origin_state == "FOLLOW_EXPLORATION":
+        steps = task.get("steps") or []
+        if node.mission3_step_index < len(steps):
+            step = steps[node.mission3_step_index]
+            if step.get("resolve") == "category":
+                target = step["parsed"].get("target", "")
+                if target and node.object_memory.find_by_category(target):
+                    node.exploration_route.clear()
+                    node.current_goal = None
+                    node.get_logger().info(
+                        f"🔍 RECOVERY TARGET SEEN - {target}; stopping patrol for verification"
+                    )
+                    with node.state_lock:
+                        node.state = "MISSION3_SELECT_STEP"
 
 
-def _on_selection_result(node, result: dict) -> None:
-    if result.get("relation_pending") or result.get("attribute_pending"):
+def _on_selection_result(node, task: dict, result: dict) -> None:
+    if result.get("relation_pending"):
+        step = task["steps"][node.mission3_step_index]
+        label = _step_label(step)
+        node.get_logger().info(
+            f"🔎 STEP {node.mission3_step_index + 1} DEFERRED - "
+            f"relation for {label} is not verified yet; planning further exploration"
+        )
+        with node.state_lock:
+            node.state = "PLAN_EXPLORATION"
+        return
+    if result.get("attribute_pending"):
+        step = task["steps"][node.mission3_step_index]
+        label = _step_label(step)
+        node.get_logger().info(
+            f"🔎 STEP {node.mission3_step_index + 1} DEFERRED - "
+            f"attributes for {label} are not verified yet; planning further exploration"
+        )
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
@@ -336,17 +371,57 @@ def _on_selection_result(node, result: dict) -> None:
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
-    _start_navigate_to_point(node, pose, selected["position"], is_object_target=True)
+    _start_navigate_to_point(node, task, pose, selected["position"], is_object_target=True)
 
 
 def _on_exploration_result(node, result: dict) -> None:
     route = result["route"]
     if not route:
+        task = node.task or {}
+        steps = task.get("steps") or []
+        if node.mission3_step_index < len(steps):
+            step = steps[node.mission3_step_index]
+            if step.get("resolve") == "category":
+                selected_id = node.scene_graph.finalize_unique_comparative_relation(
+                    step["parsed"]
+                )
+                if selected_id is not None:
+                    node.get_logger().info(
+                        f"🔗 UNIQUE COMPARATIVE RELATION - object #{selected_id} "
+                        "validated after exploration exhaustion"
+                    )
+                    with node.state_lock:
+                        node.state = "MISSION3_SELECT_STEP"
+                    return
+        with node.sensor_lock:
+            pose = None if node.latest_pose is None else dict(node.latest_pose)
+        recovery_points = node.mission3_recovery_points.setdefault(
+            int(node.mission3_step_index), []
+        )
+        if (
+            pose is not None
+            and len(recovery_points) < config.MISSION3_RECOVERY_PATROL_MAX_POINTS
+        ):
+            recovery_route = node.coverage_planner.plan_recovery_patrol(
+                pose, recovery_points
+            )
+            if recovery_route:
+                endpoint = recovery_route[-1]
+                recovery_points.append((float(endpoint["x"]), float(endpoint["y"])))
+                node.exploration_route = deque(recovery_route)
+                node.get_logger().info(
+                    f"🧭 RECOVERY PATROL {len(recovery_points)}/"
+                    f"{config.MISSION3_RECOVERY_PATROL_MAX_POINTS} - frontier exhausted, "
+                    f"checking viewpoint ({endpoint['x']:.2f}, {endpoint['y']:.2f})"
+                )
+                node.publish_next_exploration_goal()
+                return
         with node.state_lock:
             node.state = "FAILED"
         node.get_logger().warning(
             f"❌ TASK FAILED - mission3 step {node.mission3_step_index + 1} unresolved, "
-            f"no reachable frontier remains ({node.coverage_planner.describe_last_plan_failure()})"
+            f"frontier and recovery patrol exhausted "
+            f"({node.coverage_planner.describe_last_plan_failure()})"
         )
         return
     node.exploration_route = deque(route)
@@ -378,7 +453,7 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
-    _start_navigate_to_point(node, pose, point, is_object_target=False)
+    _start_navigate_to_point(node, task, pose, point, is_object_target=False)
 
 
 def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> None:
@@ -432,6 +507,35 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     with node.state_lock:
         node.state = "MISSION3_NAVIGATE_STEP"
 
+    with node.sensor_lock:
+        pose = None if node.latest_pose is None else dict(node.latest_pose)
+    distance_note = ""
+    if pose is not None:
+        distance = math.hypot(float(goal["x"]) - pose["x"], float(goal["y"]) - pose["y"])
+        distance_note = f", robot_distance={distance:.2f}m"
+    node.get_logger().info(
+        f"🎯 STEP {node.mission3_step_index + 1} GOAL ACTIVE - "
+        f"({float(goal['x']):.2f}, {float(goal['y']):.2f}), "
+        f"arrival_radius={config.MISSION3_GOAL_REACHED_DISTANCE_M:.2f}m{distance_note}"
+    )
+
+
+def _mission3_goal_reached(node, pose: dict) -> bool:
+    """Accept arrival only for the currently active goal of this exact step."""
+    goal = node.current_goal
+    if not goal or goal.get("type") != "mission3_leg":
+        return False
+    if int(goal.get("step_index", -1)) != int(node.mission3_step_index):
+        return False
+    active_for = time.monotonic() - float(goal.get("activated_at_monotonic", 0.0))
+    if active_for < config.MISSION3_GOAL_MIN_ACTIVE_SEC:
+        return False
+    distance = math.hypot(
+        float(goal["x"]) - float(pose["x"]),
+        float(goal["y"]) - float(pose["y"]),
+    )
+    return distance <= config.MISSION3_GOAL_REACHED_DISTANCE_M
+
 
 def _navigate_step(node, task: dict, pose: dict) -> None:
     outcome = node.step_target_navigation(pose)
@@ -458,5 +562,7 @@ def _navigate_step(node, task: dict, pose: dict) -> None:
     )
     node.clear_target_navigation()
     node.mission3_step_index += 1
+    node.mission3_recovery_points.pop(node.mission3_step_index - 1, None)
+    node.current_goal = None
     with node.state_lock:
         node.state = "MISSION3_SELECT_STEP"

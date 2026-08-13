@@ -16,7 +16,12 @@ import time
 from nav_msgs.msg import Odometry
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Int32, String
 from visualization_msgs.msg import Marker, MarkerArray
@@ -27,6 +32,7 @@ from sysnav.exploration.exploration_visualizer import export_exploration_debug
 from sysnav.exploration.viewpoint_memory import ViewpointMemory
 from sysnav.mission_dashboard import export_mission_dashboard
 from sysnav.missions import mission1_pipe, mission2_pipe, mission3_pipe
+from sysnav.missions.mission3_rviz import build_step_marker_array
 from sysnav.rooms import cross_room_navigator
 from sysnav.rooms.room_registry import RoomRegistry
 from sysnav.rooms.room_segmenter import RoomSegmenter
@@ -51,13 +57,14 @@ from sysnav.ros_helpers import (
 )
 from sysnav.task.llm_instruction_splitter import LLMInstructionSplitter
 from sysnav.task.llm_query_parser import LLMQueryParser
+from sysnav.task.llm_visual_aliases import LLMVisualAliasExpander
 from sysnav.task.mission_classifier import (
     MISSION_INSTRUCTION_FOLLOWING,
     MISSION_NUMERICAL,
     MISSION_OBJECT_REFERENCE,
     classify_mission,
 )
-from sysnav.task.query_parser import effective_relation_chain
+from sysnav.task.query_parser import effective_relation_chain, requires_comparative_ranking
 
 # state 이름 -> 처리할 mission pipe 모듈. 미션에 없는 state로 잘못 분기되지 않도록
 # question_callback에서 항상 task["mission_type"]을 이 dict의 키 중 하나로 채운다.
@@ -148,6 +155,7 @@ class SysNavNode(Node):
         self.perception = PerceptionPipeline()
         self.query_parser = LLMQueryParser()
         self.instruction_splitter = LLMInstructionSplitter()
+        self.visual_alias_expander = LLMVisualAliasExpander()
         self.object_memory = ObjectMemory()
         # Room/Viewpoint/Object node와 edge를 관리한다. Viewpoint는 매 프레임이 아니라
         # novel LiDAR voxel coverage가 충분할 때만 생성하며 debug graph를 갱신한다.
@@ -164,6 +172,12 @@ class SysNavNode(Node):
         self.goal_publisher = GoalPublisher(self)
         self.terrain_monitor = TerrainMonitor()
         self.object_marker_pub = self.create_publisher(MarkerArray, config.TOPIC_OBJECT_MARKERS, 10)
+        marker_qos = QoSProfile(depth=1)
+        marker_qos.reliability = ReliabilityPolicy.RELIABLE
+        marker_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.mission3_step_marker_pub = self.create_publisher(
+            MarkerArray, config.TOPIC_MISSION3_STEP_MARKERS, marker_qos
+        )
         # 채점 대상 토픽(README) - Object Reference/Numerical. 절대 이름/타입을 바꾸지
         # 말 것 (Marker 단수, MarkerArray 아님 - CLAUDE.md 하드-룰).
         self.selected_object_marker_pub = self.create_publisher(
@@ -205,6 +219,8 @@ class SysNavNode(Node):
         # 필요하다. 다른 미션에서는 안 쓰이므로 매 새 질문마다 리셋만 하면 무해하다.
         self.mission3_step_index = 0
         self.mission3_forbidden_mask = None
+        self.mission3_step_destinations: list[dict] = []
+        self.mission3_recovery_points: dict[int, list[tuple[float, float]]] = {}
 
         # Cross-room navigation(rooms/cross_room_navigator.py) - 이번 task 안에서
         # 이미 시도해본(가거나, 갔는데 경로가 안 됐던) room_id. 새 질문마다 리셋.
@@ -285,6 +301,18 @@ class SysNavNode(Node):
             self.get_logger().error(f"Could not parse question ({mission_type}): {msg.data}")
             return
 
+        # Expand only detector vocabulary. All downstream task constraints keep
+        # their canonical categories, and perception maps alias hits back before
+        # object memory sees them.
+        expanded_prompts, canonical_by_prompt, visual_aliases = (
+            self.visual_alias_expander.expand(
+                msg.data, list(parsed.get("detection_prompts") or [])
+            )
+        )
+        parsed["detection_prompts"] = expanded_prompts
+        parsed["canonical_by_detection_prompt"] = canonical_by_prompt
+        parsed["visual_aliases"] = visual_aliases
+
         with self.state_lock: # 읽는 도중 콜백으로 덮어쓰지 않도록 lock을 걸어준다.
             self.task_id += 1
             self.task = parsed
@@ -295,6 +323,8 @@ class SysNavNode(Node):
             self.last_processed_image_stamp = -1.0
             self.mission3_step_index = 0
             self.mission3_forbidden_mask = None
+            self.mission3_step_destinations.clear()
+            self.mission3_recovery_points.clear()
             self._cross_room_attempted_ids = set()
             self.task_start_time = time.monotonic()
             self.last_response_summary = None
@@ -475,6 +505,7 @@ class SysNavNode(Node):
             points_sensor=points_sensor, # pointcloud -> numpy
             prompts=list(task["detection_prompts"]), #  YOLO-World가 검출해야 하는 객체 목록 -> prompts
             robot_pose=pose, # LiDAR의 객체 point를 map 좌표로 변환
+            canonical_by_prompt=dict(task.get("canonical_by_detection_prompt") or {}),
         )
         '''
         < self.perception.process 내부 구조 >
@@ -557,14 +588,25 @@ class SysNavNode(Node):
                 for candidate in candidates
                 if int(candidate["object_id"]) in relation_candidate_ids
             ]
+        elif requires_comparative_ranking(task) and len(candidates) < 2:
+            # closest/nearest is an argmin.  A lone object is only the nearest
+            # seen so far, so it cannot become a destination until exploration
+            # exhaustion explicitly creates the unique-candidate relation edge.
+            return {"task_id": task_id, "selected_id": None, "relation_pending": True}
         elif effective_relation_chain(task):
             # 문장에 relation 제약(예: "knife rack 근처의")이 있는데 geometric/
             # co-observation 경로로는 아직 하나도 검증 안 됨 - 보통 참조 물체를
             # 아직 못 봤거나(전역 위치 없음), 유리창처럼 LiDAR grounding이 구조적으로
             # 실패해서(approximate 등급조차 못 만듦) 3D 위치 자체가 없기 때문.
             image_verified_ids: set[int] = set()
+            relation_chain = effective_relation_chain(task)
+            # A crop-based fallback can validate one local relation, but it
+            # cannot prove a nested chain. For A->B->C, every graph edge must
+            # exist; otherwise selecting A would silently ignore B->C.
+            if len(relation_chain) > 1:
+                return {"task_id": task_id, "selected_id": None, "relation_pending": True}
             if candidates:
-                first_relation, _, first_reference = effective_relation_chain(task)[0]
+                _, first_relation, first_reference = relation_chain[0]
                 if first_relation in ("nearest", "closest") and len(candidates) > 1:
                     # "nearest"는 최상급(비교) relation이라 후보마다 독립적으로
                     # yes/no만 물으면 안 된다 - bedside table이 2개 있고 둘 다 사진에
@@ -1422,6 +1464,28 @@ class SysNavNode(Node):
             self.get_clock().now().to_msg(),
         )
         self.object_marker_pub.publish(markers)
+
+    def publish_mission3_step_destination(self, step_index: int, point, label: str) -> None:
+        """Remember and publish a resolved instruction-following destination."""
+        destination = {
+            "step_index": int(step_index),
+            "position": tuple(float(value) for value in point),
+            "label": str(label),
+        }
+        self.mission3_step_destinations = [
+            item for item in self.mission3_step_destinations
+            if item["step_index"] != destination["step_index"]
+        ]
+        self.mission3_step_destinations.append(destination)
+        self.mission3_step_destinations.sort(key=lambda item: item["step_index"])
+        self.publish_mission3_step_markers()
+
+    def publish_mission3_step_markers(self) -> None:
+        markers = build_step_marker_array(
+            self.mission3_step_destinations,
+            self.get_clock().now().to_msg(),
+        )
+        self.mission3_step_marker_pub.publish(markers)
 
     # 디버깅용 mission_status_latest.html 갱신 - room_segmentation_latest.png와 같은
     # "항상 최신 상태 하나만 남기는" 패턴. MISSION_DASHBOARD_REFRESH_SEC로 스로틀링해서

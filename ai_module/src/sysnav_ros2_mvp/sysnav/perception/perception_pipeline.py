@@ -25,10 +25,58 @@ class PerceptionPipeline:
     def _format_detections(detections: list[dict]) -> str:
         if not detections:
             return "none"
-        return ", ".join(
-            f"{detection['category']}={float(detection.get('confidence', 0.0)):.2f}"
-            for detection in detections
+        formatted = []
+        for detection in detections:
+            detected_as = detection.get("detected_as")
+            alias = f"({detected_as})" if detected_as else ""
+            formatted.append(
+                f"{detection['category']}{alias}="
+                f"{float(detection.get('confidence', 0.0)):.2f}"
+            )
+        return ", ".join(formatted)
+
+    @staticmethod
+    def _box_iou(first: list[float], second: list[float]) -> float:
+        ax1, ay1, ax2, ay2 = (float(value) for value in first)
+        bx1, by1, bx2, by2 = (float(value) for value in second)
+        intersection = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(
+            0.0, min(ay2, by2) - max(ay1, by1)
         )
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - intersection
+        return intersection / union if union > 0.0 else 0.0
+
+    @classmethod
+    def _canonicalize_and_deduplicate(
+        cls, detections: list[dict], canonical_by_prompt: dict[str, str]
+    ) -> list[dict]:
+        """Map alias labels back and suppress duplicate boxes per canonical class."""
+        canonicalized = []
+        for original in detections:
+            detection = dict(original)
+            detected_as = str(detection.get("category", "")).strip().lower()
+            canonical = canonical_by_prompt.get(detected_as, detected_as)
+            detection["category"] = canonical
+            if canonical != detected_as:
+                detection["detected_as"] = detected_as
+            canonicalized.append(detection)
+
+        kept: list[dict] = []
+        for detection in sorted(
+            canonicalized,
+            key=lambda item: float(item.get("confidence", 0.0)),
+            reverse=True,
+        ):
+            duplicate = any(
+                other.get("category") == detection.get("category")
+                and cls._box_iou(other["bbox"], detection["bbox"])
+                >= config.YOLO_ALIAS_DEDUP_IOU
+                for other in kept
+            )
+            if not duplicate:
+                kept.append(detection)
+        return kept
 
     def _verify_low_confidence(self, image_rgb: np.ndarray, detections: list[dict]) -> list[dict]:
         # confidence가 DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD 밑인 것만 골라 Gemini
@@ -59,8 +107,12 @@ class PerceptionPipeline:
         points_sensor: np.ndarray,
         prompts: list[str],
         robot_pose: dict,
+        canonical_by_prompt: dict[str, str] | None = None,
     ) -> list[dict]:
         detections = self.detector.detect(image_rgb, prompts)
+        detections = self._canonicalize_and_deduplicate(
+            detections, canonical_by_prompt or {}
+        )
         self._logger.info(
             f"[Perception] YOLO-World detected: {self._format_detections(detections)} "
             f"(prompts={prompts})"

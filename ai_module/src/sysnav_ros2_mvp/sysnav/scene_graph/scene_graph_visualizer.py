@@ -21,14 +21,10 @@ class SceneGraphVisualizer:
     def export(self, graph: dict) -> dict:
         self.debug_dir.mkdir(parents=True, exist_ok=True)
         self._atomic_text(self.json_path, json.dumps(graph, ensure_ascii=False, indent=2))
-        # object-object 위치관계 edge는 DOT/PNG에 안 그린다 - 이제 sysnav_relation_check.txt가
-        # 그 검증 내역(참/거짓 전부)을 표로 남기므로 그래프 시각화는 중복이라 뺀다. 실제 관계
-        # 데이터(scene_graph_manager._edges)는 그대로 유지되고 target 선택 로직에 계속 쓰인다 -
-        # 여기서 걸러내는 건 오직 그림(DOT/PNG)에서만이다.
-        visual_graph = {
-            **graph,
-            "edges": [edge for edge in graph["edges"] if edge["edge_type"] != "object_object"],
-        }
+        # Object-object edges are shown only after SceneGraphManager has stored
+        # a validated relation.  This makes the graph itself explain why an
+        # object was promoted to a navigation destination.
+        visual_graph = graph
         self._atomic_text(self.dot_path, self._to_dot(visual_graph))
         self._write_png(visual_graph)
         return {

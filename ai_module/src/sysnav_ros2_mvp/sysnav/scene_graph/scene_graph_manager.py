@@ -235,6 +235,50 @@ class SceneGraphManager:
                 matched_roots.update(roots)
             return sorted(matched_roots)
 
+    def finalize_unique_comparative_relation(self, task: dict) -> int | None:
+        """Create a nearest edge when exhaustive search found one target only.
+
+        During exploration, a single observed source is merely the closest seen
+        so far and must not receive a superlative edge.  After reachable
+        frontiers are exhausted, however, one source is the unique global
+        candidate.  A reference node is still required so the resulting edge is
+        explicit and inspectable rather than an unverified destination shortcut.
+        """
+        chain = effective_relation_chain(task)
+        if not chain or chain[0][1] not in ("nearest", "closest"):
+            return None
+        source_category, relation, reference_category = chain[0]
+        with self._lock:
+            sources = [
+                obj for obj in self._objects.values()
+                if obj["category"] == source_category
+            ]
+            references = [
+                obj for obj in self._objects.values()
+                if obj["category"] == reference_category
+            ]
+            if len(sources) != 1 or not references:
+                return None
+            source = sources[0]
+            reference = min(
+                references,
+                key=lambda obj: float(np.linalg.norm(
+                    np.asarray(source["position"][:2], dtype=np.float64)
+                    - np.asarray(obj["position"][:2], dtype=np.float64)
+                )),
+            )
+            added = self._add_object_relation_edge(0, {
+                "source_object_id": int(source["object_id"]),
+                "target_object_ids": [int(reference["object_id"])],
+                "relation": relation,
+                "confidence": 1.0,
+                "method": "unique_after_exploration",
+                "reason": "only target instance after reachable-frontier exhaustion",
+            })
+            if added:
+                self._safe_export_locked()
+            return int(source["object_id"])
+
     def common_viewpoint_ids(self, object_ids: list[int]) -> list[int]:
         """Return representative viewpoints that observe every requested object."""
         requested = {int(value) for value in object_ids}

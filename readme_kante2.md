@@ -85,6 +85,7 @@ or
 ./docker/run_scene.sh <씬이름>
 # 예: ./docker/run_scene.sh office_2
 # 예: ./docker/run_scene.sh home_building_1
+# 예: ./docker/run_scene.sh hotel_room_1
 
 
 터미널 B — sysnav 실행 (컨테이너 재시작됐으니 새로 exec)
@@ -113,6 +114,9 @@ ros2 topic pub --once /challenge_question std_msgs/msg/String \
 "{data: 'First, go near the bedside table closest to the bench, then take the path between the TV and the bed to the picture closest to the TV.'}"
 
 
+
+ros2 topic pub --once /challenge_question std_msgs/msg/String \
+"{data: 'Go to the bedside table closest to the window and stop at the chair closest to the TV.'}"
 
 ## --------------------------------------------------
 ## A - 시뮬레이션 킬때, 방을 변경하고 싶으면 다음 sh을 실행 
