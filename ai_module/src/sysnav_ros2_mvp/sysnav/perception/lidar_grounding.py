@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import math
 
 import numpy as np
@@ -55,7 +56,12 @@ class PanoramaLidarGrounder:
         down = np.arctan2(z, horizontal) + math.radians(config.PANORAMA_PITCH_OFFSET_DEG)
         yaw = (yaw + math.pi) % (2.0 * math.pi) - math.pi
         u = np.floor(((yaw / (2.0 * math.pi)) + 0.5) * width).astype(np.int32) % width
-        v = np.floor(((down / math.pi) + 0.5) * height).astype(np.int32)
+        # 세로 스케일은 config.PANORAMA_V_FOV_DEG(실측 120도). 예전엔 math.pi(=180도)가
+        # 하드코딩돼 있어서 투영이 median 26px 위로 밀렸다 - 실측 근거는 config 주석과
+        # tests/check_pano_alignment_semantic.py 참고.
+        v = np.floor(
+            ((down / math.radians(config.PANORAMA_V_FOV_DEG)) + 0.5) * height
+        ).astype(np.int32)
         inside = (v >= 0) & (v < height)
         indices, u, v, ranges = indices[inside], u[inside], v[inside], ranges[inside]
 
@@ -66,28 +72,81 @@ class PanoramaLidarGrounder:
         return {"indices": indices[keep], "u": u[keep], "v": v[keep]}
 
     @staticmethod
-    def _dominant_depth_cluster(points_map: np.ndarray, robot_xyz: np.ndarray) -> np.ndarray:
-        """SAM2 mask 안에 들어온 point가 전부 같은 물체 표면이라는 보장이 없다 -
-        2D mask 경계가 부정확하거나, 목표 물체 앞/뒤에 다른 물체(가구, 문틀 모서리
-        등)가 살짝 겹쳐 있으면 서로 다른 깊이(depth)의 point가 한 mask 안에 섞여
-        들어온다. 그대로 median을 내면 두 물체 사이 허공에 3D 위치가 잡히는 오검출이
-        생긴다. 로봇 기준 거리로 1차원 클러스터링해서, point가 가장 많이 뭉친(=실제
-        물체 표면일 가능성이 가장 높은) 구간만 남긴다 - tmah_vlm의
-        weighted_centroid_target()과 같은 아이디어."""
+    def _cluster_labels(points: np.ndarray, gap_m: float) -> np.ndarray:
+        """3D 단일연결(single-linkage) 군집 라벨. gap_m 크기의 voxel로 나눈 뒤 인접한
+        (26-이웃) voxel끼리 BFS로 이어붙인다 - scipy 없이 O(n)이고, "이만큼 떨어지면
+        다른 물체"라는 기준을 3축 모두에 동일하게 적용한다."""
+        if len(points) == 0:
+            return np.empty(0, dtype=np.int64)
+        keys = np.floor(points / gap_m).astype(np.int64)
+        voxels: dict[tuple[int, int, int], list[int]] = {}
+        for index, key in enumerate(map(tuple, keys)):
+            voxels.setdefault(key, []).append(index)
+
+        labels = np.full(len(points), -1, dtype=np.int64)
+        neighbors = [
+            (dx, dy, dz)
+            for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+            if (dx, dy, dz) != (0, 0, 0)
+        ]
+        label = 0
+        for seed in voxels:
+            if labels[voxels[seed][0]] != -1:
+                continue
+            queue = deque([seed])
+            while queue:
+                current = queue.popleft()
+                indices = voxels.get(current)
+                if indices is None or labels[indices[0]] != -1:
+                    continue
+                labels[indices] = label
+                for dx, dy, dz in neighbors:
+                    key = (current[0] + dx, current[1] + dy, current[2] + dz)
+                    if key in voxels and labels[voxels[key][0]] == -1:
+                        queue.append(key)
+            label += 1
+        return labels
+
+    @staticmethod
+    def _dominant_object_cluster(
+        points_map: np.ndarray,
+        pixels_uv: np.ndarray,
+        bbox: tuple[int, int, int, int],
+    ) -> np.ndarray:
+        """SAM2 mask 안 point가 전부 같은 물체 표면이라는 보장이 없다 - mask 경계가
+        부정확하거나, 나란히 붙은 다른 가구가 함께 덮이면 서로 다른 물체의 point가
+        한 mask에 섞여 median이 두 물체 사이 허공을 가리킨다.
+
+        예전 구현은 "로봇까지의 거리"만으로 1차원 군집을 나눴다. 그래서 앞뒤로 겹친
+        물체는 걸러냈지만, **깊이는 같고 좌우로 떨어진** 물체(나란히 놓인 소파와 의자)는
+        한 군집으로 남아 분리되지 않았다 - GT 대조에서 chair와 sofa가 같은 3D 좌표
+        (3.15, 0.72, 0.46)로 나온 게 이 경우다. 그래서 3축 모두를 보는 3D 군집으로
+        바꿨다.
+
+        어느 군집이 "이 mask가 가리키는 물체"인지는 점 개수로만 정하면 안 된다 - 소파와
+        의자가 함께 덮였을 때 더 큰 소파가 이기면 의자 검출이 소파 위치를 받는다.
+        bbox 중심에 가까운 픽셀에 가중치를 줘서 고른다 (tmah_vlm의 center_ray_weights와
+        같은 발상)."""
         if len(points_map) < 3:
             return points_map
-        distances = np.linalg.norm(points_map - robot_xyz, axis=1)
-        order = np.argsort(distances)
-        sorted_distances = distances[order]
-        # 거리값이 DEPTH_CLUSTER_GAP_M 이상 벌어지는 지점마다 새 군집 시작
-        gaps = np.diff(sorted_distances) > config.DEPTH_CLUSTER_GAP_M
-        cluster_ids = np.concatenate([[0], np.cumsum(gaps)])
-        counts = np.bincount(cluster_ids)
-        if len(counts) == 1:
-            return points_map  # 애초에 한 덩어리(gap 없음) - 그대로 사용
-        dominant = int(np.argmax(counts))
-        keep_sorted = cluster_ids == dominant
-        return points_map[order[keep_sorted]]
+        labels = PanoramaLidarGrounder._cluster_labels(points_map, config.GROUNDING_CLUSTER_GAP_M)
+        if labels.max() <= 0:
+            return points_map  # 한 덩어리뿐 - 그대로 사용
+
+        x1, y1, x2, y2 = bbox
+        center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float64)
+        # bbox 반대각 절반을 척도로 삼아, 중심에서 멀어질수록 가중치가 완만히 준다.
+        scale = max(1.0, 0.5 * math.hypot(x2 - x1, y2 - y1))
+        pixel_distance = np.linalg.norm(pixels_uv.astype(np.float64) - center, axis=1)
+        weights = 1.0 / (1.0 + pixel_distance / scale)
+
+        best_label, best_score = 0, -1.0
+        for candidate in range(int(labels.max()) + 1):
+            selected = labels == candidate
+            score = float(weights[selected].sum())
+            if score > best_score:
+                best_score, best_label = score, candidate
+        return points_map[labels == best_label]
 
     @staticmethod
     def _crop(image_rgb: np.ndarray, mask: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray:
@@ -173,13 +232,21 @@ class PanoramaLidarGrounder:
                 projection_lidar_to_image["v"], projection_lidar_to_image["u"]
                 # segmented된 mask에 대해, projection["u"], projection["v"]에는 각 LiDAR 포인트가 투영된 이미지 좌표
                 ]
-            object_points = points_map[np.flatnonzero(selected)] # np.flatnonzero(selected)는 True인 index를 반환
-            object_points = object_points[np.isfinite(object_points).all(axis=1)]
-            # mask 안에 여러 깊이(depth)의 point가 섞여 들어왔으면(목표 물체 앞뒤로
-            # 다른 물체가 겹쳐 보이는 경우 등) 가장 많이 뭉친 깊이 구간만 남긴다 -
-            # 안 그러면 서로 다른 물체의 point가 섞여 median이 허공을 가리키는
-            # 오검출이 생긴다.
-            object_points = self._dominant_depth_cluster(object_points, robot_xyz)
+            chosen = np.flatnonzero(selected) # np.flatnonzero(selected)는 True인 index를 반환
+            object_points = points_map[chosen]
+            # 군집 선택이 bbox 중심 거리를 쓰므로, 살아남은 point의 투영 픽셀도 같은
+            # 순서로 함께 들고 간다.
+            object_pixels = np.column_stack([
+                projection_lidar_to_image["u"][chosen],
+                projection_lidar_to_image["v"][chosen],
+            ])
+            finite = np.isfinite(object_points).all(axis=1)
+            object_points, object_pixels = object_points[finite], object_pixels[finite]
+            # mask 안에 서로 다른 물체의 point가 섞여 들어왔으면(앞뒤로 겹친 경우뿐
+            # 아니라 나란히 붙은 가구까지) 이 mask가 가리키는 물체의 군집만 남긴다.
+            object_points = self._dominant_object_cluster(
+                object_points, object_pixels, segmented["bbox"]
+            )
             # mask 안에 들어온 lidar point가 approximate 등급 최소치보다도 적으면(0개
             # 포함) 방향/깊이 단서가 아예 없어 위치를 만들 수조차 없으므로 건너뜀
             if len(object_points) < config.GROUNDING_MIN_POINTS_APPROXIMATE:

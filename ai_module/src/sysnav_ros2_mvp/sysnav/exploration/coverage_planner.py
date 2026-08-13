@@ -1,12 +1,29 @@
-"""Single-room online occupancy mapping and frontier coverage planning.
+"""Single-room online occupancy mapping and surface-coverage exploration planning.
 
-In-room exploration candidate selection follows the SysNav paper (Sec. IV-B-1,
-"In-room Exploration Policy"): sample a pose horizon H, define a surface point
-set S (the free/non-free boundary), score each candidate by the still-uncovered
-surface it can see (wcov = |Scov(c) ∩ Ŝ|), pick candidates via stochastic
-sampling weighted by wcov (removing what they cover from Ŝ each pick, repeating
-until every remaining score falls below δ), repeat that K times, and keep the
-candidate set whose TSP tour is cheapest.
+In-room exploration follows the SysNav paper (Sec. IV-B-1, "In-room Exploration
+Policy"): sample a pose horizon H, define the surface point set S as the
+free/non-free boundary (non-free = occupied *and* unknown), and drive the robot
+until every surface point has been seen from within d_cover.
+
+Two details decide whether that actually happens:
+
+* S must include the occupied side. With only the unknown side (the classic
+  frontier) S empties out the moment the LiDAR has swept the room, and
+  exploration declares victory after a couple of viewpoints even though the
+  camera - which is what recognizes objects - has barely seen the place. With
+  the paper's definition S becomes the wall and furniture surfaces once unknown
+  space is gone, so frontier-chasing and surface-inspection are one objective at
+  two stages of the same map rather than two phases.
+* the covered set must persist. Coverage is `surface_point_mask & observed`, and
+  update_from_scan() accumulates `observed` for cells actually seen inside the
+  observe radius, so Ŝ (the still-uncovered surface) never silently resets.
+
+Candidates are then chosen by greedy set cover over Ŝ - each pick removes what it
+covers before the next - with the score decayed by distance so the robot does not
+ping-pong across the room, and the picks TSP-ordered into one tour. Candidates
+that scored but were not visited stay in a global horizon for the next cycle
+(the paper's rolling local/global window) instead of being resampled from
+scratch.
 """
 
 from __future__ import annotations
@@ -22,8 +39,12 @@ import numpy as np
 from sysnav import config
 from sysnav.exploration.frontier_extractor import FrontierExtractor
 from sysnav.exploration.viewpoint_memory import ViewpointMemory
+from sysnav.exploration import visibility_path
 
 _TSP_EXACT_MAX_N = 7
+# surface_point_mask()가 8-이웃으로 free/non-free 경계를 찾는다
+# (frontier_extractor의 같은 상수와 동일한 정의).
+_NEIGHBORS_8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 
 
 def _bresenham(row0: int, col0: int, row1: int, col1: int) -> list[tuple[int, int]]:
@@ -58,6 +79,12 @@ class CoveragePlanner:
         # 지금까지 관측된 point 중 가장 높은 z를 기록해뒀다가, 충분히 높이 닿은 셀만
         # "진짜 벽"으로 보는 데 쓴다 (RoomSegmenter._structural_wall_mask 참고).
         self.max_height = np.full((self.size_cells, self.size_cells), -np.inf, dtype=np.float32)
+        # "가까이서 실제로 훑어본" 셀 - frontier와 달리 지도가 known인지가 아니라
+        # EXPLORATION_OBSERVE_RADIUS_M 안에서 시야가 뚫린 채 관측됐는지를 기록한다
+        # (plan_floor_coverage()의 목표 함수). update_from_scan()이 LiDAR ray를
+        # 따라가며 채우므로 별도 LOS 계산이 필요 없다 - ray가 지나간 셀은 정의상
+        # 그 순간 로봇에서 실제로 보인 셀이다.
+        self.observed = np.zeros((self.size_cells, self.size_cells), dtype=bool)
         self.origin_x: float | None = None
         self.origin_y: float | None = None
         self.frontier_extractor = FrontierExtractor()
@@ -71,10 +98,15 @@ class CoveragePlanner:
         # 다시 잡혔는지 - 유리창처럼 LiDAR가 절대 못 뚫는 frontier 옆에 서 있으면
         # 이 값이 계속 늘어난다 (anchor_max_revisits 참고).
         self._anchor_visit_counts: dict[tuple[int, int], int] = {}
+        # 논문의 global horizon: 점수까지 매겼지만 이번 사이클에 방문하지 않은 후보를
+        # 다음 사이클로 넘겨 재사용한다 (plan_route의 rolling window).
+        self._global_horizon: list[tuple[int, int]] = []
         # plan_direct_path()가 실패했을 때 "왜"인지 남기는 진단 정보(cross-room
         # navigation처럼 두 점 사이 경로 하나만 구하는 호출용) - last_plan_diagnostics와
         # 같은 목적이지만 plan_route()의 후보 샘플링과는 무관한 별도 호출이라 분리했다.
         self.last_direct_path_diagnostics: dict = {}
+        # plan_floor_coverage()가 왜 멈췄는지(목표 도달 / 후보 없음 / 경로 없음) 남긴다.
+        self.last_floor_coverage_diagnostics: dict = {}
 
     def describe_last_plan_failure(self) -> str:
         return ", ".join(f"{key}={value}" for key, value in self.last_plan_diagnostics.items())
@@ -83,7 +115,9 @@ class CoveragePlanner:
         with self._lock:
             self.grid.fill(config.OCC_UNKNOWN)
             self.max_height.fill(-np.inf)
+            self.observed.fill(False)
             self._anchor_visit_counts.clear()
+            self._global_horizon.clear()
             if robot_pose is None:
                 self.origin_x = None
                 self.origin_y = None
@@ -100,11 +134,73 @@ class CoveragePlanner:
         with self._lock:
             return self.max_height.copy()
 
+    def reset_observed(self) -> None:
+        """observed 마스크만 비운다 - 다음 순회에서 같은 공간을 다시 훑게 만들 때
+        쓴다(EXPLORATION_COVERAGE_ROUNDS). occupancy 지도는 그대로 두는 게 핵심이다:
+        벽/장애물 정보는 경로 계획에 계속 필요하고 다시 그릴 이유가 없다."""
+        with self._lock:
+            self.observed.fill(False)
+
+    def snapshot_observed(self) -> np.ndarray:
+        with self._lock:
+            return self.observed.copy()
+
+    def floor_coverage(self) -> dict:
+        """"지금까지 가까이서 훑어본 바닥 면적"의 진행도. plan_route()의 frontier
+        기준(=지도가 known인가)과 달리, 실제로 관측 반경 안에서 본 free 셀만 센다."""
+        with self._lock:
+            free = self.grid == config.OCC_FREE
+            observed_free = free & self.observed
+            free_cells = int(free.sum())
+            observed_cells = int(observed_free.sum())
+        cell_area = self.resolution ** 2
+        return {
+            "free_cells": free_cells,
+            "observed_cells": observed_cells,
+            "ratio": (observed_cells / free_cells) if free_cells else 0.0,
+            "unobserved_area_m2": (free_cells - observed_cells) * cell_area,
+        }
+
     def surface_point_mask(self, grid: np.ndarray) -> np.ndarray:
-        """논문의 surface point set S(free/non-free 경계) - plan_route()가 candidate
-        점수(wcov)를 매길 때 쓰는 것과 동일한 마스크. 디버그 시각화 전용으로 외부에
-        노출한다 (exploration_visualizer.py)."""
+        """논문(Sec. IV-B-1)의 surface point set S: free와 non-free(occupied +
+        unknown) 사이의 경계. plan_route()가 candidate 점수(wcov)를 매길 때 쓰는 것과
+        동일한 마스크이고, 디버그 시각화(exploration_visualizer.py)에도 쓴다.
+
+        frontier_mask()와의 차이가 탐사 동작을 좌우한다: frontier는 unknown 쪽 경계만
+        보므로 LiDAR가 방을 한 번 휩쓸면 0이 되어 탐사가 끝나버린다(viewpoint 두어
+        곳에서 종료됐던 원인). 반면 S는 unknown이 사라지면 벽·가구 '표면'으로 남아,
+        로봇이 모든 표면을 d_cover 안에서 볼 때까지 탐사가 이어진다 - 물체를 보는 건
+        카메라이고 물체는 표면에 붙어 있으니 인식 목적과도 맞는다."""
+        free = grid == config.OCC_FREE
+        non_free = (grid == config.OCC_UNKNOWN) | (grid == config.OCC_OCCUPIED)
+        padded = np.pad(non_free, 1, constant_values=False)
+        adjacent = np.zeros_like(non_free, dtype=bool)
+        for dr, dc in _NEIGHBORS_8:
+            adjacent |= padded[1 + dr:1 + dr + grid.shape[0], 1 + dc:1 + dc + grid.shape[1]]
+        return free & adjacent
+
+    def frontier_mask(self, grid: np.ndarray) -> np.ndarray:
+        """free/unknown 경계만 - "아직 안 가본 공간이 남았는지"를 뜻하는 고전적 frontier.
+        surface_point_mask()가 탐사 목표를 정하는 데 쓰이는 것과 달리, 이쪽은 미탐색
+        공간을 절대 놓치지 않기 위한 anchor 후보 생성과 진단용으로만 쓴다."""
         return self.frontier_extractor._mask(grid)
+
+    def surface_coverage(self, grid: np.ndarray | None = None) -> dict:
+        """S 중 관측 반경 안에서 실제로 본 비율. 논문의 Ŝ(미커버 surface)를 그대로
+        보여주는 지표이고, observed 마스크가 누적되므로 런 전체에서 유지된다."""
+        with self._lock:
+            if grid is None:
+                grid = self.grid.copy()
+            observed = self.observed.copy()
+        surface = self.surface_point_mask(grid)
+        total = int(surface.sum())
+        covered = int((surface & observed).sum())
+        return {
+            "total": total,
+            "covered": covered,
+            "uncovered": total - covered,
+            "ratio": (covered / total) if total else 0.0,
+        }
 
     def _ensure_origin(self, pose: dict) -> None:
         if self.origin_x is None:
@@ -159,6 +255,7 @@ class CoveragePlanner:
             if len(points_base) > config.MAP_MAX_RAYS_PER_SCAN:
                 points_base = points_base[np.linspace(0, len(points_base) - 1, config.MAP_MAX_RAYS_PER_SCAN, dtype=np.int64)]
 
+            observe_radius_cells_sq = (config.EXPLORATION_OBSERVE_RADIUS_M / self.resolution) ** 2
             yaw = float(pose["yaw"])
             x_map = math.cos(yaw) * points_base[:, 0] - math.sin(yaw) * points_base[:, 1] + float(pose["x"])
             y_map = math.sin(yaw) * points_base[:, 0] + math.cos(yaw) * points_base[:, 1] + float(pose["y"])
@@ -175,11 +272,24 @@ class CoveragePlanner:
                 # 진행해서 벽 너머 공간을 통째로 free로 잘못 마킹했었다(탐색 디버그
                 # 이미지에서 벽을 뚫고 나가는 것처럼 보이는 frontier의 원인).
                 blocked = False
+                # ray를 따라 여기까지 왔다는 것 자체가 이 셀이 지금 로봇에서 보였다는
+                # 뜻이므로, 관측 반경 안이면 observed로 표시한다. ray는 로봇에서
+                # 바깥으로 순서대로 나아가니 거리는 단조 증가한다 - 반경을 한 번
+                # 벗어나면 그 뒤로는 검사할 필요가 없다(셀마다 hypot을 부르면
+                # 스캔당 수만 번이라 매핑이 눈에 띄게 느려진다).
+                within_observe_radius = True
                 for row, col in ray[:-1]:
                     if self.grid[row, col] == config.OCC_OCCUPIED:
                         blocked = True
                         break
                     self.grid[row, col] = config.OCC_FREE
+                    if within_observe_radius:
+                        dr = row - robot_cell[0]
+                        dc = col - robot_cell[1]
+                        if dr * dr + dc * dc <= observe_radius_cells_sq:
+                            self.observed[row, col] = True
+                        else:
+                            within_observe_radius = False
                 if blocked:
                     continue  # 벽 너머로 찍힌 것으로 추정되는 endpoint도 신뢰 안 함(occupied로도 안 찍음)
                 endpoints.append((endpoint[0], endpoint[1], float(z)))
@@ -189,26 +299,18 @@ class CoveragePlanner:
                     self.max_height[row, col] = z
             rr, cc = robot_cell
             radius = max(1, int(round(0.35 / self.resolution)))
-            self.grid[max(0, rr - radius):min(self.size_cells, rr + radius + 1), max(0, cc - radius):min(self.size_cells, cc + radius + 1)] = config.OCC_FREE
-
-    def _build_traversable(self, grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """occupancy grid -> (traversable, inflated).
-
-        traversable: 로봇 몸체(ROBOT_CLEARANCE_M)를 부풀린 장애물을 뺀 free 셀.
-          unknown 셀은 traversable이 아니다 - "아직 안 본 곳"을 통과 가능하다고
-          가정하면 벽 너머로 경로가 나버린다.
-        inflated: hop 사이 line-of-sight 판정에 쓰는 차단 마스크(같은 clearance).
-
-        plan_route()와 plan_direct_path()가 똑같이 쓰던 3줄이라
-        하나로 모았다 - 둘이 서로 다른 clearance를 쓰기 시작하면 조용히 어긋난다.
-        """
-        occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
-        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
-        inflated = cv2.dilate(
-            occupied, np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8)
-        ).astype(bool)
-        traversable = (grid == config.OCC_FREE) & (~inflated)
-        return traversable, inflated
+            row_slice = slice(max(0, rr - radius), min(self.size_cells, rr + radius + 1))
+            col_slice = slice(max(0, cc - radius), min(self.size_cells, cc + radius + 1))
+            # 이 박스는 반경이 0.35m(=clearance보다 넓다)라, 무조건 FREE로 덮어쓰면
+            # 로봇이 벽에 붙어 지나갈 때 벽 셀까지 지워버린다. 그러면 지도에서 벽이
+            # 사라져 그 자리가 traversable로 보이고, 목표/경로가 벽 안쪽에 잡혀
+            # 로봇이 벽에 박거나(goals on OCCUPIED) 벽 너머 유령 공간으로 새어나가
+            # traversable 그래프가 쪼개진다(도달 가능한 후보가 없어 탐사가 조기 종료).
+            # 그래서 UNKNOWN만 FREE로 풀고, 이미 관측된 장애물은 건드리지 않는다.
+            box = self.grid[row_slice, col_slice]
+            box[box == config.OCC_UNKNOWN] = config.OCC_FREE
+            # 로봇이 서 있는 자리는 당연히 관측된 것으로 본다.
+            self.observed[row_slice, col_slice] = True
 
     @staticmethod
     def _nearest_traversable(traversable: np.ndarray, row: int, col: int, radius: int = 8) -> tuple[int, int] | None:
@@ -281,11 +383,9 @@ class CoveragePlanner:
                 heapq.heappush(queue, (next_cost + heuristic, next_cost, neighbor))
         return None
 
-    def _simplify_path_indices(
-        self, path: list[tuple[int, int]], blocking: np.ndarray, max_hop_spacing_m: float | None = None
-    ) -> list[int]:
+    def _simplify_path_indices(self, path: list[tuple[int, int]], blocking: np.ndarray) -> list[int]:
         """A* 경로를 hop index 리스트로 줄인다 (string-pulling). 각 hop에서 다음 hop까지는
-        - max_hop_spacing_m(기본 EXPLORATION_PATH_WAYPOINT_SPACING_M) 이내면서
+        - EXPLORATION_PATH_WAYPOINT_SPACING_M 이내면서
         - inflated 그리드 기준 line-of-sight가 뚫려 있는 한(즉 그 사이에 벽이 없는 한)
         최대한 멀리 건너뛴다. 코너/문틀에서는 LOS가 막히는 지점에서 자동으로 hop이 촘촘해지고,
         뚫린 직선 구간에서는 hop이 줄어든다 - 고정 간격 downsample과 달리 hop 사이 직선이
@@ -293,8 +393,7 @@ class CoveragePlanner:
         n = len(path)
         if n <= 1:
             return [0] if path else []
-        spacing_m = config.EXPLORATION_PATH_WAYPOINT_SPACING_M if max_hop_spacing_m is None else max_hop_spacing_m
-        spacing_cells = max(1, int(round(spacing_m / self.resolution)))
+        spacing_cells = max(1, int(round(config.EXPLORATION_PATH_WAYPOINT_SPACING_M / self.resolution)))
         last_idx = n - 1
         indices = [0]
         i = 0
@@ -313,12 +412,11 @@ class CoveragePlanner:
         blocking: np.ndarray,
         final_theta: float | None,
         credited_len: int,
-        max_hop_spacing_m: float | None = None,
     ) -> list[dict]:
         """A* 경로(path)를 _simplify_path_indices로 줄인 hop들로 waypoint dict 목록을 만든다.
         마지막 hop만 candidate의 실제 score/coverage_score/theta를 지니고, 중간 hop들은
         진행 방향을 바라보며 score 0으로 그냥 지나가는 경유점이다."""
-        hop_indices = self._simplify_path_indices(path, blocking, max_hop_spacing_m)[1:] or [len(path) - 1]
+        hop_indices = self._simplify_path_indices(path, blocking)[1:] or [len(path) - 1]
         last_idx = len(path) - 1
 
         waypoints = []
@@ -348,58 +446,81 @@ class CoveragePlanner:
         return waypoints
 
     @staticmethod
+    def _waypoints_from_world_polyline(
+        points: list[tuple[float, float]], final_theta: float | None, credited_len: int
+    ) -> list[dict]:
+        """visibility_path.shortest_path()의 (x, y) polyline을 _leg_waypoints와
+        같은 waypoint dict 포맷으로 변환한다. polyline의 각 segment는 이미
+        Polygon.covers()로 충돌 없음이 검증돼 있으므로(grid LOS 재확인 불필요),
+        EXPLORATION_PATH_WAYPOINT_SPACING_M 간격으로 arc-length를 따라 다시
+        샘플링만 해서 hop을 만든다."""
+        if len(points) < 2:
+            return []
+        cumulative = [0.0]
+        for a, b in zip(points, points[1:]):
+            cumulative.append(cumulative[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+        total = cumulative[-1]
+        if total < 1e-9:
+            return []
+
+        def point_at(dist: float) -> tuple[float, float]:
+            for i in range(1, len(cumulative)):
+                if dist <= cumulative[i] + 1e-9:
+                    a, b = points[i - 1], points[i]
+                    seg_len = cumulative[i] - cumulative[i - 1]
+                    t = 0.0 if seg_len < 1e-9 else (dist - cumulative[i - 1]) / seg_len
+                    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+            return points[-1]
+
+        spacing = max(config.EXPLORATION_PATH_WAYPOINT_SPACING_M, 1e-3)
+        n_hops = max(1, int(math.ceil(total / spacing)))
+        dists = [min(total, spacing * k) for k in range(1, n_hops + 1)]
+        if dists[-1] < total - 1e-6:
+            dists.append(total)
+
+        waypoints = []
+        for i, dist in enumerate(dists):
+            x, y = point_at(dist)
+            is_final = i == len(dists) - 1
+            if is_final and final_theta is not None:
+                theta = final_theta
+            else:
+                nx, ny = point_at(dists[i + 1]) if i + 1 < len(dists) else (x, y)
+                theta = math.atan2(ny - y, nx - x) if (nx, ny) != (x, y) else 0.0
+            waypoints.append({
+                "x": x,
+                "y": y,
+                "theta": theta,
+                "score": float(credited_len) if is_final else 0.0,
+                "coverage_score": credited_len if is_final else 0,
+                "path_distance_m": dist,
+                "is_viewpoint": is_final,
+            })
+        return waypoints
+
+    @staticmethod
+    def _has_uncovered_nearby(
+        cell: tuple[int, int], uncovered_mask: np.ndarray, radius_cells: float
+    ) -> bool:
+        """cell 주변 d_cover 안에 아직 안 덮인 surface point가 하나라도 있는지.
+
+        후보를 "예전에 근처를 지나갔다"는 이유로 버리기 전에, 실제로 덮을 게 남았는지
+        확인하는 데 쓴다 (line-of-sight까지 보지 않는 값싼 사전 판정 - 정확한 점수는
+        나중에 scov에서 LOS까지 확인해서 매긴다)."""
+        radius = int(math.ceil(radius_cells))
+        row0 = max(0, cell[0] - radius)
+        row1 = min(uncovered_mask.shape[0], cell[0] + radius + 1)
+        col0 = max(0, cell[1] - radius)
+        col1 = min(uncovered_mask.shape[1], cell[1] + radius + 1)
+        return bool(uncovered_mask[row0:row1, col0:col1].any())
+
+    @staticmethod
     def _line_of_sight(occupied: np.ndarray, start: tuple[int, int], end: tuple[int, int]) -> bool:
         """start/end 자체는 항상 FREE라는 전제(둘 다 traversable/surface 셀)이므로 중간 셀만 검사한다."""
         for row, col in _bresenham(start[0], start[1], end[0], end[1])[1:-1]:
             if occupied[row, col]:
                 return False
         return True
-
-    def _stochastic_select(
-        self,
-        start: tuple[int, int],
-        candidates: list[tuple[int, int]],
-        scov: dict[tuple[int, int], set[tuple[int, int]]],
-        surface_points: set[tuple[int, int]],
-    ) -> list[tuple[tuple[int, int], set[tuple[int, int]]]]:
-        """wcov(c) = |Scov(c) ∩ Ŝ|에 비례한 확률로 후보를 하나씩 뽑고, 뽑을 때마다
-        그 후보가 덮는 surface point를 Ŝ에서 제거해 재계산 -> 남은 점수가 전부
-        δ 밑으로 떨어지면 멈춘다. 반환값은 (뽑힌 후보, 그 시점에 실제로 credit된
-        surface point 집합) 리스트.
-
-        EXPLORATION_MAX_CANDIDATES_PER_CYCLE로 한 번에 몇 개까지 뽑을지 제한한다 -
-        frontier anchor가 방 양쪽 끝처럼 서로 먼 곳에 여러 개 생길 수 있는데, 그걸
-        전부 한 cycle에 다 뽑아서 TSP로 묶어버리면 "이쪽 찍고 저쪽 찍고" 왔다갔다하는
-        경로가 나온다 - 다음 cycle에서 최신 지도로 다시 고르는 게 낫다.
-
-        뽑을 확률(weights)은 순수 wcov가 아니라 start(로봇 현재 위치)로부터의 거리로
-        감쇠시킨 값을 쓴다 - 안 그러면 방 양쪽 끝의 wcov 점수가 비슷할 때 매 cycle
-        50:50에 가깝게 왼쪽/오른쪽이 갈려서, cycle마다 반대쪽을 골라 "왔다갔다"하는
-        것처럼 보인다. 가까운 후보를 확실히 우선해서 이 진동을 줄인다(멈추는 기준인
-        delta 비교는 여전히 순수 wcov로 한다 - "커버할 게 남았는지"와 "그중 뭘 먼저
-        갈지"는 다른 문제라서)."""
-        pool = list(candidates)
-        uncovered = set(surface_points)
-        selected: list[tuple[tuple[int, int], set[tuple[int, int]]]] = []
-        max_candidates = max(1, int(config.EXPLORATION_MAX_CANDIDATES_PER_CYCLE))
-        halflife_cells = max(1e-6, config.EXPLORATION_DISTANCE_PENALTY_HALFLIFE_M / self.resolution)
-        while pool and len(selected) < max_candidates:
-            scores = np.array([len(scov[c] & uncovered) for c in pool], dtype=np.float64)
-            best = float(scores.max())
-            if best < config.EXPLORATION_MIN_SCORE_DELTA:
-                break
-            distances = np.array(
-                [math.hypot(c[0] - start[0], c[1] - start[1]) for c in pool],
-                dtype=np.float64,
-            )
-            weighted_scores = scores / (1.0 + distances / halflife_cells)
-            weights = weighted_scores / weighted_scores.sum()
-            pick_index = int(self._rng.choice(len(pool), p=weights))
-            picked = pool.pop(pick_index)
-            credited = scov[picked] & uncovered
-            uncovered -= credited
-            selected.append((picked, credited))
-        return selected
 
     @staticmethod
     def _tour_cost(start: tuple[int, int], ordered: list[tuple[int, int]]) -> float:
@@ -468,8 +589,10 @@ class CoveragePlanner:
         robot_cell = self.world_to_grid(robot_pose["x"], robot_pose["y"])
         if robot_cell is None:
             return self._fail(diag, "robot_cell_out_of_map")
-        traversable, inflated = self._build_traversable(grid)
         occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
+        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
+        inflated = cv2.dilate(occupied, np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8)).astype(bool)
+        traversable = (grid == config.OCC_FREE) & (~inflated)
         start = self._nearest_traversable(traversable, *robot_cell, radius=10)
         diag["robot_cell"] = robot_cell
         if start is None:
@@ -489,12 +612,24 @@ class CoveragePlanner:
         los_margin = max(1, int(round(config.FRONTIER_LOS_WALL_MARGIN_M / self.resolution)))
         los_blocking = cv2.dilate(occupied, np.ones((2 * los_margin + 1, 2 * los_margin + 1), np.uint8)).astype(bool)
 
-        # 논문의 surface point set S: free / non-free(occupied+unknown) 경계
-        frontier_mask = self.frontier_extractor._mask(grid)
-        surface_points = {tuple(cell) for cell in np.argwhere(frontier_mask)}
-        diag["surface_point_count"] = len(surface_points)
+        # 논문의 surface point set S(free/non-free 경계)와, 그중 아직 가까이서 보지
+        # 못한 Ŝ. 커버 여부는 observed 마스크(update_from_scan이 관측 반경 안에서 실제로
+        # 보인 셀만 기록)로 판단하므로 사이클을 넘어 누적된다 - 예전처럼 매 사이클
+        # frontier를 처음부터 다시 세는 방식은 "이미 훑은 표면"을 기억하지 못했다.
+        with self._lock:
+            observed = self.observed.copy()
+        surface_mask = self.surface_point_mask(grid)
+        uncovered_mask = surface_mask & (~observed)
+        surface_points = {tuple(cell) for cell in np.argwhere(uncovered_mask)}
+        diag["surface_point_count"] = int(surface_mask.sum())
+        diag["uncovered_surface_count"] = len(surface_points)
         if not surface_points:
-            return self._fail(diag, "no_surface_points_anywhere_in_known_map")
+            return self._fail(diag, "all_surface_points_covered")
+
+        # anchor(미탐색 공간 보장)는 여전히 unknown 쪽 경계 기준이다 - 표면이 남았다는
+        # 것과 "아직 안 가본 공간이 있다"는 것은 다른 문제라서 섞으면 안 된다.
+        frontier_mask = self.frontier_mask(grid)
+        diag["frontier_count"] = int(frontier_mask.sum())
 
         # 논문의 H_trav = {c in H | traversable(c) & m_j^r(c)=1} - candidate를 "지금 로봇이
         # 있는 방" 안으로만 제한한다. room 구분이 없으면(또는 로봇 위치가 아직 room으로
@@ -569,9 +704,45 @@ class CoveragePlanner:
         anchor_cells -= stale_anchor_cells
         diag["stale_anchor_count"] = len(stale_anchor_cells)
 
-        pool_cells = list(dict.fromkeys(pool_cells + list(anchor_cells) + list(stale_anchor_cells)))  # 순서 유지하며 중복 제거
+        # 미커버 표면(Ŝ) 옆에 설 자리도 "보장된" 후보로 넣는다. frontier anchor가 미탐색
+        # 공간을 놓치지 않게 하는 것과 같은 이유로, 남은 표면이 작을 때 무작위 샘플링이
+        # 우연히 그 근처를 못 뽑아 조기 종료하는 걸 막는다.
+        surface_anchor_cells: set[tuple[int, int]] = set()
+        uncovered_cells = np.argwhere(uncovered_mask)
+        if len(uncovered_cells):
+            stride = max(1, len(uncovered_cells) // 25)
+            for cell in uncovered_cells[::stride]:
+                anchor = self._nearest_traversable(
+                    traversable, int(cell[0]), int(cell[1]), radius=inflation + 3
+                )
+                if anchor is not None:
+                    surface_anchor_cells.add(anchor)
+        diag["surface_anchor_count"] = len(surface_anchor_cells)
+
+        # 논문의 rolling window: 지난 사이클에 점수까지 매겼지만 방문하지 않은 후보를
+        # 버리지 않고 global horizon으로 넘겨 재사용한다. 매번 처음부터 샘플링하면 이미
+        # 계산해둔 좋은 후보를 잃고, 남은 영역이 작을 때 못 뽑아서 조기 종료한다.
+        pool_cells = list(dict.fromkeys(
+            pool_cells
+            + list(anchor_cells)
+            + list(stale_anchor_cells)
+            + list(surface_anchor_cells)
+            + list(self._global_horizon)
+        ))  # 순서 유지하며 중복 제거
         diag["anchor_count"] = len(anchor_cells)
+        diag["global_horizon_in"] = len(self._global_horizon)
         diag["pool_cell_count"] = len(pool_cells)
+
+        # Scov 반경(논문의 d_cover). 반드시 "커버로 인정되는" 반경과 같아야 한다:
+        # 커버 판정은 observed 마스크로 하고 그건 EXPLORATION_OBSERVE_RADIUS_M 안에서만
+        # 채워지므로, 점수를 그보다 넓은 반경으로 매기면 플래너는 덮을 거라 믿고 갔는데
+        # 실제로는 안 덮여서 같은 후보를 영원히 재선택한다(실측: uncovered가 83에서
+        # 멈춘 채 사이클만 소모). 둘 중 좁은 쪽을 쓴다.
+        cover_radius_m = min(
+            config.FRONTIER_COVERAGE_RADIUS_M, config.EXPLORATION_OBSERVE_RADIUS_M
+        )
+        cover_radius_cells = cover_radius_m / self.resolution
+        diag["cover_radius_m"] = cover_radius_m
 
         candidates = []
         path_from_start: dict[tuple[int, int], list[tuple[int, int]]] = {}
@@ -579,15 +750,18 @@ class CoveragePlanner:
         rejected_by_astar = 0
         anchors_rejected_by_astar = 0
         for cell in pool_cells:
-            # 무작위 샘플은 "최근에 간 근처는 건너뛰기"(is_near_visited)를 적용해서 제자리
-            # 맴돌기를 막지만, frontier anchor는 예외다 - anchor는 "아직 안 풀린 frontier가
-            # 실제로 존재"할 때만 생기므로, 예전에 그 근처에 viewpoint가 하나 찍혔다고 걸러
-            # 버리면(그 viewpoint가 그 frontier를 실제로 해소 못 했는데도) 이 frontier를
-            # 영원히 다시 못 뽑는다 - 문 근처를 한 번 스쳐 지나간 적만 있어도 그 문 너머로
-            # 다시는 못 가는 게 바로 이 문제였다.
-            if cell not in anchor_cells:
+            # is_near_visited(방문 좌표 근처면 건너뛰기)는 목표가 frontier였을 때 제자리
+            # 맴돌기를 막기 위한 장치였다. 지금은 목표가 "아직 안 덮인 표면(Ŝ)"이고
+            # observed 마스크가 누적되므로, 이미 훑은 곳은 gain이 0이라 애초에 선택되지
+            # 않는다 - 즉 이 필터는 중복이면서, 아직 안 덮인 표면 앞 자리까지 "근처를
+            # 지나간 적 있다"는 이유로 막아버린다(실측: 후보 71개 중 69개가 이 필터에
+            # 걸려 같은 방을 5사이클이 아니라 32사이클에 훑었다). 그래서 실제로 덮을
+            # 표면이 남은 후보는 통과시키고, gain이 없는 후보에만 적용한다.
+            if cell not in anchor_cells and cell not in surface_anchor_cells:
                 x, y = self.grid_to_world(*cell)
-                if viewpoint_memory.is_near_visited(x, y):
+                if viewpoint_memory.is_near_visited(x, y) and not self._has_uncovered_nearby(
+                    cell, uncovered_mask, cover_radius_cells
+                ):
                     rejected_by_visited += 1
                     continue
             path = self._astar_path(traversable, start, cell)
@@ -606,7 +780,6 @@ class CoveragePlanner:
             return self._fail(diag, "all_pool_cells_rejected")
 
         # Scov(c) = c에서 d_cover 이내 + line-of-sight로 보이는 surface point들
-        cover_radius_cells = config.FRONTIER_COVERAGE_RADIUS_M / self.resolution
         scov: dict[tuple[int, int], set[tuple[int, int]]] = {}
         for c in candidates:
             covered = {
@@ -617,35 +790,64 @@ class CoveragePlanner:
             scov[c] = covered
         diag["candidates_with_nonempty_scov"] = sum(1 for c in candidates if scov[c])
 
-        best_cost: float | None = None
-        best_ordered: list[tuple[int, int]] = []
+        # 후보 선택: 남은 Ŝ에 대한 greedy set cover. 하나 고를 때마다 그 후보가 덮는
+        # surface point를 남은 집합에서 빼고 다시 고르므로, 같은 벽만 쳐다보는 후보가
+        # 여러 개 뽑히지 않는다. 점수는 로봇(또는 직전에 고른 후보)으로부터의 거리로
+        # 감쇠시킨다 - 순수 점수만 쓰면 방 양쪽 끝을 번갈아 고르며 왔다갔다한다.
+        # 멈추는 기준(MIN_SCORE_DELTA)은 감쇠 전 순수 점수로 판단한다: "덮을 게 남았나"와
+        # "무엇을 먼저 갈까"는 다른 문제다.
+        halflife_cells = max(
+            1e-6, config.EXPLORATION_DISTANCE_PENALTY_HALFLIFE_M / self.resolution
+        )
+        remaining = set(surface_points)
+        available = list(candidates)
+        picked: list[tuple[int, int]] = []
         best_credited: dict[tuple[int, int], set[tuple[int, int]]] = {}
-        for _ in range(config.EXPLORATION_STOCHASTIC_TRIALS):
-            selected = self._stochastic_select(start, candidates, scov, surface_points)
-            if not selected:
-                continue
-            picked_cells = [cell for cell, _ in selected]
-            credited_by_cell = dict(selected)
-            ordered = self._solve_tsp(start, picked_cells)
-            cost = self._tour_cost(start, ordered)
-            if best_cost is None or cost < best_cost:
-                best_cost = cost
-                best_ordered = ordered
-                best_credited = credited_by_cell
+        anchor_cell = start
+        while len(picked) < config.EXPLORATION_MAX_CANDIDATES_PER_CYCLE and remaining:
+            best_cell = None
+            best_priority = 0.0
+            best_gain: set[tuple[int, int]] = set()
+            for cell in available:
+                gain = scov[cell] & remaining
+                if len(gain) < config.EXPLORATION_MIN_SCORE_DELTA:
+                    continue
+                distance = math.hypot(cell[0] - anchor_cell[0], cell[1] - anchor_cell[1])
+                priority = len(gain) / (1.0 + distance / halflife_cells)
+                if priority > best_priority:
+                    best_priority = priority
+                    best_cell = cell
+                    best_gain = gain
+            if best_cell is None:
+                break
+            picked.append(best_cell)
+            best_credited[best_cell] = best_gain
+            remaining -= best_gain
+            available = [cell for cell in available if cell != best_cell]
+            anchor_cell = best_cell
 
-        if not best_ordered:
-            # 모든 trial에서 EXPLORATION_MIN_SCORE_DELTA를 넘는 candidate가 하나도 없었다는
-            # 뜻이다. 그렇다고 바로 포기하면(exploration 완전 중단) 문처럼 멀어서 wcov 점수가
-            # 낮게 나오는 것 말고는 갈 곳이 없는 상황(예: 방을 거의 다 본 뒤 문틈만 남은 경우)
-            # 에서 실제로는 갈 곳이 있는데도 탐색이 조기 종료된다. score가 조금이라도 있는
-            # candidate 중 최고점 하나만이라도 골라서 이어간다.
+        if not picked:
+            # MIN_SCORE_DELTA를 넘는 후보가 없다. 바로 포기하면 문처럼 멀어서 점수가 낮게
+            # 나오는 것 말고는 갈 곳이 없는 상황(방을 거의 다 본 뒤 문틈만 남은 경우)에서
+            # 탐색이 조기 종료되므로, 조금이라도 덮는 후보 중 최고점 하나는 살린다.
             fallback = max(candidates, key=lambda c: len(scov[c]), default=None)
             if fallback is not None and scov[fallback]:
-                best_ordered = [fallback]
+                picked = [fallback]
                 best_credited = {fallback: set(scov[fallback])}
 
-        if not best_ordered:
+        if not picked:
+            self._global_horizon = []
             return self._fail(diag, "no_candidate_had_any_visible_uncovered_surface_point")
+
+        best_ordered = self._solve_tsp(start, picked) if len(picked) > 1 else picked
+        # 점수는 있었지만 이번에 방문하지 않는 후보는 다음 사이클로 넘긴다.
+        leftover = [
+            cell for cell in candidates
+            if cell not in best_credited and scov[cell]
+        ]
+        self._global_horizon = leftover[: config.EXPLORATION_GLOBAL_HORIZON_MAX]
+        diag["picked_count"] = len(best_ordered)
+        diag["global_horizon_out"] = len(self._global_horizon)
 
         diag["reason"] = "ok"
         self.last_plan_diagnostics = diag
@@ -655,13 +857,14 @@ class CoveragePlanner:
         # 찍어서 로봇이 벽에 막히는 문제 방지).
         route: list[dict] = []
         leg_start = start
+        leg_start_world = self.grid_to_world(*start)
+        # Same reasoning as plan_recovery_patrol()/plan_direct_path(): grid A*'s
+        # LOS-based hop simplification only "sees" collisions at
+        # MAP_RESOLUTION_M, so a leg can graze clearance in a small cluttered
+        # room. Try the continuous visibility-graph route first, falling back
+        # to the existing (cached-or-fresh) grid A* unchanged if unavailable.
+        polygon = visibility_path.build_traversable_polygon(traversable, self.grid_to_world)
         for cell in best_ordered:
-            path = path_from_start.get(cell) if leg_start == start else None
-            if path is None:
-                path = self._astar_path(traversable, leg_start, cell)
-            if path is None:
-                # 이 leg만 도달 불가 -> 이 candidate는 건너뛰고 다음 candidate로 이어간다.
-                continue
             credited = best_credited.get(cell, set())
             final_theta: float | None = None
             if credited:
@@ -669,8 +872,28 @@ class CoveragePlanner:
                 ux, uy = self.grid_to_world(sum(rows) / len(rows), sum(cols) / len(cols))
                 x, y = self.grid_to_world(*cell)
                 final_theta = math.atan2(uy - y, ux - x)
+
+            goal_world = self.grid_to_world(*cell)
+            polyline = visibility_path.shortest_path(
+                polygon, leg_start_world, goal_world, simplify_tolerance=2.0 * self.resolution
+            )
+            if polyline is not None:
+                waypoints = self._waypoints_from_world_polyline(polyline, final_theta, len(credited))
+                if waypoints:
+                    route.extend(waypoints)
+                    leg_start = cell
+                    leg_start_world = goal_world
+                    continue
+
+            path = path_from_start.get(cell) if leg_start == start else None
+            if path is None:
+                path = self._astar_path(traversable, leg_start, cell)
+            if path is None:
+                # 이 leg만 도달 불가 -> 이 candidate는 건너뛰고 다음 candidate로 이어간다.
+                continue
             route.extend(self._leg_waypoints(path, nav_blocking, final_theta, len(credited)))
             leg_start = cell
+            leg_start_world = goal_world
         return route
 
     def plan_direct_path(
@@ -679,7 +902,6 @@ class CoveragePlanner:
         goal_xy: tuple[float, float],
         final_theta: float | None = None,
         forbidden_mask: np.ndarray | None = None,
-        max_hop_spacing_m: float | None = None,
     ) -> list[dict] | None:
         """start_pose에서 goal_xy까지 벽(+옵션으로 forbidden_mask)을 피해가는 A*
         경로를 waypoint 시퀀스로 만든다. plan_route()와 달리 "다음에 어디를 탐색할지"
@@ -705,7 +927,10 @@ class CoveragePlanner:
             self.last_direct_path_diagnostics = diag
             return None
 
-        traversable, inflated = self._build_traversable(grid)
+        occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
+        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
+        inflated = cv2.dilate(occupied, np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8)).astype(bool)
+        traversable = (grid == config.OCC_FREE) & (~inflated)
         if forbidden_mask is not None and forbidden_mask.shape == traversable.shape:
             traversable = traversable & (~forbidden_mask)
         diag["traversable_cell_count"] = int(traversable.sum())
@@ -726,6 +951,28 @@ class CoveragePlanner:
             )
             self.last_direct_path_diagnostics = diag
             return None
+
+        # Same reasoning as plan_recovery_patrol(): grid A*'s LOS-based hop
+        # simplification only ever "sees" collisions at MAP_RESOLUTION_M, so a
+        # step's destination leg can graze clearance in a small cluttered
+        # room. Try the continuous visibility-graph route first (forbidden_mask
+        # is already baked into `traversable` above, so it's respected here
+        # too), falling back to grid A* unchanged if unavailable/no path.
+        polygon = visibility_path.build_traversable_polygon(traversable, self.grid_to_world)
+        polyline = visibility_path.shortest_path(
+            polygon,
+            (float(start_pose["x"]), float(start_pose["y"])),
+            (float(goal_xy[0]), float(goal_xy[1])),
+            simplify_tolerance=2.0 * self.resolution,
+        )
+        if polyline is not None:
+            waypoints = self._waypoints_from_world_polyline(polyline, final_theta, credited_len=0)
+            if waypoints:
+                diag["reason"] = "ok_visibility_graph"
+                diag["path_len"] = len(polyline)
+                self.last_direct_path_diagnostics = diag
+                return waypoints
+
         path = self._astar_path(traversable, start, goal)
         if path is None:
             # start/goal 둘 다 traversable인 건 확인됐는데, 그 사이를 잇는 경로가
@@ -739,7 +986,141 @@ class CoveragePlanner:
         diag["reason"] = "ok"
         diag["path_len"] = len(path)
         self.last_direct_path_diagnostics = diag
-        return self._leg_waypoints(path, inflated, final_theta, credited_len=0, max_hop_spacing_m=max_hop_spacing_m)
+        return self._leg_waypoints(path, inflated, final_theta, credited_len=0)
+
+    def plan_floor_coverage(self, robot_pose: dict) -> list[dict]:
+        """frontier가 소진된 뒤 "아직 가까이서 안 본 바닥"을 목표로 이어서 탐사한다.
+
+        plan_route()는 free/unknown 경계(frontier)를 목표로 하므로, LiDAR가 한 번
+        휩쓸어 방 전체가 known이 되면 갈 곳이 없다고 판단해 멈춘다. 그런데 물체를
+        보는 건 카메라이고, 그 시점에 카메라는 방의 일부만 봤다. 여기서는 목표를
+        "observed 마스크가 아직 안 찍힌 free 셀"로 바꿔서, 그런 셀을 한 번에 가장
+        많이 새로 볼 수 있는 지점을 골라 이동한다 (다른 팀 구현의 floor-coverage
+        greedy set cover와 같은 발상이지만, 전체 지도를 미리 아는 오프라인이 아니라
+        지금까지 만든 지도 위에서 한 지점씩 온라인으로 고른다).
+
+        반환: plan_route()와 같은 waypoint dict 리스트. 더 볼 곳이 없거나 목표
+        커버리지에 도달했으면 빈 리스트."""
+        diag: dict = {}
+        coverage = self.floor_coverage()
+        diag["coverage_ratio"] = round(coverage["ratio"], 4)
+        diag["unobserved_area_m2"] = round(coverage["unobserved_area_m2"], 2)
+        if coverage["free_cells"] == 0:
+            return self._fail_floor(diag, "nothing_mapped_yet")
+        if coverage["ratio"] >= config.EXPLORATION_FLOOR_COVERAGE_TARGET:
+            return self._fail_floor(diag, "coverage_target_reached")
+
+        with self._lock:
+            grid = self.grid.copy()
+            observed = self.observed.copy()
+            origin_ready = self.origin_x is not None
+        if not origin_ready:
+            return self._fail_floor(diag, "origin_not_ready")
+        robot_cell = self.world_to_grid(robot_pose["x"], robot_pose["y"])
+        if robot_cell is None:
+            return self._fail_floor(diag, "robot_cell_out_of_map")
+
+        occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
+        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
+        inflated = cv2.dilate(occupied, np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8)).astype(bool)
+        traversable = (grid == config.OCC_FREE) & (~inflated)
+        start = self._nearest_traversable(traversable, *robot_cell, radius=10)
+        if start is None:
+            return self._fail_floor(diag, "robot_not_near_any_traversable_cell")
+
+        # 관측 여부 판정은 몸체 clearance가 아니라 순수 가시선 문제라, plan_route()의
+        # scov와 같은 이유로 얇은 margin만 쓴다.
+        los_margin = max(1, int(round(config.FRONTIER_LOS_WALL_MARGIN_M / self.resolution)))
+        los_blocking = cv2.dilate(occupied, np.ones((2 * los_margin + 1, 2 * los_margin + 1), np.uint8)).astype(bool)
+
+        targets = [tuple(cell) for cell in np.argwhere((grid == config.OCC_FREE) & (~observed))]
+        diag["unobserved_cell_count"] = len(targets)
+        if not targets:
+            return self._fail_floor(diag, "no_unobserved_free_cells")
+
+        traversable_cells = np.argwhere(traversable)
+        if len(traversable_cells) == 0:
+            return self._fail_floor(diag, "no_traversable_cells")
+        sample_n = min(config.EXPLORATION_CANDIDATE_SAMPLES, len(traversable_cells))
+        sample_idx = self._rng.choice(len(traversable_cells), size=sample_n, replace=False)
+        pool = [(int(traversable_cells[i][0]), int(traversable_cells[i][1])) for i in sample_idx]
+        # 미관측 셀 바로 옆에 설 자리를 항상 후보에 넣어둔다 - 무작위 샘플만 쓰면
+        # 남은 미관측 영역이 작을 때 우연히 근처 후보가 안 뽑혀 조기 종료된다
+        # (plan_route()의 frontier anchor와 같은 안전장치).
+        for cell in targets[:: max(1, len(targets) // 20)]:
+            anchor = self._nearest_traversable(traversable, cell[0], cell[1], radius=inflation + 2)
+            if anchor is not None:
+                pool.append(anchor)
+        pool = list(dict.fromkeys(pool))
+        diag["pool_cell_count"] = len(pool)
+
+        observe_radius_cells = config.EXPLORATION_OBSERVE_RADIUS_M / self.resolution
+        target_array = np.asarray(targets, dtype=np.float64)
+        min_gain = config.EXPLORATION_FLOOR_COVERAGE_MIN_GAIN_CELLS
+        scored: list[tuple[int, tuple[int, int]]] = []
+        for cell in pool:
+            # 반경 안의 미관측 셀만 먼저 거리로 추려낸 뒤 LOS를 본다 (전부 LOS를
+            # 계산하면 후보 수십 개 x 미관측 수천 개라 너무 느리다).
+            within = np.hypot(target_array[:, 0] - cell[0], target_array[:, 1] - cell[1]) <= observe_radius_cells
+            nearby = [targets[i] for i in np.nonzero(within)[0]]
+            if len(nearby) < min_gain:
+                continue  # 반경 안을 다 본다 해도 최소 이득에 못 미친다
+            gain = sum(1 for target in nearby if self._line_of_sight(los_blocking, cell, target))
+            if gain >= min_gain:
+                scored.append((gain, cell))
+        diag["scored_candidate_count"] = len(scored)
+        diag["best_gain_cells"] = max((gain for gain, _ in scored), default=0)
+        if not scored:
+            return self._fail_floor(diag, "no_candidate_gains_enough_new_floor")
+
+        # 순수 이득만으로 고르면 방 양쪽 끝을 번갈아 찍으며 왔다갔다한다 -
+        # plan_route()의 후보 선택이 EXPLORATION_DISTANCE_PENALTY_HALFLIFE_M로
+        # 같은 진동을 막는 것과 동일한 이유로, 여기서도 로봇으로부터의 거리로 점수를
+        # 감쇠시켜 가까운 곳부터 훑게 한다 (멈추는 기준인 MIN_GAIN_CELLS 비교는 감쇠
+        # 전 순수 이득으로 한다 - "볼 게 남았나"와 "뭘 먼저 갈까"는 다른 문제다).
+        halflife_cells = max(1e-6, config.EXPLORATION_DISTANCE_PENALTY_HALFLIFE_M / self.resolution)
+
+        def priority(item: tuple[int, tuple[int, int]]) -> float:
+            gain, cell = item
+            distance = math.hypot(cell[0] - start[0], cell[1] - start[1])
+            return gain / (1.0 + distance / halflife_cells)
+
+        # 우선순위가 높은 순서로 시도한다 - 1등 후보가 도달 불가(벽 뒤 고립 등)라고
+        # 해서 탐사를 끝내면 안 된다. 실제로 갈 수 있는 첫 후보로 이어간다.
+        polygon = visibility_path.build_traversable_polygon(traversable, self.grid_to_world)
+        start_world = (float(robot_pose["x"]), float(robot_pose["y"]))
+        for gain, cell in sorted(scored, key=priority, reverse=True):
+            goal_world = self.grid_to_world(*cell)
+            final_theta = math.atan2(goal_world[1] - robot_pose["y"], goal_world[0] - robot_pose["x"])
+
+            polyline = visibility_path.shortest_path(
+                polygon, start_world, goal_world, simplify_tolerance=2.0 * self.resolution
+            )
+            if polyline is not None:
+                waypoints = self._waypoints_from_world_polyline(polyline, final_theta, gain)
+                if waypoints:
+                    diag["reason"] = "ok_visibility_graph"
+                    diag["chosen_gain_cells"] = gain
+                    self.last_floor_coverage_diagnostics = diag
+                    return waypoints
+
+            path = self._astar_path(traversable, start, cell)
+            if path is None:
+                continue
+            diag["reason"] = "ok"
+            diag["chosen_gain_cells"] = gain
+            self.last_floor_coverage_diagnostics = diag
+            return self._leg_waypoints(path, inflated, final_theta, gain)
+
+        return self._fail_floor(diag, "no_reachable_candidate")
+
+    def _fail_floor(self, diag: dict, reason: str) -> list[dict]:
+        diag["reason"] = reason
+        self.last_floor_coverage_diagnostics = diag
+        return []
+
+    def describe_last_floor_coverage(self) -> str:
+        return ", ".join(f"{key}={value}" for key, value in self.last_floor_coverage_diagnostics.items())
 
     def plan_recovery_patrol(
         self,
@@ -763,9 +1144,13 @@ class CoveragePlanner:
         if start_cell is None:
             return []
 
-        # v3에서 도입한 공용 헬퍼를 쓴다 - plan_route/plan_direct_path와 clearance가
-        # 어긋나면 "계획은 됐는데 검사에서 막힌다"는 식으로 조용히 틀어진다.
-        traversable, inflated = self._build_traversable(grid)
+        occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
+        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
+        inflated = cv2.dilate(
+            occupied,
+            np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8),
+        ).astype(bool)
+        traversable = (grid == config.OCC_FREE) & (~inflated)
         start = self._nearest_traversable(traversable, *start_cell, radius=10)
         if start is None:
             return []
@@ -781,14 +1166,31 @@ class CoveragePlanner:
             if min_distance >= spacing:
                 scored.append((min_distance, cell))
 
+        # Small cluttered rooms leave only a cell or two of inflated free
+        # space between furniture - 4-connected grid A* routes there still
+        # graze the clearance boundary at MAP_RESOLUTION_M quantization. Try
+        # a continuous visibility-graph route first (exact geometry, no grid
+        # quantization) and only fall back to grid A* if that's unavailable
+        # (shapely not installed yet) or fails for this particular goal.
+        polygon = visibility_path.build_traversable_polygon(traversable, self.grid_to_world)
+        start_world = (float(start_pose["x"]), float(start_pose["y"]))
+
         for _, goal in sorted(scored, reverse=True):
-            path = self._astar_path(traversable, start, goal)
-            if path is None:
-                continue
             x, y = self.grid_to_world(*goal)
             theta = math.atan2(
                 float(start_pose["y"]) - y,
                 float(start_pose["x"]) - x,
             )
+            polyline = visibility_path.shortest_path(
+                polygon, start_world, (x, y), simplify_tolerance=2.0 * self.resolution
+            )
+            if polyline is not None:
+                waypoints = self._waypoints_from_world_polyline(polyline, theta, credited_len=0)
+                if waypoints:
+                    return waypoints
+
+            path = self._astar_path(traversable, start, goal)
+            if path is None:
+                continue
             return self._leg_waypoints(path, inflated, theta, credited_len=0)
         return []

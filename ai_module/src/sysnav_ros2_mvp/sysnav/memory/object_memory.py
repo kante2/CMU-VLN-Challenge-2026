@@ -188,3 +188,142 @@ class ObjectMemory:
     def all_nodes(self) -> list[dict]:
         with self._lock:
             return [self._copy_node(node) for node in self._nodes.values()]
+
+    def merge_duplicates(self) -> int:
+        """같은 물체가 여러 노드로 갈라진 것을 하나로 합친다. 합친 개수를 반환.
+
+        update()의 association은 관측이 들어오는 그 순간에만 판정하므로, 각도가 달라
+        모양/외형 점수가 낮게 나오면 ASSOCIATION_THRESHOLD를 못 넘고 새 노드가 생긴다.
+        그렇게 갈라진 노드는 이후로도 스스로 합쳐지지 않아서 계속 쌓인다 - 실측:
+        home_building_1에서 sofa가 GT 4개인데 26개, picture가 GT 2개인데 15개로
+        등록됐다(개수 세기 미션에서는 이게 곧 오답이다).
+
+        판정은 gfchen01/semantic_mapping_with_360_camera_and_3d_lidar의 규칙을 따른다:
+        같은 카테고리끼리 centroid 거리가 "두 물체 half-extent의 평균 크기 * 비율"보다
+        가까우면 같은 물체로 본다. 큰 소파는 넉넉하게, 작은 물체는 촘촘하게 병합되도록
+        크기에 적응하고, 아주 작은 물체를 위해 절대 하한을 함께 둔다.
+        """
+        with self._lock:
+            merged_total = 0
+            changed = True
+            while changed:
+                changed = False
+                for source_id, target_id in self._find_duplicate_pair():
+                    source, target = self._nodes[source_id], self._nodes[target_id]
+                    # 관측이 많은 쪽을 남긴다 - 그쪽 위치가 더 수렴해 있다.
+                    if int(target["observation_count"]) > int(source["observation_count"]):
+                        source, target = target, source
+                    self._absorb(source, target)
+                    del self._nodes[int(target["object_id"])]
+                    merged_total += 1
+                    changed = True
+                    break  # 노드가 사라졌으니 목록을 다시 훑는다
+            return merged_total
+
+    def _find_duplicate_pair(self) -> list[tuple[int, int]]:
+        nodes = list(self._nodes.values())
+        for i, first in enumerate(nodes):
+            for second in nodes[i + 1:]:
+                if first["category"] != second["category"]:
+                    continue
+                distance = float(np.linalg.norm(
+                    np.asarray(first["position"], dtype=np.float64)
+                    - np.asarray(second["position"], dtype=np.float64)
+                ))
+                half_first = np.asarray(first["extent_3d"], dtype=np.float64) / 2.0
+                half_second = np.asarray(second["extent_3d"], dtype=np.float64) / 2.0
+                size_threshold = float(np.linalg.norm((half_first + half_second) / 2.0)) \
+                    * config.OBJECT_MERGE_SIZE_RATIO
+                threshold = max(config.OBJECT_MERGE_MIN_DISTANCE_M, size_threshold)
+                # 거리 조건만으로는 긴 물체의 양 끝을 각각 잡은 경우를 못 합친다 -
+                # 실측: 2.7m 소파의 두 관측이 centroid 1.66m 떨어져 병합되지 않았다.
+                # 그래서 bbox가 충분히 겹치면 거리와 무관하게 같은 물체로 본다.
+                if distance < threshold or self._box_overlap_ratio(first, second) > \
+                        config.OBJECT_MERGE_OVERLAP_RATIO:
+                    return [(int(first["object_id"]), int(second["object_id"]))]
+        return []
+
+    @staticmethod
+    def _box_overlap_ratio(first: dict, second: dict) -> float:
+        """두 축정렬 bbox의 교집합 부피 / 작은 쪽 부피. 한쪽이 다른 쪽에 거의 들어가
+        있으면 1에 가까워지므로, 크기가 다른 두 관측이 같은 물체인지 판단하기 좋다."""
+        low = np.maximum(
+            np.asarray(first["bbox_3d_min"], dtype=np.float64),
+            np.asarray(second["bbox_3d_min"], dtype=np.float64),
+        )
+        high = np.minimum(
+            np.asarray(first["bbox_3d_max"], dtype=np.float64),
+            np.asarray(second["bbox_3d_max"], dtype=np.float64),
+        )
+        overlap = float(np.prod(np.clip(high - low, 0.0, None)))
+        volumes = [
+            float(np.prod(np.clip(
+                np.asarray(node["bbox_3d_max"], dtype=np.float64)
+                - np.asarray(node["bbox_3d_min"], dtype=np.float64), 0.0, None)))
+            for node in (first, second)
+        ]
+        smaller = min(volumes)
+        return overlap / smaller if smaller > 1e-9 else 0.0
+
+    def _absorb(self, keep: dict, drop: dict) -> None:
+        """drop 노드를 keep 노드로 흡수한다. 관측 횟수로 가중평균해서, 관측이 많은 쪽
+        위치가 덜 흔들리게 한다."""
+        keep_count = max(1, int(keep["observation_count"]))
+        drop_count = max(1, int(drop["observation_count"]))
+        total = keep_count + drop_count
+        keep_position = np.asarray(keep["position"], dtype=np.float64)
+        drop_position = np.asarray(drop["position"], dtype=np.float64)
+        keep["position"] = tuple(
+            float(v) for v in (keep_position * keep_count + drop_position * drop_count) / total
+        )
+        # 크기는 두 관측을 모두 담도록 bbox를 합집합으로 넓힌다.
+        minimum = np.minimum(
+            np.asarray(keep["bbox_3d_min"], dtype=np.float64),
+            np.asarray(drop["bbox_3d_min"], dtype=np.float64),
+        )
+        maximum = np.maximum(
+            np.asarray(keep["bbox_3d_max"], dtype=np.float64),
+            np.asarray(drop["bbox_3d_max"], dtype=np.float64),
+        )
+        keep["bbox_3d_min"] = tuple(float(v) for v in minimum)
+        keep["bbox_3d_max"] = tuple(float(v) for v in maximum)
+        keep["extent_3d"] = tuple(float(v) for v in (maximum - minimum))
+        keep["point_cloud"] = self._merge_points(keep["point_cloud"], drop["point_cloud"])
+        keep["num_points"] = len(keep["point_cloud"])
+        keep["observation_count"] = total
+        keep["confidence"] = max(float(keep["confidence"]), float(drop["confidence"]))
+        keep["last_seen_time"] = max(keep["last_seen_time"], drop["last_seen_time"])
+        keep["self_attributes"] = {
+            **drop.get("self_attributes", {}), **keep.get("self_attributes", {})
+        }
+        # 대표 이미지는 representative_confidence가 높은 쪽을 남긴다(노드의 실제 필드명은
+        # crop_image가 아니라 representative_image다).
+        if float(drop.get("representative_confidence", 0.0)) > float(
+            keep.get("representative_confidence", 0.0)
+        ):
+            if isinstance(drop.get("representative_image"), np.ndarray):
+                keep["representative_image"] = drop["representative_image"]
+                keep["representative_confidence"] = drop.get("representative_confidence", 0.0)
+            if isinstance(drop.get("context_image"), np.ndarray):
+                keep["context_image"] = drop["context_image"]
+
+
+def filter_reliable(candidates: list[dict]) -> tuple[list[dict], int]:
+    """판단 시점에 신뢰도 낮은 후보를 걸러낸다. 반환: (남긴 후보, 걸러낸 개수).
+
+    오탐은 특정 각도/프레임에서만 나타나므로 관측 횟수가 적고 confidence도 낮다
+    (GT 대조 실측: 정탐 obs 중앙 17 / conf 0.89, 오탐 obs 중앙 2 / conf 0.49).
+    두 조건을 함께 걸면 오탐 23개 중 14개가 사라지면서 GT 적중은 하나도 잃지 않았다.
+
+    다만 전부 걸러지면 원본을 그대로 돌려준다 - 탐사가 짧게 끝나 진짜 물체도 관측이
+    적을 수 있고, 그때 "답이 없다"고 하는 것보다 약한 후보로라도 답하는 게 낫다.
+    object_memory 자체는 건드리지 않으므로, 관측이 더 쌓이면 다음 판단에서 통과한다.
+    """
+    kept = [
+        candidate for candidate in candidates
+        if int(candidate.get("observation_count", 1)) >= config.OBJECT_MIN_OBSERVATIONS
+        and float(candidate.get("confidence", 0.0)) >= config.OBJECT_MIN_CONFIDENCE
+    ]
+    if candidates and not kept:
+        return candidates, 0
+    return kept, len(candidates) - len(kept)

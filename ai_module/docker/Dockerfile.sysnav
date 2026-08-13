@@ -13,7 +13,7 @@ RUN apt-get update && \
 # 설치돼있어 uninstall 시도 시 에러남 (debian 패키지 특성). 새 버전으로 그냥 덮어쓰게 함.
 RUN python3 -m pip install --no-cache-dir --break-system-packages --ignore-installed torch torchvision
 
-# sysnav 자체 requirements (numpy, opencv-python-headless, ultralytics, google-genai, Pillow)
+# sysnav 자체 requirements (numpy, opencv-python-headless, ultralytics, google-genai, Pillow, shapely)
 COPY src/sysnav_ros2_mvp/requirements.txt /tmp/sysnav_requirements.txt
 RUN python3 -m pip install --no-cache-dir --break-system-packages --ignore-installed -r /tmp/sysnav_requirements.txt
 

@@ -37,7 +37,7 @@ from sysnav.rooms import cross_room_navigator
 from sysnav.rooms.room_registry import RoomRegistry
 from sysnav.rooms.room_segmenter import RoomSegmenter
 from sysnav.rooms.room_visualizer import export_room_segmentation
-from sysnav.memory.object_memory import ObjectMemory
+from sysnav.memory.object_memory import ObjectMemory, filter_reliable
 from sysnav.navigation.goal_publisher import GoalPublisher
 from sysnav.navigation.terrain_monitor import TerrainMonitor
 from sysnav.perception.perception_pipeline import PerceptionPipeline
@@ -46,6 +46,7 @@ from sysnav.reasoning.gemini_selector import GeminiSelector
 from sysnav.reasoning.relation_image_verifier import RelationImageVerifier
 from sysnav.reasoning.room_classifier import RoomClassifier
 from sysnav.reasoning.room_relevance_selector import RoomRelevanceSelector
+from sysnav.reasoning.vlm_counter import VlmCounter
 from sysnav.scene_graph.scene_graph_manager import SceneGraphManager
 from sysnav.scene_graph.scene_graph_rviz import build_object_marker_array
 from sysnav.ros_helpers import (
@@ -163,6 +164,7 @@ class SysNavNode(Node):
         self.selector = GeminiSelector()
         self.attribute_verifier = AttributeVerifier()
         self.relation_image_verifier = RelationImageVerifier()
+        self.vlm_counter = VlmCounter()
         self.coverage_planner = CoveragePlanner()
         self.room_segmenter = RoomSegmenter()
         self.room_registry = RoomRegistry()
@@ -570,8 +572,17 @@ class SysNavNode(Node):
     # task # 질문을 query_parser.py에서 분석한 결과
     # 
     def selection_job(self, task_id: int, task: dict, pose: dict) -> dict:
+        # 후보를 고르기 전에 갈라진 노드를 합친다 - 같은 물체가 여러 개로 남아 있으면
+        # "nearest" 같은 비교 판정이 같은 물체끼리 경쟁하는 꼴이 된다.
+        merged = self.object_memory.merge_duplicates()
+        if merged:
+            self.get_logger().info(f"🧹 MERGED {merged} duplicate object node(s)")
+
         # 목표 객체 후보 검색
         candidates = self.object_memory.find_by_category(task["target"]) # Object Memory에서 어떤 종류의 객체를 후보로 가져올지 결정
+        candidates, dropped = filter_reliable(candidates)
+        if dropped:
+            self.get_logger().info(f"🧹 DROPPED {dropped} low-confidence candidate(s)")
 
         # 문장에 spatial constraint가 있고 Scene Graph에 검증된 Object-Object edge가
         # 존재하면, 해당 edge의 source object만 우선 후보로 사용한다. mission3는 절마다
@@ -609,14 +620,36 @@ class SysNavNode(Node):
             if candidates:
                 _, first_relation, first_reference = relation_chain[0]
                 if first_relation in ("nearest", "closest") and len(candidates) > 1:
-                    # "nearest"는 최상급(비교) relation이라 후보마다 독립적으로
-                    # yes/no만 물으면 안 된다 - bedside table이 2개 있고 둘 다 사진에
-                    # 창문이 보이면 verify()는 둘 다 통과시켜버려서 어느 게 진짜
-                    # 가까운지 못 가린다. 후보 전부를 한 번에 놓고 VLM이 직접
-                    # 비교해서 하나만 고르게 한다.
-                    winner_id = self.relation_image_verifier.rank_nearest(candidates, first_reference)
-                    if winner_id is not None:
-                        image_verified_ids = {winner_id}
+                    # 참조 물체가 3D로 잡혀있으면(대부분의 경우) 단순 유클리드 거리
+                    # 비교로 확정한다 - 결정적이고 VLM 호출도 필요 없다. 이미지 기반
+                    # rank_nearest()는 "참조 물체가 후보 사진에 우연히 같이 찍혀야만"
+                    # 성립하는 훨씬 약한 조건이라, 참조 물체가 대부분의 후보에서 안
+                    # 보이면(카메라 FOV 밖) reference_visible_in_any=false로 매번
+                    # 실패해서 relation이 영원히 확정 안 되는 문제가 있었다 - 유리창
+                    # 처럼 LiDAR 반사가 안 돼 3D 위치 자체가 없는 경우에만 이 이미지
+                    # 비교로 폴백한다.
+                    references = self.object_memory.find_by_category(first_reference)
+                    if references:
+                        winner = min(
+                            candidates,
+                            key=lambda candidate: min(
+                                math.hypot(
+                                    candidate["position"][0] - reference["position"][0],
+                                    candidate["position"][1] - reference["position"][1],
+                                )
+                                for reference in references
+                            ),
+                        )
+                        image_verified_ids = {int(winner["object_id"])}
+                    else:
+                        # "nearest"는 최상급(비교) relation이라 후보마다 독립적으로
+                        # yes/no만 물으면 안 된다 - bedside table이 2개 있고 둘 다
+                        # 사진에 창문이 보이면 verify()는 둘 다 통과시켜버려서 어느 게
+                        # 진짜 가까운지 못 가린다. 후보 전부를 한 번에 놓고 VLM이
+                        # 직접 비교해서 하나만 고르게 한다.
+                        winner_id = self.relation_image_verifier.rank_nearest(candidates, first_reference)
+                        if winner_id is not None:
+                            image_verified_ids = {winner_id}
                 else:
                     # 참조 물체를 3D로 잡을 필요 없이, 후보 자신의 사진만으로 "이 사진에
                     # 참조 물체가 보이는가"를 VLM에게 직접 확인받는다 (attribute_verifier와

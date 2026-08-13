@@ -233,15 +233,35 @@ T_SENSOR_TO_BASE = [
 ]
 PANORAMA_YAW_OFFSET_DEG = float(os.getenv("PANORAMA_YAW_OFFSET_DEG", "0.0"))
 PANORAMA_PITCH_OFFSET_DEG = float(os.getenv("PANORAMA_PITCH_OFFSET_DEG", "0.0"))
+# 파노라마 이미지 세로(640px)가 담는 실제 각도 범위. projector가 "하향각 -> 픽셀 행"을
+# 변환할 때 쓰는 스케일이라, 틀리면 3D 위치가 수직으로 통째로 밀린다.
+#
+# 이 값은 tests/check_pano_alignment_semantic.py로 실측해서 정했다: 시뮬레이터의
+# /camera/semantic_image에서 "바닥 색이 끝나는 행"을 방위각 컬럼마다 찾고, 같은 컬럼의
+# LiDAR 최원거리 바닥 반사점을 투영한 행과 비교했다(컬럼 89개). 두 측정은 같은 경계를
+# 독립적으로 보므로 파노라마 왜곡에 영향받지 않는다.
+#   v_fov=180 -> median 26px 위로 밀림 (예전 하드코딩 값)
+#   v_fov=115 -> median|err| 6px (최소)
+#   v_fov=120 -> median|err| 7px
+# 120으로 정한 이유: 측정 최적값과 노이즈 범위에서 겹치면서, 1920/360deg와 640/120deg가
+# 모두 5.33 px/deg로 가로-세로 각해상도가 정확히 같아지는 값이다(렌더러가 쓸 자연스러운
+# 규격). LiDAR 최원거리 바닥점이 실제 벽 밑단보다 조금 앞이라 측정이 약간 낮게 편향되는
+# 것도 감안했다.
+#
+# 주의: tmah_vlm의 config.PANO_V_FOV_DEG=180은 육안 대조로 정한 값이라 이 26px 오차를
+# 못 걸렀을 가능성이 있다(같은 카메라를 쓰므로 그쪽도 재검증이 필요하다).
+PANORAMA_V_FOV_DEG = float(os.getenv("PANORAMA_V_FOV_DEG", "120.0"))
 GROUNDING_MIN_RANGE_M = 0.30
 GROUNDING_MAX_RANGE_M = 30.0
 GROUNDING_MIN_POINTS = 5
 GROUNDING_MAX_OBJECT_POINTS = 2048
-# SAM2 mask 안에 들어온 LiDAR point를 로봇 기준 거리로 1차원 클러스터링할 때, 이
-# 값(m) 이상 거리 차이가 나면 다른 물체(다른 깊이)로 취급해서 군집을 나눈다.
-# 목표 물체 앞/뒤로 다른 물체가 mask 경계에 살짝 겹쳐 들어왔을 때, 가장 점이 많이
-# 뭉친 구간(=진짜 그 물체 표면)만 남기고 나머지는 버린다.
-DEPTH_CLUSTER_GAP_M = 0.3
+# SAM2 mask 안 LiDAR point를 3D로 군집화할 때, 이 값(m) 이상 떨어지면 다른 물체로
+# 본다 (lidar_grounding._cluster_labels의 single-linkage 거리).
+# 예전 이름은 DEPTH_CLUSTER_GAP_M이었고 "로봇까지의 거리" 1차원에만 적용했다 -
+# 그래서 앞뒤로 겹친 물체는 걸러냈지만 깊이는 같고 좌우로 떨어진 물체(나란히 놓인
+# 소파와 의자)를 분리하지 못해 둘이 같은 3D 좌표를 받았다. 지금은 3축 모두에
+# 적용한다. 너무 줄이면 같은 물체 표면이 쪼개져 GROUNDING_MIN_POINTS를 못 채운다.
+GROUNDING_CLUSTER_GAP_M = 0.3
 # 유리창처럼 LiDAR 반사가 잘 안 되는 물체는 GROUNDING_MIN_POINTS(정밀 bbox에 필요한
 # 최소 point 수)를 영영 못 채워서 3D grounding 자체가 항상 버려졌다 - relation 판정
 # (nearest/near/between)은 정밀한 bbox 없이 대략적인 위치만으로도 충분하므로, 이보다
@@ -257,6 +277,42 @@ GROUNDING_APPROXIMATE_DEFAULT_SIZE_M = 0.3
 # 한 변 길이의 이 비율만큼 여유를 두고, 배경은 안 지운 채 잘라내는
 # context_image를 따로 만든다.
 CONTEXT_CROP_MARGIN_RATIO = 1.0
+
+# update() 시점의 association만으로는 같은 물체가 여러 노드로 갈라지는 것을 못 막는다
+# (각도가 달라 모양/외형 점수가 낮으면 ASSOCIATION_THRESHOLD를 못 넘어 새 노드가 생기고,
+# 그 뒤로는 스스로 합쳐지지 않는다). object_memory.merge_duplicates()가 주기적으로
+# 같은 카테고리 노드를 사후 병합할 때 쓰는 기준 - 실측으로 sofa가 GT 4개인데 26개까지
+# 쌓였고, 개수 세기 미션에서는 이게 곧 오답이었다.
+# 판정: centroid 거리 < max(MIN_DISTANCE, 두 물체 half-extent 평균 크기 * SIZE_RATIO).
+# 크기 적응형이라 큰 소파는 넉넉히, 작은 물체는 촘촘히 병합된다
+# (gfchen01/semantic_mapping_with_360_camera_and_3d_lidar의 규칙과 동일한 형태).
+# 판단 시점(개수 세기/후보 선택)에 신뢰도가 낮은 관측을 걸러내는 기준.
+# GT 대조로 정했다(home_building_1, 검출 43개): 실제 물체는 로봇이 지나다니며 반복
+# 관측되지만(observation_count 중앙 17), 오탐은 특정 각도에서만 튀어나온다(중앙 2).
+# confidence도 정탐 0.89 vs 오탐 0.49로 갈렸다. 두 조건을 함께 쓰면 오탐 23개 중
+# 14개가 사라지고 GT 적중은 하나도 잃지 않았다(sofa 26->18, picture 15->8).
+# 주의: 관측 횟수 기준은 탐사를 충분히 오래 돈 뒤에만 정당하다 - 짧게 끝나면 진짜
+# 물체도 1~2회만 관측돼 걸러질 수 있어서, 필터 결과가 비면 원본으로 되돌린다.
+# 값은 tests/check_object_memory.py --sweep 으로 정했다(home_building_1, 검출 43개,
+# sofa/picture/pillow GT 24개). 병합 후 필터를 걸면 진짜 물체는 관측 횟수가 합산돼
+# 더 엄격한 기준을 견딘다 - 그래서 obs>=4에서도 찾은 GT는 21개로 그대로인데 오탐은
+# 8개에서 2개로 줄었다(obs>=2, conf>=0.5 대비). confidence는 이 지점에서 추가 효과가
+# 없어 0으로 둔다 - 오탐 억제는 관측 횟수가 이미 다 해내고, 임계를 올리면 어두운 곳의
+# 정탐만 잃는다.
+# 주의: 관측 횟수 기준은 병합이 선행되고 탐사가 충분히 돌았을 때만 유효하다. 필터
+# 결과가 비면 filter_reliable()이 원본을 그대로 돌려주므로 무응답으로 빠지지는 않는다.
+OBJECT_MIN_OBSERVATIONS = 4
+OBJECT_MIN_CONFIDENCE = 0.0
+# 사후 병합 기준(merge_duplicates). 크기 적응형 centroid 거리 또는 bbox 겹침 비율.
+# 실측(home_building_1, 검출 50개): 병합된 8쌍이 전부 "겹침" 조건으로 잡혔고 거리
+# 조건만으로 잡힌 쌍은 0이었다. 겹침 비율이 1.0/0.90/0.88처럼 뚜렷하게 높은 쌍들이라
+# 0.3 임계로 충분했다. 거리 조건은 bbox가 아직 작게 추정된 초기 관측(겹침이 0으로
+# 나오는 경우)을 위한 보조 장치로 남겨둔다.
+# 주의: 긴 물체의 양 끝을 각각 잡은 경우(예: 2.7m 소파의 두 관측)는 겹침이 0.11밖에
+# 안 되어 이 기준으로도 병합되지 않는다 - 그건 별도 문제로 남아 있다.
+OBJECT_MERGE_OVERLAP_RATIO = 0.3
+OBJECT_MERGE_MIN_DISTANCE_M = 0.5
+OBJECT_MERGE_SIZE_RATIO = 0.5
 
 ASSOCIATION_MAX_DISTANCE_M = 1.20
 ASSOCIATION_DISTANCE_SIGMA_M = 0.60
@@ -344,7 +400,17 @@ EXPLORATION_STOCHASTIC_TRIALS = 4   # K, stochastic sampling을 반복해서 TSP
 # 두면 매 사이클 가장 좋은 후보 하나만 골라서 그리로 갔다가, 도착하면 최신 지도로 다시
 # 고른다 - 논문의 "batch로 여러 개 묶어서 효율화"보다는 덜 효율적일 수 있지만 왔다갔다
 # 하는 걸 원천적으로 막는다.
-EXPLORATION_MAX_CANDIDATES_PER_CYCLE = 1
+#
+# 2026-08-12: 1 -> 4. 진동의 원인은 "여러 개를 뽑는 것" 자체가 아니라 "먼 후보를
+# 아무 순서로 뽑는 것"이었다. 지금은 (a) 점수를 로봇 거리로 감쇠시켜 고르고
+# (b) 고른 후보들을 TSP로 방문 순서까지 정하고 (c) 안 고른 후보는 global horizon에
+# 남겨 다음 사이클에 재사용하므로, 묶어서 뽑아도 왔다갔다하지 않고 재계획 횟수가
+# 줄어 한 패스로 방을 훑는다 (논문 Sec. IV-B-1의 local/global horizon rolling window).
+EXPLORATION_MAX_CANDIDATES_PER_CYCLE = 4
+# 이번 사이클에 뽑히지 않은 후보를 몇 개까지 global horizon으로 넘길지. 매 사이클
+# 무작위 샘플링을 처음부터 다시 하면 이미 점수까지 계산해둔 좋은 후보를 버리게 되고,
+# 남은 미커버 영역이 작을 때 우연히 못 뽑아 조기 종료하는 원인이 된다.
+EXPLORATION_GLOBAL_HORIZON_MAX = 400
 # candidate를 뽑는 확률 가중치를 순수 wcov가 아니라 로봇 현재 위치로부터의 거리로
 # 감쇠시킨다 (weight = wcov / (1 + distance/halflife)). 이 값(m)만큼 떨어지면 가중치가
 # 절반이 된다. MAX_CANDIDATES_PER_CYCLE=1로도, 방 양쪽 끝의 wcov 점수가 비슷하면 매
@@ -360,6 +426,45 @@ EXPLORATION_DISTANCE_PENALTY_HALFLIFE_M = 3.0
 EXPLORATION_PATH_WAYPOINT_SPACING_M = 3.0
 
 VIEWPOINT_MIN_DISTANCE_M = 1.0
+
+# Floor-coverage exploration (CoveragePlanner.plan_floor_coverage)
+# ---------------------------------------------------------------------------
+# frontier(=free/unknown 경계)만 목표로 삼으면 탐사가 너무 일찍 끝난다: LiDAR는
+# 360도에 사거리가 길어서 viewpoint 두어 곳만 찍어도 방 전체가 지도상 known이
+# 되고 frontier가 0이 된다("맵은 다 그렸다"). 하지만 물체 인식은 카메라가 하고,
+# 카메라는 그 사이 방의 일부만 봤다 - 즉 "지도 완성도"와 "실제로 가까이서 훑어본
+# 면적"은 다른 문제다. frontier가 소진된 뒤 이 단계가 이어받아, 아직 가까이서
+# 관측하지 못한 바닥 셀(observed 마스크 기준)을 가장 많이 새로 볼 수 있는 지점을
+# 골라 계속 이동한다 - "안 가본 곳"을 실제로 가게 만드는 부분이다.
+EXPLORATION_FLOOR_COVERAGE_ENABLED = os.getenv(
+    "SYSNAV_FLOOR_COVERAGE_ENABLED", "1"
+) not in ("0", "false", "False")
+# 바닥 셀이 "관측됐다"고 인정하는 최대 거리(m). LiDAR 사거리가 아니라 카메라가
+# 물체를 쓸만하게 담을 수 있는 거리 기준으로 잡는다 - 크게 두면 멀리서 스캔만
+# 스친 곳도 관측으로 쳐서 다시 탐사가 일찍 끝난다.
+EXPLORATION_OBSERVE_RADIUS_M = 3.0
+# 관측된 바닥 면적 비율이 이 값을 넘으면 탐사 완료로 본다.
+EXPLORATION_FLOOR_COVERAGE_TARGET = 0.90
+# 후보가 새로 관측할 수 있는 바닥 셀이 이 개수 미만이면 더 가봐야 의미가 없다고
+# 보고 멈춘다 (도달 불가 구석 때문에 TARGET에 영원히 못 닿는 경우의 안전장치).
+EXPLORATION_FLOOR_COVERAGE_MIN_GAIN_CELLS = 12
+# 목표 커버리지를 달성하면 observed 마스크를 지우고 처음부터 다시 훑는 횟수.
+# 1이면 한 번만 훑고 끝(예전 동작), 2면 다 훑은 뒤 한 번 더 순회한다 - 같은 물체를
+# 다른 위치/각도에서 다시 보게 되므로 첫 순회에서 카메라 각도상 놓친 물체(그림처럼
+# 특정 방향에서만 보이는 것)를 건질 기회가 생긴다. occupancy 지도(벽/장애물)는
+# 지우지 않는다 - 그건 경로 계획에 계속 필요하고, 다시 그릴 이유도 없다.
+EXPLORATION_COVERAGE_ROUNDS = 4
+
+# Numerical 미션의 개수를, 물체를 가장 많이 담은 viewpoint 파노라마 한 장으로 VLM에게
+# 직접 세게 한다(reasoning/vlm_counter.py). object_memory 기반 집계는 탐지 재현율에
+# 갇혀서, 실측(home_building_1)에서 pillow가 GT 18개인데 7개로 나왔다 - 베개 4개 중
+# 2개만 탐지되면 답은 영원히 2다. 뷰를 한 장으로 확정하는 이유는 여러 뷰의 개수를
+# 합치면 같은 물체가 중복 계산되기 때문이다.
+# 실패(키 없음/에러/이미지 없음)하면 기존 기하 기반 개수를 그대로 쓴다 - 개수 미션은
+# 0/1 채점이라 "답을 못 냄"이 최악이다.
+NUMERICAL_VLM_COUNT_ENABLED = os.getenv(
+    "SYSNAV_NUMERICAL_VLM_COUNT", "1"
+) not in ("0", "false", "False")
 
 # Instruction-Following (missions/mission3_pipe.py) - "avoiding the path between A
 # and B"/"avoid the path near Z" 같은 negative constraint를 A-B 선분(또는 Z 한 점)

@@ -22,6 +22,7 @@ from collections import deque
 from std_msgs.msg import Int32
 
 from sysnav import config
+from sysnav.memory.object_memory import filter_reliable
 from sysnav.task.query_parser import effective_relation_chain
 
 
@@ -69,7 +70,18 @@ def count_job(node, task_id: int, task: dict) -> dict:
     """탐색이 끝난 뒤 최종 개수를 센다 - Object Reference의 selection_job과 같은
     필터링(relation -> attribute)을 쓰되, 마지막에 GeminiSelector로 하나만 고르는
     대신 통과한 candidate 전부의 개수를 반환한다."""
+    # 세기 전에 갈라진 노드를 합친다 - 개수 세기에서는 중복이 곧 오답이다.
+    merged = node.object_memory.merge_duplicates()
+    if merged:
+        node.get_logger().info(f"🧹 MERGED {merged} duplicate object node(s) before counting")
+
     candidates = node.object_memory.find_by_category(task["target"])
+    candidates, dropped = filter_reliable(candidates)
+    if dropped:
+        node.get_logger().info(
+            f"🧹 DROPPED {dropped} low-confidence candidate(s) before counting "
+            f"(obs>={config.OBJECT_MIN_OBSERVATIONS}, conf>={config.OBJECT_MIN_CONFIDENCE})"
+        )
 
     relation_candidate_ids = set(node.scene_graph.find_matching_target_ids(task))
     if relation_candidate_ids:
@@ -98,7 +110,49 @@ def count_job(node, task_id: int, task: dict) -> dict:
             )
         ]
 
-    return {"task_id": task_id, "count": len(candidates)}
+    geometric_count = len(candidates)
+
+    # object_memory 기반 집계는 탐지 재현율에 갇힌다(실측: pillow GT 18개 -> 7개).
+    # 물체를 가장 많이 담은 viewpoint 한 장을 VLM에게 보여 직접 세게 해서 그 상한을
+    # 넘어본다. 뷰를 한 장으로 확정하는 이유는 여러 뷰를 합치면 같은 물체가 중복
+    # 계산되기 때문이다. 실패하면 기하 기반 개수를 그대로 쓴다(0/1 채점이라 무응답이
+    # 최악이다).
+    if config.NUMERICAL_VLM_COUNT_ENABLED:
+        vlm_count = _count_with_vlm(node, task, geometric_count)
+        if vlm_count is not None:
+            return {"task_id": task_id, "count": vlm_count}
+
+    return {"task_id": task_id, "count": geometric_count}
+
+
+def _count_with_vlm(node, task: dict, geometric_count: int) -> int | None:
+    """개수를 가장 많이 담은 viewpoint 이미지로 VLM에게 세게 한다. 실패 시 None."""
+    target = str(task.get("target", "")).strip()
+    question = str(task.get("raw", "")).strip()
+    if not target or not question:
+        return None
+
+    # 뷰 선정은 관계 필터 전의 "그 카테고리 전체"로 한다 - 관계 edge가 아직 없어서
+    # 걸러진 물체도 이미지에는 찍혀 있고, 그게 바로 VLM이 대신 세줘야 하는 대상이다.
+    category_ids = [
+        int(item["object_id"]) for item in node.object_memory.find_by_category(target)
+    ]
+    if not category_ids:
+        return None
+    viewpoint = node.scene_graph.best_viewpoint_for_objects(category_ids)
+    if viewpoint is None:
+        node.get_logger().info("VLM count skipped: no viewpoint image observes this category")
+        return None
+
+    count = node.vlm_counter.count(question, target, viewpoint)
+    if count is None:
+        return None
+    node.get_logger().info(
+        f"🔢 COUNT - geometric={geometric_count}, vlm={count} "
+        f"(viewpoint {viewpoint['viewpoint_id']} saw {viewpoint['visible_count']}/"
+        f"{len(category_ids)} of the mapped {target}); using vlm"
+    )
+    return count
 
 
 def _on_count_result(node, result: dict) -> None:

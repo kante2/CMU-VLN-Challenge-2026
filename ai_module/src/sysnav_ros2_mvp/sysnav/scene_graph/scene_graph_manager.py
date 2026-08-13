@@ -291,6 +291,37 @@ class SceneGraphManager:
                 if requested.issubset(set(viewpoint.get("observed_object_ids", [])))
             ]
 
+    def best_viewpoint_for_objects(self, object_ids: list[int]) -> dict | None:
+        """요청한 물체들을 가장 많이 동시에 본 viewpoint. 없으면 None.
+
+        common_viewpoint_ids()는 "전부 다 본" viewpoint만 돌려주므로 물체가 여러 개면
+        보통 빈 목록이 된다. 개수 세기는 "한 장에 최대한 많이 담긴 뷰"가 필요해서,
+        교집합이 아니라 가장 많이 겹치는 뷰를 고른다 - 뷰를 하나로 확정하면 여러 뷰의
+        개수를 합칠 때 생기는 중복 계산이 원천적으로 없어진다.
+
+        반환: {"viewpoint_id", "image_path", "visible_object_ids", "visible_count"}
+        """
+        requested = {int(value) for value in object_ids}
+        if not requested:
+            return None
+        best: dict | None = None
+        with self._lock:
+            for viewpoint_id, viewpoint in sorted(self._viewpoints.items()):
+                visible = requested & set(viewpoint.get("observed_object_ids", []))
+                if not visible:
+                    continue
+                image_path = viewpoint.get("image_path")
+                if not image_path:
+                    continue  # 이미지가 없으면 VLM에 넣을 수 없다
+                if best is None or len(visible) > best["visible_count"]:
+                    best = {
+                        "viewpoint_id": int(viewpoint_id),
+                        "image_path": str(image_path),
+                        "visible_object_ids": sorted(visible),
+                        "visible_count": len(visible),
+                    }
+        return best
+
     def snapshot(self) -> dict:
         with self._lock:
             return copy.deepcopy(self._snapshot_locked())
