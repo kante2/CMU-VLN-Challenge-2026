@@ -133,6 +133,17 @@ def _mission_detail_rows(snapshot: dict) -> str:
     elif mission_type == "object_reference":
         rows.append(_row("Target category", task.get("target", "?")))
         rows.append(_row("Attributes", ", ".join(task.get("attributes") or []) or "-"))
+        candidate_count = snapshot.get("candidate_count")
+        rows.append(_row("Candidates observed so far", "-" if candidate_count is None else str(candidate_count)))
+        # 탐색 완주 -> 그래프 완성 -> 선택 구조라, 지금이 어느 단계인지가 가장 궁금하다.
+        patrol = snapshot.get("mission2_recovery_points") or 0
+        if snapshot.get("mission2_select_final"):
+            phase = "exploration done - selecting from the completed scene graph"
+            if patrol:
+                phase += f" (recovery patrol {patrol})"
+        else:
+            phase = "exploring (selection waits until coverage is exhausted)"
+        rows.append(_row("Phase", phase))
         goal = snapshot.get("current_goal")
         if goal and goal.get("object_id") is not None:
             rows.append(_row("Selected object_id", str(goal["object_id"])))
@@ -181,6 +192,20 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
             f"hops_left={snapshot.get('target_hops_remaining', 0)}, "
             f"replans={snapshot.get('target_replans', 0)}",
         ))
+        echo_xy = snapshot.get("waypoint_echo_xy")
+        if echo_xy:
+            deviation = snapshot.get("waypoint_echo_deviation_m")
+            deviation_text = "-" if deviation is None else f"{deviation:.2f}m"
+            note = ""
+            if deviation is not None and deviation > config.WAYPOINT_ECHO_TOLERANCE_M:
+                note = " - base autonomy is NOT heading to our goal"
+            rejected = snapshot.get("target_rejected_points") or 0
+            if rejected:
+                note += f" (rejected approach points: {rejected})"
+            rows.append(_row(
+                "Converter /way_point",
+                f"({echo_xy[0]:.2f}, {echo_xy[1]:.2f}), off by {deviation_text}{_esc(note)}",
+            ))
 
     doc = f"""<!doctype html>
 <html>

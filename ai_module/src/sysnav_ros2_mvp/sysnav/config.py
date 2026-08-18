@@ -14,6 +14,12 @@ TOPIC_WAYPOINT = "/way_point_with_heading"
 # 판정할 때 쓰는 것과 동일한 데이터라, 우리도 같은 걸 보고 목표를 찍는다
 # (navigation/terrain_monitor.py).
 TOPIC_TERRAIN_MAP = "/terrain_map"
+# waypointConverter가 우리 /way_point_with_heading을 실제로 어떻게 바꿔서 내보냈는지
+# (= 로봇이 진짜로 향하는 지점). 우리가 찍은 목표와 크게 다르면 converter가 우리
+# 좌표를 버리고 자기 travArea 후보로 갈아탄 것이라, 기다려도 로봇은 목표로 안 간다.
+# 읽기 전용으로 구독만 한다 - 이 토픽에 우리가 발행하면 base autonomy 인터페이스를
+# 우회하는 셈이라 하지 않는다(README: 인터페이스는 /way_point_with_heading).
+TOPIC_WAYPOINT_ECHO = "/way_point"
 TOPIC_OBJECT_MARKERS = "/sysnav/object_markers"
 # mission3(Instruction-Following)가 각 step에서 실제로 찍은 goal 좌표를 디버그용으로
 # 남긴다 - "success는 떴는데 실제로는 물체 앞까지 안 갔다"류 문제를 RViz에서 눈으로
@@ -94,6 +100,18 @@ TERRAIN_APPROACH_ANGLES_DEG = (0.0, 20.0, -20.0, 40.0, -40.0, 60.0, -60.0)
 
 # terrain 데이터가 이보다 오래되면 판정하지 않는다(보류).
 TERRAIN_STALE_SEC = 3.0
+
+# waypointConverter 되먹임 감시(TOPIC_WAYPOINT_ECHO). 우리 목표와 변환 결과가 이보다
+# 멀면 "converter가 우리 좌표를 버렸다"로 본다. 0.75m는 converter의 하드 필터
+# (obstacleDisThre)와 같은 크기 - 그보다 작은 차이는 정상적인 미세 조정이다.
+WAYPOINT_ECHO_TOLERANCE_M = 0.75
+# 한 프레임만 어긋난 걸로 판단하면 안 된다(직전 목표의 잔상, terrain 갱신 지연).
+# 이 시간 동안 계속 어긋나 있어야 거부로 확정한다.
+WAYPOINT_ECHO_CONFIRM_SEC = 3.0
+# echo가 이보다 오래됐으면 판정하지 않는다 - converter가 멈춘 상태일 수 있다.
+WAYPOINT_ECHO_STALE_SEC = 2.0
+# 거부당한 접근 지점은 다시 고르지 않는다. 재선택 시 이 반경 안의 후보를 건너뛴다.
+TERRAIN_REJECTED_POINT_RADIUS_M = 0.50
 
 # 확정된 목적지로 가는 주행(mission2 NAVIGATE_TARGET)의 경로 재계획 설정.
 # 탐색(EXPLORATION_*)과 값을 공유하지 않고 따로 두는 이유: 탐색 쪽 값은 "이 후보는
@@ -476,6 +494,16 @@ INSTRUCTION_FORBIDDEN_RADIUS_M = 0.8
 # traversable locations before declaring failure.
 MISSION3_RECOVERY_PATROL_MAX_POINTS = 10
 MISSION3_RECOVERY_PATROL_MIN_SPACING_M = 1.2
+
+# Object Reference (missions/mission2_pipe.py) - 탐색을 먼저 완주해서 Scene Graph를
+# 완성한 뒤에 고르는 구조(2026-08-18)라, 탐색이 끝나기 전에 10분 제한에 걸리면 답을
+# 하나도 못 내는 위험이 생긴다. 경과 시간이 이 값을 넘으면 프론티어가 남아 있어도
+# 탐색을 멈추고 지금까지의 그래프로 최종 선택을 강행한다(무응답이 최악이므로).
+MISSION2_SELECT_DEADLINE_SEC = 0.70 * MISSION_TIME_LIMIT_SEC
+# 탐색 소진 후에도 후보를 못 골랐을 때 mission3와 같은 방식으로 도는 recovery patrol
+# 횟수. 카메라로만 보이는 물체(그림/창문 등)는 프론티어 기준으론 다 봤는데도 각도가
+# 안 나와 못 잡는 경우가 있어서 필요하다.
+MISSION2_RECOVERY_PATROL_MAX_POINTS = 6
 
 # ---------------------------------------------------------------------------
 # Single-room scene graph

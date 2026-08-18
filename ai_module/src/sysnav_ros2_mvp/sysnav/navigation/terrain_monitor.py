@@ -117,7 +117,7 @@ class TerrainMonitor:
         return self._supported(trav, obstacle, np.array([x, y], dtype=np.float64))
 
     def choose_approach_point(
-        self, object_xy, robot_xy
+        self, object_xy, robot_xy, rejected=None
     ) -> tuple[float, float] | None:
         """물체로 접근할 지점을 고른다. 물체에서 가까운 순서로 후보를 훑어 첫 통과점을
         반환한다 - "go near X"이므로 통과하는 것 중 가장 가까운 지점이 좋다.
@@ -125,9 +125,18 @@ class TerrainMonitor:
         로봇->물체 방향을 기준으로 각도를 벌려가며 찾는 이유: 정면 접근이 막혀도
         (벽에 붙은 물체, 앞을 막은 가구) 옆에서 접근하면 통과하는 경우가 많다.
 
+        rejected: 이미 발행했다가 waypointConverter가 버린 지점들. 우리 terrain 복제가
+        "통과"라고 봤지만 실제 converter는 안 받아준 좌표이므로, 그 근처
+        (TERRAIN_REJECTED_POINT_RADIUS_M)를 다시 고르면 같은 실패를 반복한다.
+
         반환 None = 통과 지점을 못 찾음. 호출 측은 기존 방식(고정 standoff)으로
         폴백해야 한다. terrain 판정 실패가 주행 자체를 막으면 안 된다.
         """
+        rejected_points = (
+            np.empty((0, 2), dtype=np.float64)
+            if not rejected
+            else np.asarray(rejected, dtype=np.float64)[:, :2]
+        )
         if not self.ready():
             self.last_selection = "terrain not ready"
             return None
@@ -153,6 +162,11 @@ class TerrainMonitor:
                 ])
                 candidate = object_xy - distance * rotated
                 tried += 1
+                if len(rejected_points) and np.any(
+                    np.linalg.norm(rejected_points - candidate, axis=1)
+                    <= config.TERRAIN_REJECTED_POINT_RADIUS_M
+                ):
+                    continue
                 if self._supported(trav, obstacle, candidate):
                     self.last_selection = (
                         f"d={distance:.2f}m angle={angle_deg:+.0f}deg tried={tried}"
@@ -161,7 +175,8 @@ class TerrainMonitor:
             distance += config.TERRAIN_APPROACH_STEP_M
 
         self.last_selection = (
-            f"no supported point (tried={tried}, trav={len(trav)}, obstacle={len(obstacle)})"
+            f"no supported point (tried={tried}, trav={len(trav)}, "
+            f"obstacle={len(obstacle)}, rejected={len(rejected_points)})"
         )
         return None
 

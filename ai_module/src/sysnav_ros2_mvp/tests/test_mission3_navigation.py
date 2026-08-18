@@ -45,6 +45,12 @@ def _node(goal_xy, current_goal, *, stalled=True, best_distance_m=3.0):
     node._target_retarget_count = 0
     node._target_republish_count = 0
     node._target_unreachable_reason = None
+    # waypointConverter 되먹임 감시 필드(sysnav_node.__init__와 같은 초기값).
+    node._waypoint_echo_xy = None
+    node._waypoint_echo_time = None
+    node._waypoint_echo_mismatch_since = None
+    node._target_rejected_points = []
+    node.sensor_lock = nullcontext()
     node._trace_navigation = lambda *_args: None
     node.coverage_planner = SimpleNamespace(last_direct_path_diagnostics={"reason": "ok"})
     node.get_logger = lambda: _Logger()

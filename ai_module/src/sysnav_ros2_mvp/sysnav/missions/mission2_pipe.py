@@ -1,27 +1,69 @@
 """Mission 2 - Object Reference (MISSION_2object_reference_CLAUDE.txt).
 
 문장 하나가 가리키는 유일한 물체를 찾아 bbox marker(`/selected_object_marker`)와
-navigation waypoint(`/way_point_with_heading`)를 낸다. sysnav_node.py의 기존
-object_reference 파이프라인(리팩터 이전 코드)을 그대로 옮긴 것 - 동작은 바뀌지
-않았고, 이번에 빠져 있던 `/selected_object_marker` 발행만 추가됐다.
+navigation waypoint(`/way_point_with_heading`)를 낸다.
+
+**탐색 완주 -> Scene Graph 완성 -> 선택** 구조다(2026-08-18 변경). 후보를 하나
+찾자마자 고르던 예전 greedy 구조는 "지금까지 본 것 중 최선"을 답으로 확정해버려서,
+"closest/farthest" 같은 최상급 문장에서 아직 못 본 더 가까운 물체가 있으면 그대로
+오답이 됐다. 이제 Mission 1(Numerical)과 같은 종료 조건을 쓴다 - candidate가
+생겨도 멈추지 않고 coverage_planner.plan_route()가 빈 route를 반환할 때까지
+탐색하면서 Scene Graph를 채우고, 그 시점에 완성된 그래프로 한 번에 고른다.
+
+두 가지 안전장치가 붙어 있다:
+  - 10분 제한(config.MISSION2_SELECT_DEADLINE_SEC): 탐색이 안 끝나도 이 시간을
+    넘으면 지금까지의 그래프로 최종 선택을 강행한다. 채점이 0/1이라 무응답이 최악이다.
+  - recovery patrol(config.MISSION2_RECOVERY_PATROL_MAX_POINTS): 프론티어가 소진됐는데도
+    후보를 못 고르면(그림/창문처럼 카메라로만 보이는 물체) mission3와 같은 방식으로
+    이미 아는 통행 가능 지점을 더 돌아본 뒤 다시 선택한다.
+
+최종 선택(`selection_job(final=True)`)은 relation/attribute가 검증 안 됐다고 미루지
+않고 반드시 하나를 고른다 - 더 탐색해서 기다릴 여지가 이미 없기 때문이다.
 
 state 흐름: OBSERVE/PLAN_EXPLORATION/FOLLOW_EXPLORATION(공용, sysnav_node.py) ->
-SELECT_TARGET -> NAVIGATE_TARGET -> SUCCESS.
+(exploration exhausted 또는 deadline) -> SELECT_TARGET -> NAVIGATE_TARGET -> SUCCESS.
 """
 
 from __future__ import annotations
 
+import time
 from collections import deque
 
+from sysnav import config
 from sysnav.scene_graph.scene_graph_rviz import build_selected_object_marker
 
 
 def loop(node, state: str, task: dict, task_id: int, pose: dict) -> None:
     if state == "SELECT_TARGET":
-        node.submit_job("selection", node.selection_job, task_id, task, pose, origin_state=state)
+        node.submit_job(
+            "selection",
+            node.selection_job,
+            task_id,
+            task,
+            pose,
+            node.mission2_select_final,
+            origin_state=state,
+        )
         return
     if state == "NAVIGATE_TARGET":
         _run_navigate_target(node, pose)
+
+
+def _deadline_reached(node) -> bool:
+    """10분 제한이 임박했는지 - 탐색을 더 못 기다리는 시점인지 판단한다."""
+    if node.task_start_time is None:
+        return False
+    return (time.monotonic() - node.task_start_time) >= config.MISSION2_SELECT_DEADLINE_SEC
+
+
+def _enter_final_selection(node, reason: str) -> None:
+    """탐색을 끝내고(또는 포기하고) 완성된 Scene Graph로 최종 선택에 들어간다."""
+    node.mission2_select_final = True
+    node.exploration_route.clear()
+    node.current_goal = None
+    with node.state_lock:
+        node.state = "SELECT_TARGET"
+    node.get_logger().info(f"🔍 FINAL SELECTION - {reason}")
 
 
 def on_job_result(node, task: dict, kind: str, result: dict, origin_state: str) -> None:
@@ -34,42 +76,48 @@ def on_job_result(node, task: dict, kind: str, result: dict, origin_state: str) 
 
 
 def _on_perception_result(node, result: dict, origin_state: str) -> None:
-    if result["candidates"]:
-        with node.state_lock:
-            node.state = "SELECT_TARGET"
-            node.exploration_route.clear()
-    elif origin_state == "OBSERVE":
+    # candidate를 찾아도 멈추지 않는다 - 탐색을 완주해야 Scene Graph가 완성되고,
+    # 그래야 "closest/farthest" 같은 비교 판정이 전체 후보를 놓고 이뤄진다
+    # (Mission 1과 같은 종료 조건). 시간 제한이 임박한 경우만 예외다.
+    if _deadline_reached(node) and result["candidates"]:
+        _enter_final_selection(
+            node,
+            f"time limit approaching ({config.MISSION2_SELECT_DEADLINE_SEC:.0f}s), "
+            f"selecting from {len(result['candidates'])} candidate(s) found so far",
+        )
+        return
+    # FOLLOW_EXPLORATION 중 관측(perception-while-moving)은 object_memory와 Scene
+    # Graph만 갱신하고 이동 자체는 방해하지 않는다.
+    if origin_state == "OBSERVE":
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
 
 
 def _on_selection_result(node, result: dict) -> None:
-    if result.get("relation_pending"):
-        # 문장의 relation 제약(예: "knife rack 근처")이 아직 검증 안 된 candidate뿐이다.
-        # 확정하지 않고 계속 탐색해서 참조 물체를 더 찾아본다.
-        node.get_logger().info(
-            "Selection deferred: relation constraint not verified for any candidate yet, "
-            "continuing exploration"
-        )
-        with node.state_lock:
-            node.state = "PLAN_EXPLORATION"
-        return
-    if result.get("attribute_pending"):
-        # 문장의 속성 제약(예: "black" chair)을 만족하는 candidate가 검증되지 않았다
-        # (불일치했거나 아직 확인 자체가 안 됨) - 확정하지 않고 계속 탐색해서 진짜
-        # 속성이 맞는 물체를 더 찾아본다.
-        node.get_logger().info(
-            "Selection deferred: attribute constraint not verified for any "
-            "candidate yet, continuing exploration"
-        )
-        with node.state_lock:
-            node.state = "PLAN_EXPLORATION"
+    # *_pending은 "더 탐색하면 확정할 수 있다"는 뜻이라 최종 선택(final=True)에서는
+    # 애초에 나오지 않는다. 시간 제한 직전에 강행한 선택 등 예외 경로를 위해
+    # 남겨두되, 이미 탐색이 끝난 뒤라면 탐색으로 되돌리지 않고 아래 recovery로 간다.
+    if result.get("relation_pending") or result.get("attribute_pending"):
+        constraint = "relation" if result.get("relation_pending") else "attribute"
+        if not node.mission2_select_final:
+            node.get_logger().info(
+                f"Selection deferred: {constraint} constraint not verified for any "
+                "candidate yet, continuing exploration"
+            )
+            with node.state_lock:
+                node.state = "PLAN_EXPLORATION"
+            return
+        _recover_or_fail(node, f"{constraint} constraint unverified at final selection")
         return
 
     selected = node.object_memory.get(result["selected_id"])
     with node.sensor_lock:
         pose = None if node.latest_pose is None else dict(node.latest_pose)
     if selected is None or pose is None:
+        # 최종 선택인데도 고를 게 없다(카테고리 후보 자체가 없거나 pose 미준비).
+        if node.mission2_select_final:
+            _recover_or_fail(node, "no candidate available at final selection")
+            return
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
@@ -108,15 +156,56 @@ def _on_selection_result(node, result: dict) -> None:
 def _on_exploration_result(node, result: dict) -> None:
     route = result["route"]
     if not route:
-        with node.state_lock:
-            node.state = "FAILED"
-        node.get_logger().warning(
-            f"❌ TASK FAILED - no reachable frontier remains "
-            f"({node.coverage_planner.describe_last_plan_failure()})"
+        # 더 볼 곳이 없다 - Mission 1과 마찬가지로 이건 "실패"가 아니라 "다 봤다,
+        # 이제 완성된 Scene Graph로 고를 시점"이라는 신호다. (예전엔 여기서 바로
+        # FAILED였고, 그래서 유일 후보인 최상급 문장이 답 없이 끝났다.)
+        _enter_final_selection(
+            node,
+            "exploration exhausted, selecting from the completed scene graph "
+            f"({node.coverage_planner.describe_last_plan_failure()})",
+        )
+        return
+    if _deadline_reached(node):
+        _enter_final_selection(
+            node,
+            f"time limit approaching ({config.MISSION2_SELECT_DEADLINE_SEC:.0f}s), "
+            "stopping exploration",
         )
         return
     node.exploration_route = deque(route)
     node.publish_next_exploration_goal()
+
+
+def _recover_or_fail(node, reason: str) -> None:
+    """최종 선택에서 아무것도 못 골랐을 때 - 이미 아는 통행 가능 지점을 더 돌아보고
+    (mission3의 recovery patrol과 같은 방식), 그것도 소진되면 FAILED로 끝낸다."""
+    with node.sensor_lock:
+        pose = None if node.latest_pose is None else dict(node.latest_pose)
+    if (
+        pose is not None
+        and not _deadline_reached(node)
+        and len(node.mission2_recovery_points) < config.MISSION2_RECOVERY_PATROL_MAX_POINTS
+    ):
+        recovery_route = node.coverage_planner.plan_recovery_patrol(
+            pose, node.mission2_recovery_points
+        )
+        if recovery_route:
+            endpoint = recovery_route[-1]
+            node.mission2_recovery_points.append((float(endpoint["x"]), float(endpoint["y"])))
+            node.exploration_route = deque(recovery_route)
+            node.get_logger().info(
+                f"🧭 RECOVERY PATROL {len(node.mission2_recovery_points)}/"
+                f"{config.MISSION2_RECOVERY_PATROL_MAX_POINTS} - {reason}, "
+                f"checking viewpoint ({endpoint['x']:.2f}, {endpoint['y']:.2f})"
+            )
+            node.publish_next_exploration_goal()
+            return
+    with node.state_lock:
+        node.state = "FAILED"
+    node.get_logger().warning(
+        f"❌ TASK FAILED - {reason}; frontier and recovery patrol exhausted "
+        f"({node.coverage_planner.describe_last_plan_failure()})"
+    )
 
 
 def _run_navigate_target(node, pose: dict) -> None:

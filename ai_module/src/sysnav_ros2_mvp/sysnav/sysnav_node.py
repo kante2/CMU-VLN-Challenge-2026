@@ -13,6 +13,7 @@ import os
 import threading
 import time
 
+from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import Odometry
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
@@ -216,6 +217,13 @@ class SysNavNode(Node):
         self._target_retarget_count = 0
         self._target_republish_count = 0
         self._target_unreachable_reason: str | None = None
+        # waypointConverter 되먹임(TOPIC_WAYPOINT_ECHO) 감시용.
+        self._waypoint_echo_xy: tuple[float, float] | None = None
+        self._waypoint_echo_time: float | None = None
+        # 우리 목표와 echo가 어긋나기 시작한 시각(연속으로 어긋난 시간을 재기 위함).
+        self._waypoint_echo_mismatch_since: float | None = None
+        # converter가 실제로 버린 접근 지점들 - 재선택 때 이 근처는 건너뛴다.
+        self._target_rejected_points: list[tuple[float, float]] = []
 
         # Mission 3(Instruction-Following, missions/mission3_pipe.py) 전용 상태 -
         # 여러 목적지를 순서대로 처리해야 해서 mission2/1과 달리 진행 인덱스가
@@ -224,6 +232,12 @@ class SysNavNode(Node):
         self.mission3_forbidden_mask = None
         self.mission3_step_destinations: list[dict] = []
         self.mission3_recovery_points: dict[int, list[tuple[float, float]]] = {}
+
+        # Mission 2(Object Reference, missions/mission2_pipe.py) 전용 상태 -
+        # "탐색 완주 -> Scene Graph 완성 -> 선택"이라 지금이 최종 선택 시점인지
+        # (=더 탐색해서 기다릴 여지가 없는지)를 selection_job에 알려줘야 한다.
+        self.mission2_select_final = False
+        self.mission2_recovery_points: list[tuple[float, float]] = []
 
         # Cross-room navigation(rooms/cross_room_navigator.py) - 이번 task 안에서
         # 이미 시도해본(가거나, 갔는데 경로가 안 됐던) room_id. 새 질문마다 리셋.
@@ -266,6 +280,18 @@ class SysNavNode(Node):
             PointCloud2,
             config.TOPIC_TERRAIN_MAP,
             self.terrain_callback,
+            qos_profile_sensor_data,
+            callback_group=self.callback_group,
+        )
+        # waypointConverter가 우리 목표를 실제로 어떤 좌표로 바꿔 내보냈는지 되먹임으로
+        # 본다(읽기 전용). 우리 terrain 복제(terrain_monitor)가 "통과"라고 판정했는데도
+        # converter가 우리 좌표를 버리는 경우가 실측으로 있었고, 그때 로봇은 목표 근처가
+        # 아니라 자기 옆 지점으로 waypoint를 받아 제자리에 머문다 - 그 상황을 40초짜리
+        # stall 타임아웃이 아니라 즉시 알아채기 위한 신호다.
+        self.waypoint_echo_sub = self.create_subscription(
+            PointStamped,
+            config.TOPIC_WAYPOINT_ECHO,
+            self.waypoint_echo_callback,
             qos_profile_sensor_data,
             callback_group=self.callback_group,
         )
@@ -326,6 +352,8 @@ class SysNavNode(Node):
             self.last_processed_image_stamp = -1.0
             self.mission3_step_index = 0
             self.mission3_forbidden_mask = None
+            self.mission2_select_final = False
+            self.mission2_recovery_points.clear()
             self.mission3_step_destinations.clear()
             self.mission3_recovery_points.clear()
             self._cross_room_attempted_ids = set()
@@ -373,6 +401,52 @@ class SysNavNode(Node):
             self.terrain_monitor.update(msg)
         except Exception as error:
             self.get_logger().warning(f"terrain_map parse failed: {error}")
+
+    def waypoint_echo_callback(self, msg: PointStamped) -> None:
+        """waypointConverter가 로봇에게 실제로 준 waypoint. 판정은 control_loop
+        쪽(converter_rejected_goal)에서 하고 여기서는 최신값만 받아둔다."""
+        with self.sensor_lock:
+            self._waypoint_echo_xy = (float(msg.point.x), float(msg.point.y))
+            self._waypoint_echo_time = time.monotonic()
+
+    def converter_rejected_goal(self) -> float | None:
+        """waypointConverter가 우리 목표를 버렸으면 어긋난 거리(m), 아니면 None.
+
+        converter는 목표가 자기 travArea 기준으로 못 쓰는 지점이면 우리 좌표를 버리고
+        "우리 목표에 가깝고 + 로봇에도 가까운" 후보를 대신 고른다(비용에 로봇 거리가
+        0.5 가중치로 들어간다). 그 결과가 로봇 바로 옆이면 로봇은 이미 도착한 셈이라
+        움직이지 않는다 - 실측에서 1.8m 앞 목표가 로봇 0.3m 옆으로 바뀌었다.
+
+        한 프레임 차이로 단정하지 않고 WAYPOINT_ECHO_CONFIRM_SEC 동안 계속 어긋나야
+        거부로 본다(직전 목표의 잔상, terrain 갱신 지연 때문).
+        """
+        if self.target_goal_xy is None:
+            self._waypoint_echo_mismatch_since = None
+            return None
+        with self.sensor_lock:
+            echo_xy = self._waypoint_echo_xy
+            echo_time = self._waypoint_echo_time
+        now = time.monotonic()
+        if (
+            echo_xy is None
+            or echo_time is None
+            or now - echo_time > config.WAYPOINT_ECHO_STALE_SEC
+        ):
+            # converter가 멈췄거나 아직 안 왔다 - 판정하지 않는다(보류).
+            self._waypoint_echo_mismatch_since = None
+            return None
+        deviation = math.hypot(
+            echo_xy[0] - self.target_goal_xy[0], echo_xy[1] - self.target_goal_xy[1]
+        )
+        if deviation <= config.WAYPOINT_ECHO_TOLERANCE_M:
+            self._waypoint_echo_mismatch_since = None
+            return None
+        if self._waypoint_echo_mismatch_since is None:
+            self._waypoint_echo_mismatch_since = now
+            return None
+        if now - self._waypoint_echo_mismatch_since < config.WAYPOINT_ECHO_CONFIRM_SEC:
+            return None
+        return deviation
 
     def scan_callback(self, msg: PointCloud2) -> None:
         stamp = message_stamp_to_sec(msg) # ROS 메시지에는 촬영 시간이 존재, 이를 추출
@@ -571,7 +645,15 @@ class SysNavNode(Node):
     # task_id, # 현재 처리중인 질문 번호 / worker가 어느 질문인지 확인하기 위함.
     # task # 질문을 query_parser.py에서 분석한 결과
     # 
-    def selection_job(self, task_id: int, task: dict, pose: dict) -> dict:
+    def selection_job(self, task_id: int, task: dict, pose: dict, final: bool = False) -> dict:
+        """후보 중 하나를 고른다.
+
+        final=True는 "더 탐색해서 기다릴 여지가 없는 최종 선택"이라는 뜻이다
+        (Object Reference가 탐색을 완주한 뒤, 또는 10분 제한이 임박해서 호출).
+        이때는 relation/attribute가 검증 안 됐다고 *_pending으로 미루지 않고,
+        검증 가능한 만큼만 걸러낸 뒤 반드시 하나를 고른다 - 채점이 0/1이라
+        "확신이 없어서 답을 안 냄"이 가장 나쁜 결과이기 때문이다.
+        """
         # 후보를 고르기 전에 갈라진 노드를 합친다 - 같은 물체가 여러 개로 남아 있으면
         # "nearest" 같은 비교 판정이 같은 물체끼리 경쟁하는 꼴이 된다.
         merged = self.object_memory.merge_duplicates()
@@ -604,7 +686,11 @@ class SysNavNode(Node):
             # closest/nearest is an argmin.  A lone object is only the nearest
             # seen so far, so it cannot become a destination until exploration
             # exhaustion explicitly creates the unique-candidate relation edge.
-            return {"task_id": task_id, "selected_id": None, "relation_pending": True}
+            if not final:
+                return {"task_id": task_id, "selected_id": None, "relation_pending": True}
+            # final=True면 그 "exploration exhaustion" 시점이 바로 지금이다 - 유일
+            # 인스턴스라는 근거를 그래프에 edge로 남기고 그대로 확정한다.
+            self.scene_graph.finalize_unique_comparative_relation(task)
         elif effective_relation_chain(task):
             # 문장에 relation 제약(예: "knife rack 근처의")이 있는데 geometric/
             # co-observation 경로로는 아직 하나도 검증 안 됨 - 보통 참조 물체를
@@ -615,7 +701,7 @@ class SysNavNode(Node):
             # A crop-based fallback can validate one local relation, but it
             # cannot prove a nested chain. For A->B->C, every graph edge must
             # exist; otherwise selecting A would silently ignore B->C.
-            if len(relation_chain) > 1:
+            if len(relation_chain) > 1 and not final:
                 return {"task_id": task_id, "selected_id": None, "relation_pending": True}
             if candidates:
                 _, first_relation, first_reference = relation_chain[0]
@@ -662,11 +748,18 @@ class SysNavNode(Node):
                     candidate for candidate in candidates
                     if int(candidate["object_id"]) in image_verified_ids
                 ]
-            else:
+            elif not final:
                 # 후보가 아직 없거나, 이미지 확인도 실패(또는 검증 안 됨) - 확정하지
                 # 않고 계속 탐색해서 후보/참조 물체를 더 찾아보거나 다른 각도에서
                 # 다시 시도한다.
                 return {"task_id": task_id, "selected_id": None, "relation_pending": True}
+            else:
+                # 최종 선택 시점 - relation을 못 걸렀어도 candidates를 그대로 두고
+                # GeminiSelector가 문장 전체를 보고 고르게 한다(무응답 방지).
+                self.get_logger().warning(
+                    "🔎 FINAL SELECT - relation constraint unverified; "
+                    "falling back to unfiltered candidates"
+                )
 
         # SysNav paper Sec. IV-A-1 (self-attribute): 문장에 속성 제약(예: "black" chair)이
         # 있으면, 후보가 1개뿐이어도 반드시 VLM으로 확인한다 - "후보가 하나뿐이면 그냥
@@ -678,17 +771,26 @@ class SysNavNode(Node):
                 newly_checked = attribute_results.get(int(candidate["object_id"]), {})
                 if newly_checked:
                     self.object_memory.update_self_attributes(int(candidate["object_id"]), newly_checked)
-            candidates = [
+            attribute_matched = [
                 candidate for candidate in candidates
                 if all(
                     attribute_results.get(int(candidate["object_id"]), {}).get(attribute, False)
                     for attribute in attributes
                 )
             ]
-            if not candidates:
+            if attribute_matched:
+                candidates = attribute_matched
+            elif not final:
                 # 속성이 확인된 후보가 하나도 없다(전부 불일치했거나 아직 검증 자체가
                 # 안 됨) - 확정하지 않고 계속 탐색해서 진짜 맞는 물체를 더 찾아본다.
                 return {"task_id": task_id, "selected_id": None, "attribute_pending": True}
+            else:
+                # 최종 선택 시점 - 속성이 맞는 후보가 없어도 카테고리 후보 중에서는
+                # 골라야 한다(무응답 방지). candidates를 속성 필터 전 상태로 둔다.
+                self.get_logger().warning(
+                    "🔎 FINAL SELECT - no candidate matched the requested attributes; "
+                    "falling back to category candidates"
+                )
 
         # GeminiSelector()
         selected_id = self.selector.select(
@@ -1086,6 +1188,8 @@ class SysNavNode(Node):
             self.current_goal = None
         self._target_replan_count = 0
         self._target_last_replan_time = None
+        self._waypoint_echo_mismatch_since = None
+        self._target_rejected_points.clear()
         self._target_goal_best_distance_m = None
         self._target_goal_last_progress_time = None
         self._target_retarget_count = 0
@@ -1365,6 +1469,14 @@ class SysNavNode(Node):
         if self._retarget_if_unsupported(pose):
             return "driving"
 
+        # 3-b. converter 되먹임. 우리 terrain 복제가 통과라고 봤어도 실제
+        #      waypointConverter는 우리 좌표를 버릴 수 있다(travArea 커버리지가
+        #      우리 판정과 다를 때). 그러면 로봇은 자기 옆 지점을 목표로 받아 제자리에
+        #      머무는데, 3번은 우리 판정 기준이라 이를 영원히 못 잡는다. 실제로 나간
+        #      /way_point를 보고 즉시 다른 접근 지점으로 옮긴다.
+        if self._retarget_if_converter_rejected(pose):
+            return "driving"
+
         # 4. 최후 백스톱. base autonomy가 스스로 멈춘 것이므로 "더 못 간다"는 판단은
         #    우리 지도가 아니라 로봇의 실제 거동에서 온다.
         if self.target_progress_stalled(pose):
@@ -1419,7 +1531,9 @@ class SysNavNode(Node):
         self._target_last_replan_time = now
 
         robot_xy = (float(pose["x"]), float(pose["y"]))
-        chosen = self.terrain_monitor.choose_approach_point(self.target_object_xy, robot_xy)
+        chosen = self.terrain_monitor.choose_approach_point(
+            self.target_object_xy, robot_xy, rejected=self._target_rejected_points
+        )
         if chosen is None:
             self._trace_navigation(
                 "RETARGET_FAIL",
@@ -1439,6 +1553,55 @@ class SysNavNode(Node):
         self.target_goal_xy = chosen
         self.target_final_theta = theta
         self._target_retarget_count += 1
+        self._publish_target_goal(chosen[0], chosen[1], theta, is_final=True)
+        self.refresh_goal_marker()
+        return True
+
+    def _retarget_if_converter_rejected(self, pose: dict) -> bool:
+        """waypointConverter가 우리 목표를 버렸으면 그 지점을 기록하고 다른 접근 지점을
+        고른다. 고를 게 없으면 False를 돌려 기존 stall 판정에 맡긴다."""
+        if self.target_object_xy is None or self.target_route or self.target_goal_xy is None:
+            return False
+        deviation = self.converter_rejected_goal()
+        if deviation is None:
+            return False
+
+        rejected = self.target_goal_xy
+        self._target_rejected_points.append((float(rejected[0]), float(rejected[1])))
+        self._waypoint_echo_mismatch_since = None
+        with self.sensor_lock:
+            echo_xy = self._waypoint_echo_xy
+        echo_note = "-" if echo_xy is None else f"({echo_xy[0]:.2f},{echo_xy[1]:.2f})"
+        self.get_logger().warning(
+            f"🚧 WAYPOINT REJECTED BY CONVERTER - requested "
+            f"({rejected[0]:.2f},{rejected[1]:.2f}) but /way_point is {echo_note} "
+            f"(off by {deviation:.2f}m); picking another approach point"
+        )
+
+        robot_xy = (float(pose["x"]), float(pose["y"]))
+        chosen = self.terrain_monitor.choose_approach_point(
+            self.target_object_xy, robot_xy, rejected=self._target_rejected_points
+        )
+        if chosen is None:
+            self._trace_navigation(
+                "CONVERTER_REJECT_NO_ALT",
+                f"rejected={len(self._target_rejected_points)} "
+                f"{self.terrain_monitor.last_selection}",
+            )
+            return False
+
+        theta = math.atan2(
+            self.target_object_xy[1] - chosen[1], self.target_object_xy[0] - chosen[0]
+        )
+        self._trace_navigation(
+            "CONVERTER_REJECT_RETARGET",
+            f"({rejected[0]:.2f},{rejected[1]:.2f}) -> ({chosen[0]:.2f},{chosen[1]:.2f}) "
+            f"dev={deviation:.2f}m {self.terrain_monitor.last_selection}",
+        )
+        self.target_goal_xy = chosen
+        self.target_final_theta = theta
+        self._target_retarget_count += 1
+        self._target_goal_last_progress_time = time.monotonic()
         self._publish_target_goal(chosen[0], chosen[1], theta, is_final=True)
         self.refresh_goal_marker()
         return True
@@ -1575,9 +1738,25 @@ class SysNavNode(Node):
             "target_goal_xy": self.target_goal_xy,
             "target_distance_m": None if pose is None else self.distance_to_target(pose),
             "target_hops_remaining": len(self.target_route),
+            # base autonomy가 우리 목표를 실제로 어떤 좌표로 바꿔 내보냈는지
+            # (waypointConverter 되먹임). 우리 목표와 크게 다르면 로봇은 목표가 아니라
+            # 그 좌표로 가고 있는 것이라, 이 행만 보고도 원인을 구분할 수 있다.
+            "waypoint_echo_xy": self._waypoint_echo_xy,
+            "waypoint_echo_deviation_m": (
+                None
+                if self._waypoint_echo_xy is None or self.target_goal_xy is None
+                else math.hypot(
+                    self._waypoint_echo_xy[0] - self.target_goal_xy[0],
+                    self._waypoint_echo_xy[1] - self.target_goal_xy[1],
+                )
+            ),
+            "target_rejected_points": len(self._target_rejected_points),
             "target_replans": self._target_replan_count,
             "mission3_step_index": self.mission3_step_index,
             "mission3_forbidden_active": self.mission3_forbidden_mask is not None,
+            # Mission 2가 아직 탐색 중인지(False), 탐색을 끝내고 최종 선택 단계인지(True).
+            "mission2_select_final": self.mission2_select_final,
+            "mission2_recovery_points": len(self.mission2_recovery_points),
             "last_response_summary": self.last_response_summary,
             "candidate_count": candidate_count,
         })
