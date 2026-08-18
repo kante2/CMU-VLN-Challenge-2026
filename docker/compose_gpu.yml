@@ -88,3 +88,27 @@ services:
               - driver: nvidia
                 count: all
                 capabilities: [gpu]
+
+  # 제출용 sysnav — Docker Hub에 올린 이미지를 그대로 실행 (2026-08-18 추가)
+  # 위 sysnav_module과 달리 (1) 로컬 빌드 안 함 (2) src 바인드 마운트 안 함
+  #   → 이미지 안에 COPY+colcon build 되어 있는 소스 그대로 돌아감 (제출본 검증용).
+  # 사용: docker compose -f compose_gpu.yml up -d sysnav_submission
+  sysnav_submission:
+    image: parkjaeil00/cmu-vln-2026-sysnav:${SYSNAV_IMAGE_TAG:-submission-v1}
+    pull_policy: missing
+    container_name: iros2026_sysnav_submission
+    network_mode: host
+    ipc: host
+    stdin_open: true
+    tty: true
+    env_file:
+      - ../ai_module/.env
+    volumes:
+      - ../ai_module/debug:/home/docker/ai_module/debug
+    deploy:
+        resources:
+          reservations:
+            devices:
+              - driver: nvidia
+                count: all
+                capabilities: [gpu]

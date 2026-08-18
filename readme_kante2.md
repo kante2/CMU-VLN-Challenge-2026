@@ -15,6 +15,61 @@
   예: `ros2 topic pub --once /challenge_question std_msgs/msg/String "{data: 'Find the bowl near the trash can.'}"`)
 - **대시보드 확인** (호스트에서, 컨테이너 밖): `./docker/ui_checker.sh`
 
+## 제출 이미지(Docker Hub)로 터미널 B 실행 (2026-08-18 추가)
+
+터미널 B(sysnav)를 **로컬 빌드 대신 Docker Hub 이미지**로 돌리는 경로.
+이미지: `parkjaeil00/cmu-vln-2026-sysnav` (태그 `latest`, `submission-v1` — 둘 다 같은 다이제스트/크기,
+`Dockerfile.sysnav` 그대로 빌드된 것. `WORKDIR=/home/docker/ai_module`, `USER=docker`,
+SAM2/YOLO 가중치 + `install/` colcon 빌드까지 이미지 안에 포함).
+
+```bash
+docker pull parkjaeil00/cmu-vln-2026-sysnav:submission-v1   # ~9GB 다운로드 (1회)
+./docker/start_containers.sh                                # system + sysnav_submission 기동
+./docker/B_sysnav_실행_제출이미지.sh                          # 컨테이너 없으면 자동 생성 후 launch
+./docker/C_질의.sh                                          # 실행 중인 sysnav 컨테이너 자동 선택
+```
+
+compose에 서비스 `sysnav_submission`(컨테이너 `iros2026_sysnav_submission`)을 새로 추가함.
+기존 `sysnav_module`(로컬 빌드 + src 마운트) 개발 경로는 그대로 두고 **병행**하는 구조.
+차이점 두 가지가 핵심:
+- **`build:` 없음** → 로컬 소스로 다시 빌드하지 않고 허브 이미지를 그대로 씀.
+- **`src` 바인드 마운트 없음** → 호스트 소스가 이미지 안 소스를 덮어쓰지 않음. 즉 실제 제출본
+  코드가 도는지 검증됨. (반대로 말하면 호스트에서 코드를 고쳐도 이 컨테이너엔 반영 안 됨 —
+  코드 수정 중이면 기존 `sysnav_module` + `./docker/B_sysnav_실행.sh`를 쓸 것.)
+- `debug` 마운트와 `.env`(GEMINI 키)는 동일하게 유지.
+
+**컨테이너 기동 스크립트**: `./docker/start_containers.sh` — 실행 중이면 건너뛰고, 정지 상태면
+`docker start`, 아예 없으면 `docker compose up -d`로 생성까지 함 (`xhost +local:docker`도 같이).
+```bash
+./docker/start_containers.sh              # system + sysnav_submission (제출 이미지, 기본)
+./docker/start_containers.sh dev          # system + sysnav_module   (로컬 빌드 개발용)
+./docker/start_containers.sh both         # 셋 다
+```
+
+**`.env` 생성 스크립트 (운영진 전달용)**: `./docker/create_env.sh`가 `ai_module/.env`를 만들어 줌.
+키 자리는 비워둔 채로 나오고(`GEMINI_API_KEY=`), 나머지 값은 다 채워짐. 템플릿 원본은
+저장소에 커밋된 `ai_module/.env.example`.
+```bash
+./docker/create_env.sh              # GEMINI_API_KEY= (빈칸)으로 생성, 이후 직접 채워넣기
+./docker/create_env.sh <API_KEY>    # 키까지 채워서 생성
+./docker/create_env.sh --force      # 이미 있는 .env 덮어쓰기 (기본은 거부)
+```
+생성 파일은 `chmod 600`. 주석은 운영진이 읽을 것이라 영어로 씀.
+
+**주의 — `.env`가 필요함**: `ai_module/.env`는 `.gitignore`라 새로 clone한 체크아웃엔 없고,
+compose가 `env_file`로 읽으므로 없으면 `up`이 바로 실패함. 이 저장소에서는 기존 실행 중이던
+`iros2026_sysnav_module` 컨테이너의 환경변수에서 복원해 다시 만들어 둠(`chmod 600`).
+`.env`는 컨테이너 **생성 시점**에만 읽히므로 키를 고쳤으면
+`docker compose -f docker/compose_gpu.yml up -d --force-recreate sysnav_submission`.
+
+**주의 — 이미지 안 소스 = 지금 브랜치 소스인지 확인**: 이미지 빌드 시각(2026-08-18 18:43 KST)과
+지금 체크아웃의 HEAD가 다를 수 있음. 받은 뒤 한 번 대조할 것:
+```bash
+docker run --rm parkjaeil00/cmu-vln-2026-sysnav:submission-v1 \
+  bash -lc "cd /home/docker/ai_module/src/sysnav_ros2_mvp && find . -name '*.py' | sort | xargs md5sum | md5sum"
+(cd ai_module/src/sysnav_ros2_mvp && find . -name '*.py' | sort | xargs md5sum | md5sum)
+```
+
 # sysnav_ros2_mvp 실행 방법 (2026-07-21)
 
 경로: `ai_module/src/sysnav_ros2_mvp/`
