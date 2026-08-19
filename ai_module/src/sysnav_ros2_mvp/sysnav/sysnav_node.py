@@ -212,6 +212,8 @@ class SysNavNode(Node):
         self._target_replan_count = 0
         self._target_last_replan_time: float | None = None
         self._target_goal_best_distance_m: float | None = None
+        # 지금 목표가 terrain 기준 "못 쓴다"로 처음 보인 시각(dwell 판정용).
+        self._target_unsupported_since: float | None = None
         self._target_goal_last_progress_time: float | None = None
         # 진단용(동작 영향 없음)
         self._target_retarget_count = 0
@@ -474,7 +476,12 @@ class SysNavNode(Node):
     # ------------------------------------------------------------------
 
     def mapping_job(self, scan_msg: PointCloud2, pose: dict) -> None:
-        self.coverage_planner.update_from_scan(pointcloud2_to_xyz(scan_msg), pose)
+        # credit_coverage=False: 지도(occupancy)는 스캔마다 갱신하지만 "표면을 봤다"는
+        # 커버리지 회계는 여기서 하지 않는다 - 물체를 보는 건 카메라이므로 인식이 실제로
+        # 돈 프레임(perception_job)에서만 인정한다. update_from_scan의 docstring 참고.
+        self.coverage_planner.update_from_scan(
+            pointcloud2_to_xyz(scan_msg), pose, credit_coverage=False
+        )
         #-> Occupancy Map
         # frontier는 이 occupancy map을 통해서 찾게 된다.
         self._update_room_segmentation()
@@ -577,6 +584,13 @@ class SysNavNode(Node):
     ) -> dict:
         image_rgb = image_msg_to_rgb(image_msg) # ROS image -> numpy
         points_sensor = pointcloud2_to_xyz(scan_msg) # 동일 LiDAR를 인식과 Viewpoint coverage 계산에 공용 사용
+
+        # 논문(Sec. IV-B-1)의 covered set은 이 자리에서만 늘어난다: 이 pose에서 카메라
+        # 프레임이 실제로 인식을 돌았고, 같은 시각에 동기화된 이 스캔이 어디까지 보였는지가
+        # 곧 "표면을 봤다"의 정의다. 스캔마다 세던 예전 방식은 인식이 1.5초마다만 도는
+        # 사이에 지나친 표면까지 덮은 것으로 계산했다.
+        self.coverage_planner.update_from_scan(points_sensor, pose, credit_coverage=True)
+
         observations = self.perception.process( # 실제 객체 인식 파이프라인 실행
             image_rgb=image_rgb,
             points_sensor=points_sensor, # pointcloud -> numpy
@@ -1189,6 +1203,7 @@ class SysNavNode(Node):
         self._target_replan_count = 0
         self._target_last_replan_time = None
         self._waypoint_echo_mismatch_since = None
+        self._target_unsupported_since = None
         self._target_rejected_points.clear()
         self._target_goal_best_distance_m = None
         self._target_goal_last_progress_time = None
@@ -1342,6 +1357,17 @@ class SysNavNode(Node):
             time.monotonic() - last_progress >= config.TARGET_REPLAN_STUCK_TIMEOUT_SEC
         )
 
+    def _target_progress_stale(self, patience_sec: float) -> bool:
+        """마지막 "진전"(역대 최단거리 갱신) 이후 patience_sec 넘게 지났는지.
+
+        target_progress_stalled()와 같은 기록을 쓰지만 임계값만 다르다: 저쪽은 "이
+        목적지를 포기할지"(20초)를 재고, 이쪽은 "지금 목표를 갈아탈지"(수 초)를 잰다.
+        기록이 아직 없으면(막 발행한 goal) 진전 중으로 보고 False."""
+        last_progress = self._target_goal_last_progress_time
+        if last_progress is None:
+            return False
+        return time.monotonic() - last_progress >= float(patience_sec)
+
     def replan_target_route(self, pose: dict, reason: str) -> str:
         """최신 지도로 목적지까지의 경로를 다시 계산하고, 무슨 일이 있었는지 문자열로
         돌려준다. bool이 아닌 이유: 호출한 미션이 "재계획됨"과 "더 갈 곳이 없음"을
@@ -1462,10 +1488,21 @@ class SysNavNode(Node):
             self.publish_next_target_hop()
             return "driving"
 
-        # 3. 주행 중 terrain이 갱신되어 지금 목표를 base autonomy가 못 받아들이게
-        #    됐으면 접근 지점을 다시 고른다. 판정 근거가 우리 occupancy grid가 아니라
-        #    /terrain_map인 게 핵심이다 - 로봇을 실제로 움직이는 쪽과 같은 데이터를
-        #    봐야 판정이 의미가 있다.
+        # 2-b. 진행도를 아래 판단들보다 먼저 갱신한다. 3/3-b가 "지금 나아가고 있나"를
+        #      보고 갈아탈지 정하는데, 예전엔 진행도 갱신이 4번(stall 판정) 안에서만
+        #      일어나서 3번이 먼저 return하면 기록이 그대로 멈춰 있었다.
+        stalled = self.target_progress_stalled(pose)
+
+        # 2-c. 한 번 낸 waypoint는 도착하거나 진짜로 멈출 때까지 고정한다. 목표까지
+        #      거리가 계속 줄고 있는 동안에는 아래 재선택(3, 3-b)을 아예 보지 않는다 -
+        #      choose_approach_point()가 로봇 현재 위치 기준이라, 주행 중에 다시 부르면
+        #      접근 지점이 물체 주위를 따라 돌면서 waypoint가 왕복한다.
+        if not self._target_progress_stale(config.TARGET_RETARGET_PATIENCE_SEC):
+            return "driving"
+
+        # 3. 진전이 멈췄다. 지금 목표를 base autonomy가 못 받아들이는 지점이면 접근
+        #    지점을 다시 고른다. 판정 근거가 우리 occupancy grid가 아니라 /terrain_map인
+        #    게 핵심이다 - 로봇을 실제로 움직이는 쪽과 같은 데이터를 봐야 의미가 있다.
         if self._retarget_if_unsupported(pose):
             return "driving"
 
@@ -1479,7 +1516,7 @@ class SysNavNode(Node):
 
         # 4. 최후 백스톱. base autonomy가 스스로 멈춘 것이므로 "더 못 간다"는 판단은
         #    우리 지도가 아니라 로봇의 실제 거동에서 온다.
-        if self.target_progress_stalled(pose):
+        if stalled:
             # 포기하기 전에 같은 goal을 한 번 다시 쏴본다. base autonomy가 어떤 이유로든
             # (waypointConverter의 재타게팅, 메시지 유실 등) 목표를 놓았을 수 있는데,
             # 재발행은 공짜이고 실패해도 잃는 게 없다. 그래도 진전이 없으면 그때 판정한다.
@@ -1508,6 +1545,18 @@ class SysNavNode(Node):
 
         return "driving"
 
+    @staticmethod
+    def _goal_is_on_the_robot(goal_xy, pose: dict) -> bool:
+        """새 목표가 로봇이 이미 서 있는 자리인지.
+
+        choose_approach_point()는 물체에서 TERRAIN_APPROACH_MIN_M(1.0m)부터 후보를
+        훑는데, 방향 기준이 로봇->물체다. 로봇이 물체에 이미 그만큼 붙어 있으면 뽑히는
+        지점이 로봇 위로 수축한다 - 그걸 발행하면 로봇은 "이미 도착"이라 안 움직이고
+        waypoint만 새로 찍힌 것처럼 보인다. 도착 판정 반경과 같은 기준으로 걸러낸다."""
+        return math.hypot(
+            float(goal_xy[0]) - float(pose["x"]), float(goal_xy[1]) - float(pose["y"])
+        ) <= config.GOAL_REACHED_DISTANCE_M
+
     def _retarget_if_unsupported(self, pose: dict) -> bool:
         """지금 목표가 terrain 기준으로 못 쓰게 됐으면 접근 지점을 다시 골라 발행한다.
 
@@ -1519,10 +1568,20 @@ class SysNavNode(Node):
             return False
         if not self.terrain_monitor.ready():
             return False
+        now = time.monotonic()
         if self.terrain_monitor.is_waypoint_supported(*self.target_goal_xy):
+            self._target_unsupported_since = None
             return False
 
-        now = time.monotonic()
+        # 한 프레임의 "못 쓴다"로는 움직이지 않는다 - /terrain_map은 롤링 로컬 맵이라
+        # 목표 근처 점이 프레임마다 들락날락한다(config.TERRAIN_UNSUPPORTED_CONFIRM_SEC
+        # 주석의 실측값 참고). 계속 못 쓰는 상태여야 진짜다.
+        if self._target_unsupported_since is None:
+            self._target_unsupported_since = now
+            return False
+        if now - self._target_unsupported_since < config.TERRAIN_UNSUPPORTED_CONFIRM_SEC:
+            return False
+
         if (
             self._target_last_replan_time is not None
             and now - self._target_last_replan_time < config.TARGET_REPLAN_MIN_INTERVAL_SEC
@@ -1530,17 +1589,41 @@ class SysNavNode(Node):
             return False
         self._target_last_replan_time = now
 
+        # 지금 목표는 "terrain 기준으로 못 쓴다"가 확인된 지점이다. 버린 지점으로
+        # 기록해두지 않으면 choose_approach_point()가 로봇이 조금 움직인 뒤 같은 자리를
+        # 다시 뽑아서 A -> B -> A 왕복이 된다 (converter 거부 경로는 원래 기록했는데
+        # 이쪽만 빠져 있었다). 기록하면 그 반경
+        # config.TERRAIN_REJECTED_POINT_RADIUS_M 안은 후보에서 제외된다.
+        previous_goal = (float(self.target_goal_xy[0]), float(self.target_goal_xy[1]))
         robot_xy = (float(pose["x"]), float(pose["y"]))
         chosen = self.terrain_monitor.choose_approach_point(
-            self.target_object_xy, robot_xy, rejected=self._target_rejected_points
+            self.target_object_xy,
+            robot_xy,
+            rejected=[*self._target_rejected_points, previous_goal],
         )
         if chosen is None:
+            # 대안이 없으면 기록도 남기지 않는다 - 지금 목표를 계속 밀고 가는 편이
+            # 낫고(4번 백스톱이 판정한다), 기록해두면 나중에 terrain이 갱신돼 그
+            # 지점이 다시 쓸 만해져도 영영 못 고르게 된다.
             self._trace_navigation(
                 "RETARGET_FAIL",
                 f"goal=({self.target_goal_xy[0]:.2f},{self.target_goal_xy[1]:.2f}) "
                 f"{self.terrain_monitor.last_selection}",
             )
             return False
+        if self._goal_is_on_the_robot(chosen, pose):
+            # 접근 지점이 로봇이 이미 서 있는 자리로 수축했다 - 발행해도 로봇은
+            # 안 움직이고(자기 위치가 목표), waypoint만 다시 찍힌 것처럼 보인다.
+            # 이건 "여기가 지금 갈 수 있는 최선"이라는 뜻이므로 4번 백스톱의
+            # 도착 판정에 맡긴다.
+            self._trace_navigation(
+                "RETARGET_ON_ROBOT",
+                f"({chosen[0]:.2f},{chosen[1]:.2f}) robot=({pose['x']:.2f},{pose['y']:.2f}) "
+                f"{self.terrain_monitor.last_selection}",
+            )
+            return False
+        self._target_rejected_points.append(previous_goal)
+        self._target_unsupported_since = None
 
         theta = math.atan2(
             self.target_object_xy[1] - chosen[1], self.target_object_xy[0] - chosen[0]
@@ -1587,6 +1670,13 @@ class SysNavNode(Node):
                 "CONVERTER_REJECT_NO_ALT",
                 f"rejected={len(self._target_rejected_points)} "
                 f"{self.terrain_monitor.last_selection}",
+            )
+            return False
+
+        if self._goal_is_on_the_robot(chosen, pose):
+            self._trace_navigation(
+                "CONVERTER_REJECT_ON_ROBOT",
+                f"({chosen[0]:.2f},{chosen[1]:.2f}) robot=({pose['x']:.2f},{pose['y']:.2f})",
             )
             return False
 

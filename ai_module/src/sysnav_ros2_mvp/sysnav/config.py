@@ -101,6 +101,16 @@ TERRAIN_APPROACH_ANGLES_DEG = (0.0, 20.0, -20.0, 40.0, -40.0, 60.0, -60.0)
 # terrain 데이터가 이보다 오래되면 판정하지 않는다(보류).
 TERRAIN_STALE_SEC = 3.0
 
+# "지금 목표가 terrain 기준으로 못 쓴다"는 판정이 이 시간 동안 계속 유지돼야 목표를
+# 갈아탄다.
+#
+# /terrain_map은 로봇 주변만 담은 롤링 로컬 맵이라 프레임마다 점이 갈린다(실측 trace:
+# trav=1042 -> 1986 -> 2664 -> 3518을 오감). 목표 근처 TERRAIN_SUPPORT_RADIUS_M(0.35m)
+# 안에 점이 있느냐는 판정은 그 갈림에 그대로 흔들려서, 한 프레임만 보고 갈아타면
+# waypoint가 1~2초마다 다시 찍힌다(실측: RETARGET (-1.28,-3.35) -> (-1.26,-3.45),
+# 10cm 이동). converter 되먹임 감시(WAYPOINT_ECHO_CONFIRM_SEC)와 같은 이유의 dwell이다.
+TERRAIN_UNSUPPORTED_CONFIRM_SEC = 2.0
+
 # waypointConverter 되먹임 감시(TOPIC_WAYPOINT_ECHO). 우리 목표와 변환 결과가 이보다
 # 멀면 "converter가 우리 좌표를 버렸다"로 본다. 0.75m는 converter의 하드 필터
 # (obstacleDisThre)와 같은 크기 - 그보다 작은 차이는 정상적인 미세 조정이다.
@@ -136,6 +146,16 @@ TARGET_PATH_WAYPOINT_SPACING_M = 1.5
 # 못 줄이는 일이 생긴다. 그러면 아직 다가가는 중인데도 정지로 판정해버린다.
 # 시간을 늘려 그 조기 종료를 막는다.
 TARGET_REPLAN_STUCK_TIMEOUT_SEC = 20.0
+
+# 주행 중 접근 지점을 다시 고르기 전에 "정말 멈췄는지" 기다리는 시간.
+#
+# choose_approach_point()는 로봇 현재 위치를 기준으로 방향을 잡으므로(direction =
+# object - robot), 로봇이 움직이는 동안 계속 다시 부르면 뽑히는 지점도 물체 주위를
+# 따라 돌아 waypoint가 왕복한다. 목표까지 거리가 줄고 있는 동안에는 terrain이 잠깐
+# "이 목표는 못 쓴다"고 해도 그대로 밀고 간다 - 실제로 진전이 멈춘 뒤에만 갈아탄다.
+# TARGET_REPLAN_STUCK_TIMEOUT_SEC(포기 판정)보다 훨씬 짧아야 "갈아타기 -> 그래도 안
+# 되면 포기" 순서가 유지된다.
+TARGET_RETARGET_PATIENCE_SEC = 6.0
 
 # 진전 없이(=hop 도착 없이) 연속으로 재계획한 횟수 상한. 넘으면 지금 지도로는 못 가는
 # 것으로 보고 탐사 재계획으로 넘긴다.

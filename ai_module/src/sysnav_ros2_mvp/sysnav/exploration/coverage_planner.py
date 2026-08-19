@@ -14,9 +14,14 @@ Two details decide whether that actually happens:
   the paper's definition S becomes the wall and furniture surfaces once unknown
   space is gone, so frontier-chasing and surface-inspection are one objective at
   two stages of the same map rather than two phases.
-* the covered set must persist. Coverage is `surface_point_mask & observed`, and
-  update_from_scan() accumulates `observed` for cells actually seen inside the
-  observe radius, so Ŝ (the still-uncovered surface) never silently resets.
+* the covered set must persist, and it must mean what the camera saw. Coverage is
+  `surface_point_mask & observed`; update_from_scan() accumulates `observed` for
+  cells seen inside the observe radius, so Ŝ (the still-uncovered surface) never
+  silently resets. Only frames where recognition actually ran credit coverage
+  (`credit_coverage=True`, i.e. perception_job) - the occupancy grid still
+  updates on every scan, but crediting every scan would mark surfaces the robot
+  merely drove past between two perception frames as "seen" when no detector ever
+  looked at them.
 
 Candidates are then chosen by greedy set cover over Ŝ - each pick removes what it
 covers before the next - with the score decayed by distance so the robot does not
@@ -83,7 +88,9 @@ class CoveragePlanner:
         # EXPLORATION_OBSERVE_RADIUS_M 안에서 시야가 뚫린 채 관측됐는지를 기록한다
         # (plan_floor_coverage()의 목표 함수). update_from_scan()이 LiDAR ray를
         # 따라가며 채우므로 별도 LOS 계산이 필요 없다 - ray가 지나간 셀은 정의상
-        # 그 순간 로봇에서 실제로 보인 셀이다.
+        # 그 순간 로봇에서 실제로 보인 셀이다. 단, 인식이 실제로 돈 프레임
+        # (credit_coverage=True)에서만 채운다 - 카메라가 안 본 표면을 덮은 것으로
+        # 세면 탐사가 실제보다 낙관적으로 끝난다.
         self.observed = np.zeros((self.size_cells, self.size_cells), dtype=bool)
         self.origin_x: float | None = None
         self.origin_y: float | None = None
@@ -232,7 +239,24 @@ class CoveragePlanner:
         따라가며 뭔가 칠해야 할 때 쓴다."""
         return _bresenham(start[0], start[1], end[0], end[1])
 
-    def update_from_scan(self, points_sensor: np.ndarray, pose: dict) -> None:
+    def update_from_scan(
+        self, points_sensor: np.ndarray, pose: dict, credit_coverage: bool = True
+    ) -> None:
+        """LiDAR 한 스캔으로 occupancy grid를 갱신한다.
+
+        credit_coverage: 이 스캔을 "표면을 실제로 본 것"으로 인정할지(observed 마스크).
+          occupancy grid는 경로계획/방 분할에 최신 지도가 필요하므로 모든 스캔마다
+          갱신하지만, 커버리지(=논문의 covered set)는 **카메라 인식이 실제로 돈 프레임**
+          에서만 인정해야 한다. 예전에는 스캔마다 observed를 채웠는데, 인식은
+          PERCEPTION_WHILE_MOVING_INTERVAL_SEC(1.5초)마다만 돌아서 그 사이 지나친
+          표면이 "봤다"로 기록됐다 - 물체를 보는 건 카메라이므로 그건 커버리지가 아니다.
+          (파노라마 카메라라 수평 FOV 게이팅은 필요 없다: 가로 1920px = 360도.)
+
+          기본값이 True인 이유: "관측 한 번 = 인식 한 번"인 호출자(오프라인 시뮬레이션
+          하니스 tests/test_room_exploration.py 등)가 다수이고, 그쪽에서 False가 되면
+          커버리지가 영원히 안 늘어 탐사가 종료되지 않는다. 실제 노드에서 스캔마다
+          도는 경로(sysnav_node.mapping_job)만 명시적으로 False를 넘긴다.
+        """
         if points_sensor.size == 0:
             return
         with self._lock:
@@ -273,11 +297,12 @@ class CoveragePlanner:
                 # 이미지에서 벽을 뚫고 나가는 것처럼 보이는 frontier의 원인).
                 blocked = False
                 # ray를 따라 여기까지 왔다는 것 자체가 이 셀이 지금 로봇에서 보였다는
-                # 뜻이므로, 관측 반경 안이면 observed로 표시한다. ray는 로봇에서
-                # 바깥으로 순서대로 나아가니 거리는 단조 증가한다 - 반경을 한 번
-                # 벗어나면 그 뒤로는 검사할 필요가 없다(셀마다 hypot을 부르면
-                # 스캔당 수만 번이라 매핑이 눈에 띄게 느려진다).
-                within_observe_radius = True
+                # 뜻이므로, credit_coverage인 스캔이면 관측 반경 안을 observed로
+                # 표시한다. ray는 로봇에서 바깥으로 순서대로 나아가니 거리는 단조
+                # 증가한다 - 반경을 한 번 벗어나면 그 뒤로는 검사할 필요가 없다
+                # (셀마다 hypot을 부르면 스캔당 수만 번이라 매핑이 눈에 띄게 느려진다).
+                # credit_coverage=False면 첫 셀부터 검사 자체를 건너뛴다.
+                within_observe_radius = credit_coverage
                 for row, col in ray[:-1]:
                     if self.grid[row, col] == config.OCC_OCCUPIED:
                         blocked = True
@@ -309,8 +334,13 @@ class CoveragePlanner:
             # 그래서 UNKNOWN만 FREE로 풀고, 이미 관측된 장애물은 건드리지 않는다.
             box = self.grid[row_slice, col_slice]
             box[box == config.OCC_UNKNOWN] = config.OCC_FREE
-            # 로봇이 서 있는 자리는 당연히 관측된 것으로 본다.
-            self.observed[row_slice, col_slice] = True
+            # 로봇이 서 있는 자리는 당연히 관측된 것으로 본다 - 단 이것도 커버리지
+            # 회계라서 credit_coverage일 때만 찍는다. 스캔마다 찍으면 로봇이 지나간
+            # 궤적 옆 표면이 카메라와 무관하게 "봤다"로 덮이고(0.35m짜리 drive-by),
+            # 그게 바로 이 플래그로 막으려던 문제다. 어차피 다음 perception 프레임에서
+            # 로봇 위치는 관측 반경 안이라 같이 덮인다.
+            if credit_coverage:
+                self.observed[row_slice, col_slice] = True
 
     @staticmethod
     def _nearest_traversable(traversable: np.ndarray, row: int, col: int, radius: int = 8) -> tuple[int, int] | None:
