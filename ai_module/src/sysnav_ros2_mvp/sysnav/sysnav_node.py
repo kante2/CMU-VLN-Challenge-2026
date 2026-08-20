@@ -1,4 +1,4 @@
-"""ROS2 orchestration node for the single-room SysNav MVP.
+"""ROS2 orchestration node for hierarchical, room-aware SysNav exploration.
 
 Callbacks only cache messages. Heavy perception, Gemini and exploration jobs run in
 worker threads and are coordinated by a timer-driven state machine.
@@ -175,6 +175,9 @@ class SysNavNode(Node):
 
         self.current_goal: dict | None = None
         self.exploration_route = deque()
+        # VLM이 방 완료 직전 다른 방을 더 유망하다고 고를 때만 잠시 보관한다.
+        # 현재 방을 계속 보라는 결과/오류가 오면 이 경로를 그대로 복구한다.
+        self._pending_in_room_route = deque()
         self._latest_room_segmentation: dict | None = None
         self._exploration_goal_best_distance_m: float | None = None
         self._exploration_goal_last_progress_time: float | None = None
@@ -205,10 +208,14 @@ class SysNavNode(Node):
         # 필요하다. 다른 미션에서는 안 쓰이므로 매 새 질문마다 리셋만 하면 무해하다.
         self.mission3_step_index = 0
         self.mission3_forbidden_mask = None
+        # Mission 2는 탐사 중 발견 즉시 이동하지 않고, 모든 room/frontier를 소진한
+        # 뒤 누적 Scene Graph에서 한 번만 최종 target을 고른다.
+        self.mission2_exploration_complete = False
 
         # Cross-room navigation(rooms/cross_room_navigator.py) - 이번 task 안에서
         # 이미 시도해본(가거나, 갔는데 경로가 안 됐던) room_id. 새 질문마다 리셋.
         self._cross_room_attempted_ids: set[int] = set()
+        self._early_stop_checked_room_ids: set[int] = set()
 
         # 디버깅용 미션 상태 대시보드(mission_dashboard.py)용 상태.
         self.task_start_time: float | None = None
@@ -255,7 +262,7 @@ class SysNavNode(Node):
             self.control_loop,
             callback_group=self.control_callback_group,
         )
-        self.get_logger().info("SysNav single-room MVP started")
+        self.get_logger().info("SysNav hierarchical room-aware planner started")
 
     # ------------------------------------------------------------------
     # ROS callbacks
@@ -291,17 +298,21 @@ class SysNavNode(Node):
             self.state = "OBSERVE"
             self.current_goal = None
             self.exploration_route.clear()
+            self._pending_in_room_route.clear()
             self.clear_target_navigation()
             self.last_processed_image_stamp = -1.0
             self.mission3_step_index = 0
             self.mission3_forbidden_mask = None
+            self.mission2_exploration_complete = False
             self._cross_room_attempted_ids = set()
+            self._early_stop_checked_room_ids = set()
             self.task_start_time = time.monotonic()
             self.last_response_summary = None
 
         if not config.KEEP_MEMORY_BETWEEN_TASKS:
             self.object_memory.clear()
             self.scene_graph.clear()
+            self.room_registry.clear()
             self.viewpoint_memory.clear()
             with self.sensor_lock:
                 pose = None if self.latest_pose is None else dict(self.latest_pose)
@@ -370,30 +381,31 @@ class SysNavNode(Node):
         self.coverage_planner.update_from_scan(pointcloud2_to_xyz(scan_msg), pose)
         #-> Occupancy Map
         # frontier는 이 occupancy map을 통해서 찾게 된다.
-        self._update_room_segmentation()
+        self._update_room_segmentation(pose)
         self._update_exploration_debug(pose)
 
     # Room Node segmentation (SysNav paper Sec. IV-A-1) - 매핑이 갱신될 때마다 같이
     # 갱신하고, room_segmentation_latest.png를 scene_graph_latest.png와 같은 패턴으로
     # (append가 아니라 매번 통째로 다시 그려서) 덮어쓴다. exploration용
-    # self._latest_room_segmentation(room_scoped sampling에 쓰임, 사이클마다 room_id가
-    # 바뀌어도 무방 - 그 사이클 안에서만 일관되면 됨)과, 시각화/분류용 RoomRegistry(사이클
-    # 간에도 room_id가 안정적으로 유지되어야 category를 이어붙일 수 있음)는 서로 다른
-    # 목적이라 별도로 관리한다.
-    def _update_room_segmentation(self) -> None:
+    # RoomRegistry가 watershed의 매-cycle 임시 label을 안정적인 room_id로 바꾼 뒤
+    # planner/시각화/분류가 모두 같은 persistent room graph를 사용한다.
+    def _update_room_segmentation(self, pose: dict) -> None:
         grid = self.coverage_planner.snapshot_grid()
         max_height = self.coverage_planner.snapshot_max_height()
         result = self.room_segmenter.segment(grid, max_height=max_height)
-        self._latest_room_segmentation = result
-
         viewpoints = self.scene_graph.list_viewpoints()
+        objects = self.object_memory.all_nodes()
+        robot_cell = self.coverage_planner.world_to_grid(pose["x"], pose["y"])
         registry_result = self.room_registry.update(
             segmentation=result,
             viewpoints=viewpoints,
             world_to_grid=self.coverage_planner.world_to_grid,
+            objects=objects,
+            robot_cell=robot_cell,
         )
+        self._latest_room_segmentation = registry_result
         self._classify_pending_rooms()
-        export_room_segmentation(grid, registry_result)
+        export_room_segmentation(grid, self.room_registry.snapshot())
 
     def _classify_pending_rooms(self) -> None:
         if not config.ROOM_CLASSIFICATION_ENABLED:
@@ -538,8 +550,19 @@ class SysNavNode(Node):
     # task # 질문을 query_parser.py에서 분석한 결과
     # 
     def selection_job(self, task_id: int, task: dict, pose: dict) -> dict:
-        # 목표 객체 후보 검색
-        candidates = self.object_memory.find_by_category(task["target"]) # Object Memory에서 어떤 종류의 객체를 후보로 가져올지 결정
+        # Mission 2의 최종 후보는 누적 Scene Graph에 실제 Object Node로 들어간 것만
+        # 사용한다. ObjectMemory는 이미지/point cloud 원본을 가져오는 backing store이고,
+        # 후보 집합 자체의 source of truth는 Scene Graph다.
+        graph_snapshot = self.scene_graph.snapshot()
+        graph_candidate_ids = {
+            int(obj["object_id"])
+            for obj in graph_snapshot.get("objects", [])
+            if str(obj.get("category", "")).lower() == str(task["target"]).lower()
+        }
+        candidates = [
+            candidate for candidate in self.object_memory.find_by_category(task["target"])
+            if int(candidate["object_id"]) in graph_candidate_ids
+        ]
 
         # 문장에 spatial constraint가 있고 Scene Graph에 검증된 Object-Object edge가
         # 존재하면, 해당 edge의 source object만 우선 후보로 사용한다. mission3는 절마다
@@ -646,11 +669,16 @@ class SysNavNode(Node):
     '''
 
     def exploration_job(self, task_id: int, pose: dict) -> dict:
+        room_graph = self.room_registry.snapshot()
+        route = self.coverage_planner.plan_route(
+            pose, self.viewpoint_memory, room_segmentation=room_graph
+        )
+        diagnostics = dict(self.coverage_planner.last_plan_diagnostics)
         return {
             "task_id": task_id,
-            "route": self.coverage_planner.plan_route(
-                pose, self.viewpoint_memory, room_segmentation=self._latest_room_segmentation
-            ),
+            "route": route,
+            "room_id": diagnostics.get("active_room_id"),
+            "diagnostics": diagnostics,
         }
 
     # ------------------------------------------------------------------
@@ -715,6 +743,9 @@ class SysNavNode(Node):
         except Exception as error: # Worker 함수 안에서 오류가 발생하면 future.result()를 호출할 때 그 예외가 다시 발생
             self.get_logger().error(f"⚠️ {kind} job failed: {error}")
             # ---------------- 작업 종류별 오류 복구 -----------------------
+            recover_in_room_route = bool(
+                kind == "cross_room_select" and self._pending_in_room_route
+            )
             with self.state_lock:
                 if kind == "perception":
                     # - 초기 관측 중 실패        -> 인식에 실패했으니 탐색 계획 단계
@@ -723,9 +754,17 @@ class SysNavNode(Node):
                 elif kind == "selection":
                     # - Gemini 후보 선택이 실패했다면 목표 객체를 확정하지 않고 다시 탐색
                     self.state = "PLAN_EXPLORATION" # 탐색 이동중 재관측 실패
+                elif recover_in_room_route:
+                    # publish_next_exploration_goal()도 state_lock을 잡으므로 실제
+                    # 복구/발행은 lock 밖에서 한다.
+                    pass
                 else:
                     # - exploration 실패시, 다음 waypoint가 없으면 PLAN_EXPLORATION으로 돌아가서 새로운 waypoint를 찾는다.
                     self.state = "FAILED"
+            if recover_in_room_route:
+                self.exploration_route = deque(self._pending_in_room_route)
+                self._pending_in_room_route.clear()
+                self.publish_next_exploration_goal()
             return
         
         # 오래된 질문인지 확인
@@ -773,23 +812,74 @@ class SysNavNode(Node):
         if kind == "cross_room_select":
             self._on_cross_room_select_result(task, expected_task_id, result)
             return
-        if kind == "exploration" and not result.get("route"):
-            if self._try_start_cross_room_navigation(task, expected_task_id):
-                return
+        if kind == "exploration":
+            route = result.get("route") or []
+            diagnostics = result.get("diagnostics") or {}
+            room_id = result.get("room_id")
+            if route:
+                self.room_registry.record_exploration_result(room_id, has_route=True)
+                if (
+                    config.ROOM_EARLY_STOP_ENABLED
+                    and (task or {}).get("mission_type") != MISSION_OBJECT_REFERENCE
+                    and diagnostics.get("room_near_complete")
+                    and self._try_start_cross_room_navigation(
+                        task, expected_task_id, early_stop=True, fallback_route=route
+                    )
+                ):
+                    return
+            elif diagnostics.get("room_complete"):
+                confirmed = self.room_registry.record_exploration_result(
+                    room_id, has_route=False
+                )
+                if not confirmed:
+                    self.get_logger().info(
+                        f"Room completion pending confirmation: room_id={room_id} "
+                        f"reason={diagnostics.get('reason')}"
+                    )
+                    with self.state_lock:
+                        self.state = "PLAN_EXPLORATION"
+                    return
+                if self._try_start_cross_room_navigation(task, expected_task_id):
+                    return
+            elif not route:
+                # 지도 원점/로봇 cell이 아직 준비되지 않은 일시적 실패는 전체 탐사
+                # 종료로 해석하지 않는다.
+                transient_reasons = {
+                    "origin_not_ready",
+                    "robot_cell_out_of_map",
+                    "robot_not_near_any_traversable_cell",
+                    "no_traversable_cells_anywhere",
+                }
+                if diagnostics.get("reason") in transient_reasons:
+                    with self.state_lock:
+                        self.state = "PLAN_EXPLORATION"
+                    return
 
         mission_pipe = _MISSION_PIPES.get(
             (task or {}).get("mission_type", MISSION_OBJECT_REFERENCE), mission2_pipe
         )
         mission_pipe.on_job_result(self, task, kind, result, origin_state)
 
-    def _try_start_cross_room_navigation(self, task: dict | None, task_id: int) -> bool:
+    def _try_start_cross_room_navigation(
+        self,
+        task: dict | None,
+        task_id: int,
+        early_stop: bool = False,
+        fallback_route: list[dict] | None = None,
+    ) -> bool:
         with self.sensor_lock:
             pose = None if self.latest_pose is None else dict(self.latest_pose)
         if pose is None or task is None:
             return False
-        unvisited = self.room_registry.unvisited_rooms()
+        robot_cell = self.coverage_planner.world_to_grid(pose["x"], pose["y"])
+        current_room_id = self.room_registry.room_at_cell(robot_cell)
+        if early_stop and (
+            current_room_id is None or current_room_id in self._early_stop_checked_room_ids
+        ):
+            return False
+        candidates_all = self.room_registry.navigation_candidates(current_room_id)
         candidates = [
-            room for room in unvisited
+            room for room in candidates_all
             if room["room_id"] not in self._cross_room_attempted_ids
         ]
         # "cross-room이 왜 아무것도 안 했는지"를 로그 없이는 확인할 방법이 없었다 -
@@ -797,16 +887,20 @@ class SysNavNode(Node):
         # 봤다는 뜻(문 통과를 한 번도 못 했거나, 다른 방이 core 임계값을 못 넘었거나).
         self.get_logger().info(
             f"🚪 CROSS-ROOM check - known_rooms={self.room_registry.known_room_count()}, "
-            f"unvisited={len(unvisited)}, "
+            f"current_room={current_room_id}, reachable_uncovered={len(candidates_all)}, "
             f"already_attempted_this_task={len(self._cross_room_attempted_ids)}, "
-            f"usable_candidates={len(candidates)}"
+            f"usable_candidates={len(candidates)}, early_stop={early_stop}"
         )
         if not candidates:
             return False
+        if early_stop:
+            self._early_stop_checked_room_ids.add(int(current_room_id))
+            self._pending_in_room_route = deque(fallback_route or [])
         self.submit_job(
             "cross_room_select",
             cross_room_navigator.select_job,
             self, task_id, task, pose, candidates,
+            self.room_registry.get_room(current_room_id), early_stop,
             origin_state="PLAN_EXPLORATION",
         )
         return True
@@ -816,6 +910,13 @@ class SysNavNode(Node):
             self._cross_room_attempted_ids.add(int(room_id))
         room_id = result.get("room_id")
         path = result.get("path")
+        if result.get("deferred") and self._pending_in_room_route:
+            self.get_logger().info("Room VLM kept the current room; resuming in-room coverage")
+            self.exploration_route = deque(self._pending_in_room_route)
+            self._pending_in_room_route.clear()
+            self.publish_next_exploration_goal()
+            return
+        self._pending_in_room_route.clear()
         if room_id is None or not path:
             # 안 가본 방이 있었지만 전부 경로를 못 찾음(또는 애초에 없었음) - 원래
             # exploration이 비어있던 상황으로 돌려서 미션별 최종 처리로 넘긴다.
@@ -827,7 +928,10 @@ class SysNavNode(Node):
             )
             return
         self._cross_room_attempted_ids.add(int(room_id))
-        self.get_logger().info(f"🚪 CROSS-ROOM - heading to unvisited room_id={room_id}")
+        self.get_logger().info(
+            f"🚪 CROSS-ROOM - heading to room_id={room_id} "
+            f"through={result.get('room_path') or [room_id]}"
+        )
         self.exploration_route = deque(path)
         self.publish_next_exploration_goal()
 
@@ -888,12 +992,17 @@ class SysNavNode(Node):
                     f"{config.EXPLORATION_STUCK_TIMEOUT_SEC:.0f}s), skipping "
                     f"({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
                 )
-                # 도달 실패한 지점도 방문한 것으로 취급해서 같은/근처 후보를 다시 뽑지 않게 한다.
+                if self.current_goal.get("navigation_mode") == "cross_room":
+                    # 문 하나를 못 통과했으면 그 뒤의 door-chain도 유효하지 않다.
+                    self.exploration_route.clear()
+                    self.current_goal = None
+                    with self.state_lock:
+                        self.state = "PLAN_EXPLORATION"
+                    return
+                # 도달 실패한 in-room 후보는 재선택하지 않도록 방문 처리한다.
                 self.viewpoint_memory.add(
-                    self.current_goal["x"],
-                    self.current_goal["y"],
-                    self.current_goal["theta"],
-                    self.current_goal.get("coverage_score"),
+                    self.current_goal["x"], self.current_goal["y"],
+                    self.current_goal["theta"], self.current_goal.get("coverage_score"),
                 )
                 self.publish_next_exploration_goal()
                 return
@@ -1110,13 +1219,8 @@ class SysNavNode(Node):
         )
 
     def target_destination_reached(self, pose: dict) -> bool:
-        """최종 목적지(마지막 hop이 아니라 목적지 좌표 자체)에 도달했는지."""
-        if self.target_goal_xy is None:
-            return False
-        return math.hypot(
-            self.target_goal_xy[0] - float(pose["x"]),
-            self.target_goal_xy[1] - float(pose["y"]),
-        ) <= config.GOAL_REACHED_DISTANCE_M
+        """RViz에 표시한 최종 marker의 0.5m 성공 반경 안에 들어왔는지."""
+        return self.distance_to_target(pose) <= config.TARGET_SUCCESS_DISTANCE_M
 
     def approach_pose_for(self, pose: dict, object_position) -> tuple[float, float, float]:
         """물체로 접근할 (x, y, theta)를 정한다. mission2/3가 공용으로 쓴다.
@@ -1246,27 +1350,16 @@ class SysNavNode(Node):
         return path, (time.perf_counter() - started) * 1000.0
 
     def target_arrival_acceptable(self, pose: dict) -> bool:
-        """목적지 판정 반경 밖이지만 "여기가 갈 수 있는 최선"일 때 도달로 인정할지.
-
-        목적지가 가구 옆이면 경로 계획이 목표를 통행 가능한 셀로 최대 2m 스냅하므로
-        GOAL_REACHED_DISTANCE_M(0.35m) 안으로는 애초에 들어갈 수 없다. 이때 도착을
-        고집하면 로봇은 멈춰 있는데 미션만 영원히 안 끝난다. 다만 아무 데서나 끝났다고
-        하면 안 되므로 TARGET_ARRIVAL_FALLBACK_MAX_M 안일 때만 인정한다.
-        """
-        if self.target_goal_xy is None:
-            return False
-        return math.hypot(
-            self.target_goal_xy[0] - float(pose["x"]),
-            self.target_goal_xy[1] - float(pose["y"]),
-        ) <= config.TARGET_ARRIVAL_FALLBACK_MAX_M
+        """정체 폴백에서도 최종 marker의 엄격한 성공 반경을 만족하는지."""
+        return self.distance_to_target(pose) <= config.TARGET_ARRIVAL_FALLBACK_MAX_M
 
     def step_target_navigation(self, pose: dict) -> str:
         """목적지 주행 1 tick. 미션(mission2/mission3)이 매 control_loop마다 호출한다.
 
         반환:
           "driving"     - 계속 가는 중 (필요하면 이 안에서 경로를 다시 계산했다)
-          "arrived"     - 목적지 도달. 목적지 판정 반경 안이거나, "지금 지도로는 여기가
-                          최선"이 확인되고 TARGET_ARRIVAL_FALLBACK_MAX_M 안인 경우.
+          "arrived"     - 최종 target marker의 TARGET_SUCCESS_DISTANCE_M 안에 도달.
+                          정체 폴백도 이 반경을 완화하지 않는다.
           "unreachable" - 지금 지도로는 갈 방법이 없음. 미션이 탐사로 되돌릴지 결정한다.
 
         미션별로 도착 후 할 일만 다르고(mission2는 SUCCESS, mission3는 다음 step) 판단
@@ -1396,7 +1489,8 @@ class SysNavNode(Node):
         )
         self.get_logger().info(
             f"🚩 ARRIVAL accepted at closest reachable point ({why}) - "
-            f"{distance:.2f}m from goal (limit {config.TARGET_ARRIVAL_FALLBACK_MAX_M:.2f}m)"
+            f"{distance:.2f}m from goal (strict limit "
+            f"{config.TARGET_SUCCESS_DISTANCE_M:.2f}m)"
         )
         return "arrived"
 
@@ -1457,6 +1551,7 @@ class SysNavNode(Node):
             "target_replans": self._target_replan_count,
             "mission3_step_index": self.mission3_step_index,
             "mission3_forbidden_active": self.mission3_forbidden_mask is not None,
+            "mission2_exploration_complete": self.mission2_exploration_complete,
             "last_response_summary": self.last_response_summary,
             "candidate_count": candidate_count,
         })

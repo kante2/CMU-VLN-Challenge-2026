@@ -1,4 +1,4 @@
-"""Single-room online occupancy mapping and frontier coverage planning.
+"""Room-scoped online occupancy mapping and frontier coverage planning.
 
 In-room exploration candidate selection follows the SysNav paper (Sec. IV-B-1,
 "In-room Exploration Policy"): sample a pose horizon H, define a surface point
@@ -70,7 +70,7 @@ class CoveragePlanner:
         # anchor cell(frontier 근처 보장 후보)이 plan_route() 호출마다 몇 번 연속
         # 다시 잡혔는지 - 유리창처럼 LiDAR가 절대 못 뚫는 frontier 옆에 서 있으면
         # 이 값이 계속 늘어난다 (anchor_max_revisits 참고).
-        self._anchor_visit_counts: dict[tuple[int, int], int] = {}
+        self._anchor_visit_counts: dict[tuple[int, int, int], int] = {}
         # plan_direct_path()가 실패했을 때 "왜"인지 남기는 진단 정보(cross-room
         # navigation처럼 두 점 사이 경로 하나만 구하는 호출용) - last_plan_diagnostics와
         # 같은 목적이지만 plan_route()의 후보 샘플링과는 무관한 별도 호출이라 분리했다.
@@ -225,6 +225,35 @@ class CoveragePlanner:
         return nr, nc
 
     @staticmethod
+    def _active_room_id(
+        robot_cell: tuple[int, int], room_segmentation: dict | None
+    ) -> int | None:
+        if not room_segmentation:
+            return None
+        labels = room_segmentation.get("labels")
+        if labels is None:
+            return None
+        row, col = robot_cell
+        if not (0 <= row < labels.shape[0] and 0 <= col < labels.shape[1]):
+            return None
+        room_id = int(labels[row, col])
+        if room_id > 0:
+            return room_id
+        radius = max(
+            1,
+            int(round(config.ROOM_DOOR_NEIGHBOR_RADIUS_M / config.MAP_RESOLUTION_M)),
+        )
+        candidates: list[tuple[int, int]] = []
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                nr, nc = row + dr, col + dc
+                if 0 <= nr < labels.shape[0] and 0 <= nc < labels.shape[1]:
+                    value = int(labels[nr, nc])
+                    if value > 0:
+                        candidates.append((dr * dr + dc * dc, value))
+        return min(candidates)[1] if candidates else None
+
+    @staticmethod
     def _room_scoped_traversable(
         traversable: np.ndarray,
         robot_cell: tuple[int, int],
@@ -239,11 +268,8 @@ class CoveragePlanner:
         labels = room_segmentation.get("labels")
         if labels is None or labels.shape != traversable.shape:
             return traversable
-        row, col = robot_cell
-        if not (0 <= row < labels.shape[0] and 0 <= col < labels.shape[1]):
-            return traversable
-        room_id = int(labels[row, col])
-        if room_id <= 0:
+        room_id = CoveragePlanner._active_room_id(robot_cell, room_segmentation)
+        if room_id is None:
             return traversable
         return traversable & (labels == room_id)
 
@@ -489,12 +515,35 @@ class CoveragePlanner:
         los_margin = max(1, int(round(config.FRONTIER_LOS_WALL_MARGIN_M / self.resolution)))
         los_blocking = cv2.dilate(occupied, np.ones((2 * los_margin + 1, 2 * los_margin + 1), np.uint8)).astype(bool)
 
-        # 논문의 surface point set S: free / non-free(occupied+unknown) 경계
+        active_room_id = self._active_room_id(robot_cell, room_segmentation)
+        diag["active_room_id"] = active_room_id
+        diag["room_scope_active"] = active_room_id is not None
+
+        # 논문의 surface point set S: free / non-free(occupied+unknown) 경계. 방이
+        # 분할된 뒤에는 현재 room mask에 속한 surface만 남긴다. 예전 구현은 candidate만
+        # 현재 방으로 제한하고 score/anchor는 집 전체 frontier를 사용해서, 방을 다 봐도
+        # 다른 방의 frontier를 쫓아 나가 room-query 단계가 사실상 실행되지 않았다.
         frontier_mask = self.frontier_extractor._mask(grid)
+        if active_room_id is not None:
+            labels = room_segmentation["labels"]
+            room_mask = labels == active_room_id
+            room_margin = cv2.dilate(room_mask.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+            frontier_mask = frontier_mask & room_margin
         surface_points = {tuple(cell) for cell in np.argwhere(frontier_mask)}
         diag["surface_point_count"] = len(surface_points)
+        diag["room_surface_point_count"] = len(surface_points)
+        diag["room_near_complete"] = (
+            active_room_id is not None
+            and len(surface_points) <= int(config.ROOM_EARLY_STOP_SURFACE_CELLS)
+        )
         if not surface_points:
-            return self._fail(diag, "no_surface_points_anywhere_in_known_map")
+            diag["room_complete"] = active_room_id is not None
+            reason = (
+                "no_surface_points_in_active_room"
+                if active_room_id is not None
+                else "no_surface_points_anywhere_in_known_map"
+            )
+            return self._fail(diag, reason)
 
         # 논문의 H_trav = {c in H | traversable(c) & m_j^r(c)=1} - candidate를 "지금 로봇이
         # 있는 방" 안으로만 제한한다. room 구분이 없으면(또는 로봇 위치가 아직 room으로
@@ -510,12 +559,20 @@ class CoveragePlanner:
         diag["room_scoped_traversable_cell_count"] = len(traversable_cells)
         diag["fell_back_to_whole_map"] = False
         if len(traversable_cells) == 0:
-            # 지금 방 안에 더 뽑을 candidate가 없다(방을 다 봤을 가능성) -> room 제한 없이
-            # 전체 traversable에서 다시 시도한다 (cross-room 정책이 아직 없어서, 완전히
-            # 포기하는 대신 예전처럼 맵 전체를 보는 걸로 안전하게 폴백).
-            active_traversable = traversable
-            traversable_cells = np.argwhere(traversable)
-            diag["fell_back_to_whole_map"] = True
+            if active_room_id is None:
+                active_traversable = traversable
+                traversable_cells = np.argwhere(traversable)
+                diag["fell_back_to_whole_map"] = True
+            else:
+                diag["room_complete"] = True
+                return self._fail(diag, "no_traversable_cells_in_active_room")
+        if active_room_id is not None:
+            room_start = self._nearest_traversable(active_traversable, *robot_cell, radius=10)
+            if room_start is None:
+                diag["room_complete"] = True
+                return self._fail(diag, "robot_not_near_traversable_cell_in_active_room")
+            start = room_start
+            diag["start_cell"] = start
         diag["active_traversable_cell_count"] = len(traversable_cells)
         if len(traversable_cells) == 0:
             return self._fail(diag, "no_traversable_cells_anywhere")
@@ -532,15 +589,8 @@ class CoveragePlanner:
         # "보장된" 후보로 추가한다 - 맵 크기와 무관하게, 문 하나짜리 작은 frontier도
         # 후보 풀에서 절대 안 놓친다.
         #
-        # 이 anchor 탐색은 반드시 room-scope 없는 전체 traversable에서 해야 한다 (room으로
-        # 제한된 active_traversable이 아니라) - 문(doorway)은 두 방 경계에 걸친 좁은 지점이라,
-        # frontier 셀 바로 근처의 traversable cell들이 로봇이 있는 방이 아니라 반대편 방/
-        # watershed 경계(미배정)로 라벨링되는 경우가 흔하다. anchor를 room으로 제한해버리면
-        # 그런 경우 "frontier는 분명 있는데 이 방 안에서는 근처에 설 자리가 없다"고 오판해서
-        # anchor를 못 찾는다 - "방을 다 보면 벽/미지 경계로 새 탐색 지점을 잘 찍던" 예전 동작이
-        # room-scope를 넣으면서 깨진 지점이 바로 여기였다. random 샘플링만 방 안 커버리지를
-        # 우선하도록 room-scope를 적용하고, anchor(절대 놓치면 안 되는 안전장치)는 항상 전체
-        # 맵에서 찾는다.
+        # Anchor도 현재 room 안에서만 고른다. 다른 방으로 이동하는 책임은 아래
+        # coverage policy가 아니라 room graph/cross_room_navigator에 있다.
         anchor_radius = max(1, int(round(1.0 / self.resolution)))
         anchor_cells: set[tuple[int, int]] = set()
         n_frontier_components, frontier_labels = cv2.connectedComponents(frontier_mask.astype(np.uint8), connectivity=8)
@@ -549,7 +599,7 @@ class CoveragePlanner:
             if len(rows) == 0:
                 continue
             anchor = self._nearest_traversable(
-                traversable, int(rows[0]), int(cols[0]), radius=anchor_radius
+                active_traversable, int(rows[0]), int(cols[0]), radius=anchor_radius
             )
             if anchor is not None:
                 anchor_cells.add(anchor)
@@ -562,8 +612,9 @@ class CoveragePlanner:
         # 안 그러면 "도착 -> 다시 같은 anchor 선택 -> 도착 -> ..." 무한 루프에 걸린다.
         stale_anchor_cells: set[tuple[int, int]] = set()
         for cell in anchor_cells:
-            count = self._anchor_visit_counts.get(cell, 0) + 1
-            self._anchor_visit_counts[cell] = count
+            anchor_key = (int(active_room_id or 0), cell[0], cell[1])
+            count = self._anchor_visit_counts.get(anchor_key, 0) + 1
+            self._anchor_visit_counts[anchor_key] = count
             if count > config.EXPLORATION_ANCHOR_MAX_REVISITS:
                 stale_anchor_cells.add(cell)
         anchor_cells -= stale_anchor_cells
@@ -590,7 +641,7 @@ class CoveragePlanner:
                 if viewpoint_memory.is_near_visited(x, y):
                     rejected_by_visited += 1
                     continue
-            path = self._astar_path(traversable, start, cell)
+            path = self._astar_path(active_traversable, start, cell)
             if path is None:
                 rejected_by_astar += 1
                 if cell in anchor_cells:
@@ -603,6 +654,7 @@ class CoveragePlanner:
         diag["anchors_rejected_by_astar"] = anchors_rejected_by_astar
         diag["candidate_count"] = len(candidates)
         if not candidates:
+            diag["room_complete"] = active_room_id is not None
             return self._fail(diag, "all_pool_cells_rejected")
 
         # Scov(c) = c에서 d_cover 이내 + line-of-sight로 보이는 surface point들
@@ -645,9 +697,11 @@ class CoveragePlanner:
                 best_credited = {fallback: set(scov[fallback])}
 
         if not best_ordered:
+            diag["room_complete"] = active_room_id is not None
             return self._fail(diag, "no_candidate_had_any_visible_uncovered_surface_point")
 
         diag["reason"] = "ok"
+        diag["room_complete"] = False
         self.last_plan_diagnostics = diag
 
         # 각 candidate를 최종 목적지 하나로 바로 던지지 않고, A* 경로(벽을 피해가는 경로)를
@@ -658,7 +712,7 @@ class CoveragePlanner:
         for cell in best_ordered:
             path = path_from_start.get(cell) if leg_start == start else None
             if path is None:
-                path = self._astar_path(traversable, leg_start, cell)
+                path = self._astar_path(active_traversable, leg_start, cell)
             if path is None:
                 # 이 leg만 도달 불가 -> 이 candidate는 건너뛰고 다음 candidate로 이어간다.
                 continue

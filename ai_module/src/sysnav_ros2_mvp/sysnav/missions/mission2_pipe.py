@@ -1,9 +1,8 @@
 """Mission 2 - Object Reference (MISSION_2object_reference_CLAUDE.txt).
 
-문장 하나가 가리키는 유일한 물체를 찾아 bbox marker(`/selected_object_marker`)와
-navigation waypoint(`/way_point_with_heading`)를 낸다. sysnav_node.py의 기존
-object_reference 파이프라인(리팩터 이전 코드)을 그대로 옮긴 것 - 동작은 바뀌지
-않았고, 이번에 빠져 있던 `/selected_object_marker` 발행만 추가됐다.
+먼저 모든 room/frontier를 탐사하며 Scene Graph를 누적한다. 탐사가 완전히 끝난 뒤
+Graph의 object/relation/viewpoint 정보를 사용해 문장이 가리키는 유일한 물체를 고르고,
+bbox marker(`/selected_object_marker`)와 navigation waypoint를 발행한다.
 
 state 흐름: OBSERVE/PLAN_EXPLORATION/FOLLOW_EXPLORATION(공용, sysnav_node.py) ->
 SELECT_TARGET -> NAVIGATE_TARGET -> SUCCESS.
@@ -30,38 +29,45 @@ def on_job_result(node, task: dict, kind: str, result: dict, origin_state: str) 
     elif kind == "selection":
         _on_selection_result(node, result)
     elif kind == "exploration":
-        _on_exploration_result(node, result)
+        _on_exploration_result(node, task, result)
 
 
 def _on_perception_result(node, result: dict, origin_state: str) -> None:
-    if result["candidates"]:
-        with node.state_lock:
-            node.state = "SELECT_TARGET"
-            node.exploration_route.clear()
-    elif origin_state == "OBSERVE":
+    # Mission 2는 탐사 도중 target이 보여도 route를 끊거나 SELECT_TARGET으로 가지
+    # 않는다. 여러 방을 모두 본 뒤의 Scene Graph가 있어야 relation/attribute 및
+    # 동종 객체 비교가 안정적이기 때문이다. FOLLOW 중 관측은 graph만 갱신하고,
+    # waypoint 도착 후 OBSERVE 관측만 다음 탐사 계획을 시작한다.
+    if result.get("candidates") and origin_state == "OBSERVE":
+        node.get_logger().info(
+            f"Scene Graph target candidates accumulated: {len(result['candidates'])}; "
+            "continuing full exploration"
+        )
+    if origin_state == "OBSERVE":
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
 
 
 def _on_selection_result(node, result: dict) -> None:
     if result.get("relation_pending"):
-        # 문장의 relation 제약(예: "knife rack 근처")이 아직 검증 안 된 candidate뿐이다.
-        # 확정하지 않고 계속 탐색해서 참조 물체를 더 찾아본다.
-        node.get_logger().info(
-            "Selection deferred: relation constraint not verified for any candidate yet, "
-            "continuing exploration"
-        )
+        # 전체 탐사 전이라면 보류할 수 있지만, Mission 2의 정상 흐름에서는 전체
+        # 탐사 뒤 한 번만 선택하므로 이 시점의 evidence 부족은 최종 실패다.
+        if node.mission2_exploration_complete:
+            _fail_after_full_exploration(
+                node, "no Scene Graph object satisfies the relation constraint"
+            )
+            return
+        node.get_logger().info("Selection deferred: relation evidence is still incomplete")
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
     if result.get("attribute_pending"):
-        # 문장의 속성 제약(예: "black" chair)을 만족하는 candidate가 검증되지 않았다
-        # (불일치했거나 아직 확인 자체가 안 됨) - 확정하지 않고 계속 탐색해서 진짜
-        # 속성이 맞는 물체를 더 찾아본다.
-        node.get_logger().info(
-            "Selection deferred: attribute constraint not verified for any "
-            "candidate yet, continuing exploration"
-        )
+        # 문장의 속성 제약(예: "black" chair)을 만족하는 후보가 없다.
+        if node.mission2_exploration_complete:
+            _fail_after_full_exploration(
+                node, "no Scene Graph object satisfies the attribute constraint"
+            )
+            return
+        node.get_logger().info("Selection deferred: attribute evidence is still incomplete")
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
@@ -70,6 +76,9 @@ def _on_selection_result(node, result: dict) -> None:
     with node.sensor_lock:
         pose = None if node.latest_pose is None else dict(node.latest_pose)
     if selected is None or pose is None:
+        if node.mission2_exploration_complete:
+            _fail_after_full_exploration(node, "Scene Graph final selection returned no object")
+            return
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
@@ -105,18 +114,36 @@ def _on_selection_result(node, result: dict) -> None:
     )
 
 
-def _on_exploration_result(node, result: dict) -> None:
+def _on_exploration_result(node, task: dict, result: dict) -> None:
     route = result["route"]
     if not route:
+        node.mission2_exploration_complete = True
+        graph_candidates = [
+            obj for obj in node.scene_graph.snapshot().get("objects", [])
+            if str(obj.get("category", "")).lower() == str(task["target"]).lower()
+        ]
+        if not graph_candidates:
+            _fail_after_full_exploration(
+                node,
+                "full exploration completed but target category is absent from Scene Graph",
+            )
+            return
         with node.state_lock:
-            node.state = "FAILED"
-        node.get_logger().warning(
-            f"❌ TASK FAILED - no reachable frontier remains "
-            f"({node.coverage_planner.describe_last_plan_failure()})"
+            node.state = "SELECT_TARGET"
+        node.get_logger().info(
+            f"🧠 FULL EXPLORATION COMPLETE - selecting final target from Scene Graph "
+            f"(category={task['target']}, candidates={len(graph_candidates)}, "
+            f"planner={node.coverage_planner.describe_last_plan_failure()})"
         )
         return
     node.exploration_route = deque(route)
     node.publish_next_exploration_goal()
+
+
+def _fail_after_full_exploration(node, reason: str) -> None:
+    with node.state_lock:
+        node.state = "FAILED"
+    node.get_logger().warning(f"❌ TASK FAILED AFTER FULL EXPLORATION - {reason}")
 
 
 def _run_navigate_target(node, pose: dict) -> None:
@@ -139,24 +166,29 @@ def _finish_navigate_target(node, pose: dict) -> None:
     object_id = node.target_object_id
     obj = None if object_id is None else node.object_memory.get(object_id)
     category = obj["category"] if obj else "?"
+    goal_distance = node.distance_to_target(pose)
     node.clear_target_navigation()
     with node.state_lock:
         node.state = "SUCCESS"
     node.get_logger().info(
         f"🚩🏁 ARRIVED - FINAL TARGET REACHED (task SUCCESS): "
         f"object_id={object_id} category={category}, "
-        f"robot_pose=({pose['x']:.2f}, {pose['y']:.2f})"
+        f"robot_pose=({pose['x']:.2f}, {pose['y']:.2f}), "
+        f"goal_distance={goal_distance:.2f}m"
     )
 
 
 def _give_up_target(node) -> None:
     """step_target_navigation()이 "지금 지도로는 갈 방법이 없다"고 판단했을 때 불린다.
 
-    바로 FAILED로 끝내지 않고 탐사로 되돌리는 이유: "지금 아는 지도로 길이 없다"는
-    "갈 수 없다"가 아니라 "아직 안 뚫었다"인 경우가 많다. 맵을 더 넓힌 뒤 다시 이
-    물체가 선택되면 그때는 경로가 나올 수 있다.
+    Mission 2는 target 선택 전에 이미 전체 탐사를 끝냈으므로 다시 탐사로 보내 같은
+    target을 무한 재선택하지 않는다. 이전/호환 호출처럼 아직 탐사 완료 전인 경우만
+    PLAN_EXPLORATION으로 되돌린다.
     """
     node.clear_target_navigation()
+    if node.mission2_exploration_complete:
+        _fail_after_full_exploration(node, "selected target remained unreachable after replanning")
+        return
     with node.state_lock:
         node.state = "PLAN_EXPLORATION"
     node.get_logger().warning("🧭 back to exploration to open up the map")

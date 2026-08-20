@@ -64,8 +64,11 @@ def export_room_segmentation(
     c0 = max(0, int(cols.min()) - margin)
     c1 = min(grid.shape[1], int(cols.max()) + 1 + margin)
 
+    labels = result.get("labels")
+    if labels is None or labels.shape != grid.shape:
+        return None
     cropped_grid = grid[r0:r1, c0:c1]
-    cropped_labels = result["labels"][r0:r1, c0:c1]
+    cropped_labels = labels[r0:r1, c0:c1]
 
     height, width = cropped_grid.shape
     canvas = np.full((height, width, 3), 60, dtype=np.uint8)  # unknown = 어두운 회색
@@ -76,19 +79,57 @@ def export_room_segmentation(
 
     canvas = cv2.resize(canvas, (width * scale, height * scale), interpolation=cv2.INTER_NEAREST)
 
-    for room in result["rooms"]:
+    rooms_by_id = {int(room["room_id"]): room for room in result.get("rooms", [])}
+    # Door graph를 먼저 그려서 room label text가 그 위에 선명하게 남도록 한다.
+    for doorway in result.get("doorways", []):
+        room_a = rooms_by_id.get(int(doorway["room_a"]))
+        room_b = rooms_by_id.get(int(doorway["room_b"]))
+        if room_a is None or room_b is None:
+            continue
+        door = (
+            int((float(doorway["centroid_col"]) - c0) * scale),
+            int((float(doorway["centroid_row"]) - r0) * scale),
+        )
+        for room in (room_a, room_b):
+            center = (
+                int((float(room["centroid_col"]) - c0) * scale),
+                int((float(room["centroid_row"]) - r0) * scale),
+            )
+            cv2.line(canvas, center, door, (0, 255, 255), max(1, scale // 2), cv2.LINE_AA)
+        cv2.circle(canvas, door, max(3, scale), (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.putText(
+            canvas, f'D{doorway.get("door_id", "?")}',
+            (door[0] + 4, max(10, door[1] - 4)), cv2.FONT_HERSHEY_SIMPLEX,
+            0.38, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+
+    for room in result.get("rooms", []):
         cy = int((room["centroid_row"] - r0) * scale)
         cx = int((room["centroid_col"] - c0) * scale)
-        title = f'Room {room["room_id"]}: {_category_text(room)}'
-        detail = f'{room["cell_count"]} cells, {room.get("viewpoint_count", 0)} vp'
-        for offset, (text, thickness) in enumerate([(title, 2), (detail, 1)]):
-            (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, thickness)
+        title = f'R{room["room_id"]}: {_category_text(room)}'
+        status = "covered" if room.get("covered") else ("visited" if room.get("visited") else "new")
+        neighbors = (result.get("adjacency") or {}).get(int(room["room_id"]), [])
+        detail = (
+            f'{status} {room["cell_count"]}c {room.get("viewpoint_count", 0)}vp '
+            f'{len(room.get("object_labels", []))}obj'
+        )
+        adjacency_text = f'adj={neighbors}'
+        for offset, (text, thickness) in enumerate(
+            [(title, 2), (detail, 1), (adjacency_text, 1)]
+        ):
+            font_scale = 0.42 if offset == 0 else 0.34
+            (text_width, text_height), _ = cv2.getTextSize(
+                text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+            )
             origin = (max(0, cx - text_width // 2), max(text_height, cy) + offset * (text_height + 6))
-            cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), thickness, cv2.LINE_AA)
+            cv2.putText(
+                canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                (255, 255, 255), thickness, cv2.LINE_AA,
+            )
 
     cv2.putText(
         canvas,
-        f"rooms={len(result['rooms'])}",
+        f"rooms={len(result.get('rooms', []))}, doors={len(result.get('doorways', []))}",
         (10, canvas.shape[0] - 10),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,

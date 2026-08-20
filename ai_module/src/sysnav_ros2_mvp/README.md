@@ -1,4 +1,4 @@
-# SysNav ROS2 Single-Room MVP
+# SysNav ROS2 Room-Aware Explorer
 
 이 패키지는 다음 파이프라인을 하나의 ROS2 프로세스와 상태 머신으로 연결한 구현 예시다.
 
@@ -9,11 +9,19 @@ query_parser.py
         ↓
 YOLOv8x-WorldV2 → SAM2 → LiDAR 3D grounding
         ↓
-Object Association / Merge
+Object Association / Merge → Scene Graph 누적
         ↓
-Target 후보 존재?
- ├─ Yes → Gemini Flash → object approach waypoint
- └─ No  → online occupancy map → frontier/coverage route
+online occupancy map → room segmentation + door graph
+                                      ↓
+                         current-room coverage route
+                                      ↓
+                    room complete → VLM next-room ranking
+                                      ↓
+                         door-chain cross-room route
+                                      ↓
+                         모든 방/frontier 탐사 완료
+                                      ↓
+                  Scene Graph 최종 선택 → object waypoint
         ↓
 /way_point_with_heading
 ```
@@ -41,8 +49,14 @@ Target 후보 존재?
 - target object standoff waypoint 생성
 - LiDAR 기반 고정 크기 occupancy map
 - free/unknown frontier, coverage score, 다중 waypoint 순서화
-- 이동 중 perception 재실행 및 목표 발견 시 탐색 중단
-- Single Room용 `Room_0` Scene Graph 생성
+- 이동 중 perception을 계속 실행하되 Mission 2는 목표 발견 후에도 전체 탐사 유지
+- 높이 기반 벽 추출과 distance-transform watershed 방 분할
+- 방 ID, 방문, 인접 관계, 방문/완료 상태를 유지하는 persistent Room Graph
+- 현재 방의 frontier/coverage만 담당하는 room-scoped coverage planner
+- 방 category, 객체, 거리, 대표 이미지를 이용한 VLM 다음 방 선택
+- BFS room path와 방문/room anchor A* 경로를 이용한 cross-room navigation
+- 방 완료 임계에서의 VLM early-stop 판단
+- 기존 Scene Graph의 `Room_0`는 object/viewpoint 관계 호환성을 위해 유지
 - LiDAR novel voxel coverage가 임계값을 넘을 때만 대표 Viewpoint Node와 RGB 이미지 저장
 - `Viewpoint -> Room (lies_in)` edge
 - `Object -> Room (lies_in)` edge
@@ -52,11 +66,6 @@ Target 후보 존재?
 
 ## 미포함 범위
 
-- Multi-Room Segmentation 및 Room 경계 자동 생성
-- Room category 자동 분류
-- Cross-Room Navigation
-- Room-query Navigation
-- Early-stop Room Navigation
 - 정식 SLAM/loop closure
 - navigation action feedback
 
@@ -80,7 +89,8 @@ sysnav/reasoning/
 └── spatial_relation_reasoner.py
 ```
 
-현재 Single Room이므로 `Room_0` 하나를 생성한다. Viewpoint는 매 perception 프레임마다
+기존 object/viewpoint Scene Graph는 호환성을 위해 `Room_0` 하나를 생성한다. 실제
+탐사 방 경계와 이동 상태는 별도의 persistent Room Graph가 관리한다. Viewpoint는 매 perception 프레임마다
 추가하지 않는다. 현재 360° LiDAR 관측을 map-frame voxel 집합 `C_t`로 만들고, 기존
 Viewpoint들의 coverage 합집합 `C_prev`와 비교한다.
 
@@ -220,10 +230,18 @@ ros2 topic pub --once /challenge_question std_msgs/msg/String \
 IDLE
   ↓ 질문
 OBSERVE
-  ├─ 후보 있음 → SELECT_TARGET → NAVIGATE_TARGET → SUCCESS
-  └─ 후보 없음 → PLAN_EXPLORATION → FOLLOW_EXPLORATION
-                                      ↓ 새 관측
-                                    OBSERVE
+  └─ 후보 유무와 관계없이 → PLAN_EXPLORATION → FOLLOW_EXPLORATION
+                     ↑                     ↓ 새 관측
+                     └── 현재 방 미완료 ── OBSERVE
+                     ↓ 현재 방 완료
+             RANK_NEXT_ROOM (VLM)
+                     ↓
+             FOLLOW_EXPLORATION
+              (door graph route)
+                     ↓ 모든 방 완료
+             SELECT_TARGET (Scene Graph)
+                     ↓
+             NAVIGATE_TARGET → SUCCESS
 ```
 
 ## 주의사항

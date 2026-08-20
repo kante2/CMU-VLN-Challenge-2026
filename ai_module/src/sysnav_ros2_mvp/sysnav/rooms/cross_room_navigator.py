@@ -1,64 +1,149 @@
-"""Cross-room navigation job (SysNav paper Sec. IV-B-2, "Room-query navigation
-mode") - in-room exploration이 소진됐을 때(plan_route()가 빈 route) 호출된다.
-
-아직 안 들어가본 방(RoomRegistry.unvisited_rooms())을 "물체가 있을법한 방 먼저,
-카테고리를 모르는 방은 가까운 방부터" 순서로 정렬한 뒤, 그 순서대로
-plan_direct_path()가 실제로 되는 첫 방을 골라 거기까지 가는 waypoint 경로를
-반환한다. node를 인자로 받는 자유 함수 - sysnav_node.submit_job()의 worker
-스레드에서 실행되어 VLM 호출(관련도 순위 판단)이 메인/ROS 스레드를 막지 않는다.
-"""
+"""Door-graph navigation between room-scoped coverage phases."""
 
 from __future__ import annotations
 
 import math
 
+from sysnav import config
 
-def select_job(node, task_id: int, task: dict, pose: dict, candidates: list[dict]) -> dict:
-    """candidates: RoomRegistry.unvisited_rooms() 결과(이미 attempted 필터링된 상태).
-    반환: {"task_id", "room_id", "path"} - 어디로도 못 가면 room_id/path 둘 다 None."""
-    categorized = [room for room in candidates if room.get("category")]
-    uncategorized = [room for room in candidates if not room.get("category")]
 
-    ordered_categorized = categorized
-    if categorized:
+def _world(node, row: float, col: float) -> tuple[float, float]:
+    return node.coverage_planner.grid_to_world(row, col)
+
+
+def _distance(node, pose: dict, room: dict) -> float:
+    x, y = _world(node, room["anchor_row"], room["anchor_col"])
+    return math.hypot(x - float(pose["x"]), y - float(pose["y"]))
+
+
+def _ranking_payload(room: dict, distance_m: float) -> dict:
+    return {
+        "room_id": int(room["room_id"]),
+        "category": room.get("category") or "unknown",
+        "objects": list(room.get("object_labels") or []),
+        "distance_m": round(float(distance_m), 2),
+        "visited": bool(room.get("visited", False)),
+        "image_path": room.get("image_path") or room.get("representative_image_path"),
+    }
+
+
+def _plan_room_route(node, pose: dict, candidate: dict) -> list[dict] | None:
+    """Plan to each door, step inside the next room, then reach its anchor."""
+    route: list[dict] = []
+    virtual_pose = dict(pose)
+    room_path = list(candidate.get("room_path") or [candidate["room_id"]])
+    doorways = list(candidate.get("doorways") or [])
+
+    def append_segment(goal_xy: tuple[float, float], entering_room_id: int | None = None) -> bool:
+        nonlocal virtual_pose
+        segment = node.coverage_planner.plan_direct_path(
+            virtual_pose,
+            goal_xy,
+            max_hop_spacing_m=config.EXPLORATION_PATH_WAYPOINT_SPACING_M,
+        )
+        if not segment:
+            return False
+        for waypoint in segment:
+            waypoint["is_viewpoint"] = False
+            waypoint["navigation_mode"] = "cross_room"
+            if entering_room_id is not None:
+                waypoint["entering_room_id"] = int(entering_room_id)
+        route.extend(segment)
+        virtual_pose = {
+            **virtual_pose,
+            "x": float(segment[-1]["x"]),
+            "y": float(segment[-1]["y"]),
+        }
+        return True
+
+    for index, doorway in enumerate(doorways):
+        next_room_id = int(room_path[index + 1])
+        door_xy = _world(node, doorway["centroid_row"], doorway["centroid_col"])
+        if not append_segment(door_xy):
+            return None
+
+        next_room = node.room_registry.get_room(next_room_id)
+        if next_room is None:
+            return None
+        anchor_xy = _world(node, next_room["anchor_row"], next_room["anchor_col"])
+        dx, dy = anchor_xy[0] - door_xy[0], anchor_xy[1] - door_xy[1]
+        norm = math.hypot(dx, dy)
+        if norm > 1e-6:
+            depth = min(float(config.ROOM_ENTRY_DEPTH_M), max(0.4, norm * 0.7))
+            entry_xy = (door_xy[0] + dx / norm * depth, door_xy[1] + dy / norm * depth)
+            if not append_segment(entry_xy, entering_room_id=next_room_id):
+                return None
+
+    target_xy = _world(node, candidate["anchor_row"], candidate["anchor_col"])
+    if math.hypot(target_xy[0] - virtual_pose["x"], target_xy[1] - virtual_pose["y"]) > 0.35:
+        if not append_segment(target_xy, entering_room_id=int(candidate["room_id"])):
+            return None
+    if route:
+        route[-1]["room_entry"] = True
+        route[-1]["target_room_id"] = int(candidate["room_id"])
+    return route or None
+
+
+def select_job(
+    node,
+    task_id: int,
+    task: dict,
+    pose: dict,
+    candidates: list[dict],
+    current_room: dict | None = None,
+    early_stop: bool = False,
+) -> dict:
+    """Choose a room semantically, then realize it through the doorway graph."""
+    candidates = sorted(candidates, key=lambda room: _distance(node, pose, room))
+    candidate_by_id = {int(room["room_id"]): room for room in candidates}
+    payloads = [_ranking_payload(room, _distance(node, pose, room)) for room in candidates]
+
+    if early_stop:
+        # Put the current room first. If VLM is unavailable, rank() preserves this
+        # fallback order and exploration safely continues instead of leaving early.
+        if current_room is None:
+            return {"task_id": task_id, "room_id": None, "path": None, "deferred": True}
+        current_payload = _ranking_payload(current_room, 0.0)
         ranked_ids = node.room_relevance_selector.rank(
-            task.get("raw", ""),
-            [{"room_id": room["room_id"], "category": room["category"]} for room in categorized],
+            task.get("raw", ""), [current_payload] + payloads
         )
-        rank_of = {room_id: index for index, room_id in enumerate(ranked_ids)}
-        ordered_categorized = sorted(
-            categorized, key=lambda room: rank_of.get(room["room_id"], len(rank_of))
-        )
+        if not ranked_ids or int(ranked_ids[0]) == int(current_room["room_id"]):
+            return {
+                "task_id": task_id, "room_id": None, "path": None,
+                "deferred": True, "failed_room_ids": [], "early_stop": True,
+            }
+        ordered_ids = [room_id for room_id in ranked_ids if room_id in candidate_by_id]
+    else:
+        ranked_ids = node.room_relevance_selector.rank(task.get("raw", ""), payloads)
+        ordered_ids = [room_id for room_id in ranked_ids if room_id in candidate_by_id]
+        ordered_ids += [room_id for room_id in candidate_by_id if room_id not in ordered_ids]
 
-    def _distance(room: dict) -> float:
-        wx, wy = node.coverage_planner.grid_to_world(room["centroid_row"], room["centroid_col"])
-        return math.hypot(wx - pose["x"], wy - pose["y"])
-
-    ordered_uncategorized = sorted(uncategorized, key=_distance)
-
-    # 논문 취지: category를 아는 방(관련도 판단 가능)을 먼저 시도하고, 그 안에서는
-    # 관련도 순, category를 모르는 방은 그 뒤에 거리순으로 붙인다.
-    tried_room_ids: list[int] = []
-    for room in ordered_categorized + ordered_uncategorized:
-        wx, wy = node.coverage_planner.grid_to_world(room["centroid_row"], room["centroid_col"])
-        path = node.coverage_planner.plan_direct_path(pose, (wx, wy))
+    failed: list[int] = []
+    for room_id in ordered_ids:
+        room = candidate_by_id[int(room_id)]
+        path = _plan_room_route(node, pose, room)
         if path:
             return {
-                "task_id": task_id, "room_id": room["room_id"], "path": path,
-                "failed_room_ids": tried_room_ids,
+                "task_id": task_id,
+                "room_id": int(room_id),
+                "path": path,
+                "failed_room_ids": failed,
+                "room_path": list(room.get("room_path") or []),
+                "early_stop": early_stop,
+                "deferred": False,
             }
-        # 왜 실패했는지("경로 없음"인지 "목표 지점 자체를 못 잡았는지")를 바로 로그로
-        # 남긴다 - 예전엔 "실패했다"만 알 수 있고 원인은 알 방법이 없었다.
         diag = node.coverage_planner.last_direct_path_diagnostics
         node.get_logger().warning(
-            f"🚪 CROSS-ROOM unreachable - room_id={room['room_id']} "
-            f"category={room.get('category')} reason={diag.get('reason')} "
-            f"start_snap={diag.get('start_snap')} goal_snap={diag.get('goal_snap')} "
-            f"traversable_cell_count={diag.get('traversable_cell_count')}"
+            f"Door-graph route failed: room_id={room_id} "
+            f"room_path={room.get('room_path')} reason={diag.get('reason')}"
         )
-        # 경로를 못 찾은 방도 "시도해봤음"으로 남겨서 호출 쪽이 다음 사이클에 또
-        # 헛수고로 재시도하지 않게 한다 (A*로 못 가는 방이 갑자기 되지는 않음 - 맵이
-        # 더 갱신되기 전까지는).
-        tried_room_ids.append(room["room_id"])
+        failed.append(int(room_id))
 
-    return {"task_id": task_id, "room_id": None, "path": None, "failed_room_ids": tried_room_ids}
+    return {
+        "task_id": task_id,
+        "room_id": None,
+        "path": None,
+        "failed_room_ids": failed,
+        "early_stop": early_stop,
+        "deferred": bool(early_stop),
+    }

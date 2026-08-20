@@ -42,11 +42,13 @@ POSE_BUFFER_SIZE = 100
 # stuck-timeout으로 SKIP되는 근본적 불일치가 생긴다(2026-08-10 실측: 0.15m일 때 0.31~0.34m
 # 남기고 반복 SKIP). 즉 0.3m가 하한이다.
 #
-# 0.35 -> 0.5 (2026-08-12): 0.35에서는 목적지 주행 6건이 전부 이 판정을 못 넘기고
-# 정지-폴백(TARGET_ARRIVAL_FALLBACK_MAX_M)으로 처리됐다. 실측 도달 거리가 0.41~0.64m에
-# 몰려 있어서 0.5면 상당수가 즉시 도달로 잡히고, 그만큼 정지 대기 시간을 아낀다.
-# 주의: 탐색 waypoint 도착 판정에도 같이 쓰이는 공유 상수다.
+# 0.35 -> 0.5 (2026-08-12): base autonomy 도착 반경과의 불일치를 줄이기 위해
+# 조정했다. 주의: 이 값은 탐색 waypoint에도 쓰이며, 최종 target 성공 조건은 아래
+# TARGET_SUCCESS_DISTANCE_M가 별도로 고정한다.
 GOAL_REACHED_DISTANCE_M = 0.5
+# 최종 target marker에 대한 미션 성공 반경. 탐색 waypoint 허용 반경과 분리해,
+# 향후 탐색 튜닝이 최종 미션 성공 조건을 느슨하게 바꾸지 못하게 한다.
+TARGET_SUCCESS_DISTANCE_M = 0.5
 # exploration goal까지 거리가 이 이상 줄지 않은 채 이 시간(초)이 지나면 도달 불가로 보고 포기한다.
 # (벽 너머 등 실제로는 갈 수 없는 waypoint에 로봇이 영원히 박혀있는 것을 막기 위한 안전장치)
 EXPLORATION_STUCK_TIMEOUT_SEC = 8.0
@@ -112,24 +114,10 @@ TARGET_REPLAN_STUCK_TIMEOUT_SEC = 20.0
 # 도착하므로 10m만 가도 6~7번인데 그걸 세면 정상 주행 중에 상한을 넘어버린다.
 TARGET_REPLAN_MAX_COUNT = 3
 
-# "목적지 판정 반경(GOAL_REACHED_DISTANCE_M) 밖이지만 지금 지도로는 더 가까이 갈 수 없다"고
-# 확인됐을 때, 목적지에서 이 거리 안이면 도달로 인정한다.
-#
-# 필요한 이유: base autonomy의 waypointConverter가 우리 목표를 자기 traversable 지점
-# 으로 옮겨서 거기 주차하면(waypointTravAdj=true), 로봇은 이미 "갈 수 있는 만큼 간 것"
-# 이다. 그 상태에서 0.35m를 고집하는 건 시스템이 물리적으로 줄 수 없는 정밀도를
-# 요구하는 것이다(2026-08-11 실측: 0.43m 남기고 7분 정지, step 0/2).
-#
-# 기준점은 "우리가 발행한 goal marker"다(물체가 아니라). 접근 지점 자체가 이미 물체
-# 에서 갈 수 있는 만큼 가까이 잡힌 값(TERRAIN_APPROACH_*)이므로, 여기서는 "의도한
-# 지점까지 실제로 갔는가"만 본다.
-#
-# 2.2 -> 1.2 -> 0.5 -> 0.7 (2026-08-12): 2.2는 접근 지점 오차(최대
-# TERRAIN_APPROACH_MAX_M)와 더해져 물체에서 4m 넘게 떨어진 곳도 도달로 인정할 수 있어
-# 지나치게 관대했다. 반대로 너무 낮추면 0.43m 남기고 7분 정지하던 실패가 돌아온다.
-# 실측 도달 거리가 0.41~0.64m에 몰려 있어 그 위인 0.7로 잡았다.
-# GOAL_REACHED_DISTANCE_M(정상 판정)보다는 확실히 커야 두 판정이 구분된다.
-TARGET_ARRIVAL_FALLBACK_MAX_M = 0.7
+# 정체(stalled) 폴백도 최종 target marker에서 0.5m를 넘으면 성공으로 인정하지 않는다.
+# 이전 값 0.7m 때문에 로그처럼 0.53m에서도 SUCCESS가 발생했다. 기존 이름은 다른
+# 호출부/설정과의 호환을 위해 유지하지만 성공 반경과 동일하게 고정한다.
+TARGET_ARRIVAL_FALLBACK_MAX_M = TARGET_SUCCESS_DISTANCE_M
 
 # 재계획 최소 간격(초). hop이 막혔다는 판정은 control_loop(0.2초)마다 나올 수 있어서,
 # 간격 제한이 없으면 "막힘 판정 -> 재계획 -> 같은 경로 -> 또 막힘 판정"이 0.2초마다
@@ -270,12 +258,35 @@ ROOM_WALL_MIN_HEIGHT_M = 1.30
 # 요청대로 줄여둠.)
 ROOM_SEGMENTATION_WALL_PADDING_M = 0.05
 
+# Watershed가 만든 room ridge 중 실제로 두 room을 잇는 짧은 구간을 doorway로
+# 등록한다. ridge 주변 이 반경 안에서 정확히 두 room label이 보여야 하며, ridge의
+# 길이가 MAX_WIDTH보다 길면 넓은 공간을 잘못 둘로 나눈 경계로 보고 버린다.
+ROOM_DOOR_NEIGHBOR_RADIUS_M = float(os.getenv("SYSNAV_ROOM_DOOR_NEIGHBOR_RADIUS_M", "0.60"))
+ROOM_DOOR_MIN_CELLS = int(os.getenv("SYSNAV_ROOM_DOOR_MIN_CELLS", "1"))
+ROOM_DOOR_MAX_WIDTH_M = float(os.getenv("SYSNAV_ROOM_DOOR_MAX_WIDTH_M", "2.40"))
+
+# 방 identity는 centroid만으로 이어붙이면 인접 방의 크기가 바뀔 때 ID가 서로
+# 뒤바뀔 수 있다. 직전 mask와의 IoU가 이 값 이상이면 overlap을 우선 사용하고,
+# overlap이 부족한 신규/초기 room만 centroid 반경으로 폴백한다.
+ROOM_REGISTRY_MIN_IOU = float(os.getenv("SYSNAV_ROOM_REGISTRY_MIN_IOU", "0.12"))
+
 # Room Node identity persistence (rooms/room_registry.py). RoomSegmenter.segment()는
 # 매 mapping cycle마다 watershed를 처음부터 다시 돌려 room_id를 1..N으로 새로 매기므로
 # (사이클 간 정체성이 없음), RoomRegistry가 centroid 근접 매칭으로 "같은 물리적 방"을
 # 안정적인 room_id에 이어붙인다. 이 반경(m)보다 centroid가 더 멀어지면 다른 방으로
 # 취급해 새 id를 발급한다.
 ROOM_REGISTRY_MATCH_RADIUS_M = 2.0
+
+# 빈 in-room route가 한 번 나온 것만으로 room 완료를 선언하면 stochastic sampling의
+# 일시 실패에도 다음 방으로 넘어간다. 연속 N번 비어야 covered로 확정한다.
+ROOM_COMPLETION_CONFIRMATIONS = int(os.getenv("SYSNAV_ROOM_COMPLETION_CONFIRMATIONS", "2"))
+# 방 안에 남은 surface cell이 이 값 이하이면 다음 방 선택을 worker에서 미리 계산한다.
+# VLM이 현재 방을 더 유망하다고 고르면 기존 in-room route를 그대로 계속 수행한다.
+ROOM_EARLY_STOP_SURFACE_CELLS = int(os.getenv("SYSNAV_ROOM_EARLY_STOP_SURFACE_CELLS", "18"))
+ROOM_EARLY_STOP_ENABLED = os.getenv("SYSNAV_ROOM_EARLY_STOP_ENABLED", "1") not in ("0", "false", "False")
+# doorway를 지난 뒤 다음 room 쪽으로 이 거리만큼 들어간 점을 room-entry waypoint로
+# 사용한다. 문 중심에만 도착하면 room label 0 경계에 계속 남는 문제를 막는다.
+ROOM_ENTRY_DEPTH_M = float(os.getenv("SYSNAV_ROOM_ENTRY_DEPTH_M", "1.20"))
 
 # Room category 추론(VLM) - SysNav paper Sec. IV-A-1의 room attribute c_i. Object
 # self-attribute와 같은 on-demand 패턴: room의 "best view"(가장 coverage_voxel_count가
