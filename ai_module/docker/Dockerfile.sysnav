@@ -40,6 +40,11 @@ from ultralytics import YOLOWorld; \
 YOLOWorld('/home/docker/ai_module/weights/yolov8x-worldv2.pt'); \
 print('YOLO-World weights cached.')" || echo "WARN: yolo-world pre-download skipped"
 
+RUN python3 -c "\
+from ultralytics import YOLO; \
+YOLO('/home/docker/ai_module/weights/yolo12s.pt'); \
+print('YOLO12s weights cached.')" || echo "WARN: yolo12s pre-download skipped"
+
 # sysnav 소스 복사
 COPY src/sysnav_ros2_mvp /home/docker/ai_module/src/sysnav_ros2_mvp
 
@@ -58,6 +63,7 @@ RUN echo "source /home/docker/ai_module/install/setup.bash" >> /home/docker/.bas
 ENV SAM2_CHECKPOINT=/home/docker/ai_module/weights/sam2.1_hiera_tiny.pt
 ENV SAM2_MODEL_CFG=configs/sam2.1/sam2.1_hiera_t.yaml
 ENV YOLO_WORLD_WEIGHTS=/home/docker/ai_module/weights/yolov8x-worldv2.pt
+ENV YOLO12_WEIGHTS=/home/docker/ai_module/weights/yolo12s.pt
 
 RUN chown -R docker:docker /home/docker/ai_module
 

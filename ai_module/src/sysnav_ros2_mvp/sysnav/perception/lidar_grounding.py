@@ -53,9 +53,10 @@ class PanoramaLidarGrounder:
         ranges = ranges[valid]
         yaw = np.arctan2(x, y) + math.radians(config.PANORAMA_YAW_OFFSET_DEG)
         down = np.arctan2(z, horizontal) + math.radians(config.PANORAMA_PITCH_OFFSET_DEG)
+        vertical_fov = math.radians(config.PANORAMA_V_FOV_DEG)
         yaw = (yaw + math.pi) % (2.0 * math.pi) - math.pi
         u = np.floor(((yaw / (2.0 * math.pi)) + 0.5) * width).astype(np.int32) % width
-        v = np.floor(((down / math.pi) + 0.5) * height).astype(np.int32)
+        v = np.floor(((down / vertical_fov) + 0.5) * height).astype(np.int32)
         inside = (v >= 0) & (v < height)
         indices, u, v, ranges = indices[inside], u[inside], v[inside], ranges[inside]
 

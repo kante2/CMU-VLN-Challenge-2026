@@ -70,10 +70,8 @@ PANO_WIDTH = 1920
 PANO_HEIGHT = 640
 PANO_H_FOV_DEG = 360.0
 
-# test_pano_lidar_overlay.py로 LiDAR point cloud를 카메라 이미지에 직접 겹쳐서
-# 실측 검증함: 120도로는 point band가 실제 벽/천장 경계선과 어긋났고,
-# 180도로 맞추니 경계선을 따라감. (2026-07-09)
-PANO_V_FOV_DEG = 180.0
+# 파노라마 카메라의 수직 시야각.
+PANO_V_FOV_DEG = 120.0
 
 # 파노라마 이미지에서 로봇 정면이 위치한 x 픽셀.
 # 보통 중앙이 정면이다. 실제로 어긋나면 여기만 조정한다.

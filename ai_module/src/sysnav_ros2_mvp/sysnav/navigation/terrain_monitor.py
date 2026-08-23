@@ -226,7 +226,7 @@ class TerrainMonitor:
         return self._supported(trav, obstacle, np.array([x, y], dtype=np.float64))
 
     def choose_approach_point(
-        self, object_xy, robot_xy
+        self, object_xy, robot_xy, max_distance_m: float | None = None
     ) -> tuple[float, float] | None:
         """물체로 접근할 지점을 고른다. 물체에서 가까운 순서로 후보를 훑어 첫 통과점을
         반환한다 - "go near X"이므로 통과하는 것 중 가장 가까운 지점이 좋다.
@@ -257,8 +257,15 @@ class TerrainMonitor:
         # 후자는 "이 물체는 접근 자체가 불가하다".
         no_coverage = 0
         best_clearance: float | None = None
-        distance = config.TERRAIN_APPROACH_MIN_M
-        while distance <= config.TERRAIN_APPROACH_MAX_M + 1e-9:
+        max_distance = (
+            config.TERRAIN_APPROACH_MAX_M
+            if max_distance_m is None
+            else min(float(max_distance_m), config.TERRAIN_APPROACH_MAX_M)
+        )
+        # mission별 상한이 공용 최소값보다 작을 수 있다(Mission 3: 0.9m). 이 경우
+        # 루프를 건너뛰지 말고 그 상한 거리의 ring을 한 번 검사한다.
+        distance = min(config.TERRAIN_APPROACH_MIN_M, max_distance)
+        while distance <= max_distance + 1e-9:
             for angle_deg in config.TERRAIN_APPROACH_ANGLES_DEG:
                 angle = math.radians(angle_deg)
                 rotated = np.array([

@@ -262,6 +262,11 @@ def _resolve_point_ref(node, point_mode: str, point_refs: list[dict], pose: dict
     return tuple((a + b) / 2.0 for a, b in zip(pa, pb))
 
 
+def _uses_object_approach(point_mode: str) -> bool:
+    """near(object)는 물체 중심 대신 terrain 기반 접근점을 사용한다."""
+    return point_mode == "near"
+
+
 def _build_forbidden_mask(node, point_a, point_b) -> np.ndarray | None:
     planner = node.coverage_planner
     grid = planner.snapshot_grid()
@@ -353,7 +358,11 @@ def _on_perception_result(node, origin_state: str) -> None:
 
 
 def _on_selection_result(node, result: dict) -> None:
-    if result.get("relation_pending") or result.get("attribute_pending"):
+    if (
+        result.get("relation_pending")
+        or result.get("attribute_pending")
+        or result.get("verification_pending")
+    ):
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
@@ -473,6 +482,7 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
     if step["resolve"] == "category":
         node.submit_job(
             "selection", node.selection_job, task_id, step["parsed"], pose,
+            node.mission3_step_index,
             origin_state="MISSION3_SELECT_STEP",
         )
         return
@@ -483,7 +493,12 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
-    _start_navigate_to_point(node, pose, point, is_object_target=False)
+    # near(TV) 같은 경유점은 검출된 물체의 3D 중심 자체가 아니라, 매 실행의
+    # /terrain_map에서 동적으로 고른 접근 가능 지점으로 가야 한다. 반면 between(A,B)는
+    # 두 물체 사이 좌표를 통과하는 것이 제약의 의미이므로 그 좌표를 유지한다.
+    _start_navigate_to_point(
+        node, pose, point, is_object_target=_uses_object_approach(step["point_mode"])
+    )
 
 
 def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> None:
@@ -506,7 +521,11 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     if is_object_target:
         # 접근 지점은 /terrain_map 기준으로 고른다 (navigation/terrain_monitor.py) -
         # base autonomy가 받아들일 지점을 처음부터 찍어야 엉뚱한 데로 끌려가지 않는다.
-        x, y, _ = node.approach_pose_for(pose, point)
+        # Mission 3의 semantic subgoal은 물체 앞이어야 하므로, 일반 navigation의 2.2m
+        # 탐색 범위 대신 모든 go-to/near object에 0.9m 상한을 적용한다.
+        x, y, _ = node.approach_pose_for(
+            pose, point, max_distance_m=config.MISSION3_OBJECT_APPROACH_MAX_M
+        )
         object_xy = (float(point[0]), float(point[1]))
     else:
         # "take the path between A and B" 같은 경유점은 그 좌표 자체가 제약이라
@@ -539,18 +558,54 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
 
 
 def _navigate_step(node, task: dict, pose: dict) -> None:
-    outcome = node.step_target_navigation(pose)
+    # Mission 3 전용 1m 도착 반경. 공용 step_target_navigation()은 Mission 2도 쓰므로
+    # 그 안의 0.5m 기준을 바꾸지 않고 여기서만 먼저 판정한다.
+    goal_xy = node.target_goal_xy
+    mission3_reached = (
+        goal_xy is not None
+        and math.hypot(
+            float(goal_xy[0]) - float(pose["x"]),
+            float(goal_xy[1]) - float(pose["y"]),
+        ) <= config.MISSION3_TARGET_SUCCESS_DISTANCE_M
+    )
+    outcome = "arrived" if mission3_reached else node.step_target_navigation(pose)
     if outcome == "driving":
         return
     if outcome == "unreachable":
-        # 지금 지도로는 이 step의 목적지까지 갈 길이 없다 - 맵을 더 뚫고 다시 시도한다.
-        # step_index는 올리지 않으므로 탐색 후 같은 step을 다시 resolve한다.
-        node.clear_target_navigation()
+        # marker까지 만든 확정 subgoal은 탐사 목표로 덮어쓰지 않는다. 예전에는 여기서
+        # PLAN_EXPLORATION으로 돌아가 /way_point_with_heading에 전혀 다른 frontier를
+        # 발행했기 때문에, RViz에는 goalN이 남아 있는데 로봇은 다른 곳으로 향했다.
+        #
+        # 채점은 subgoal의 순서와 실제 trajectory를 보므로, 같은 최종 좌표/금지 마스크/
+        # 물체 접근 정보를 보존한 채 주행기를 재시작한다. 도착하기 전에는 step index도
+        # 올리지 않는다. 결과적으로 한번 marker가 생긴 step은 다음 marker로 넘어가기
+        # 전에 반드시 계속 같은 subgoal을 명령한다.
+        goal_xy = node.target_goal_xy
+        final_theta = node.target_final_theta
+        forbidden_mask = node.target_forbidden_mask
+        object_id = node.target_object_id
+        object_xy = node.target_object_xy
+        marker_index = node.target_marker_index
+        if goal_xy is None or final_theta is None:
+            node.get_logger().error(
+                "🧭 mission3 subgoal retry failed - committed marker has no target coordinate"
+            )
+            return
+        node.start_target_navigation(
+            pose,
+            goal_xy,
+            final_theta,
+            forbidden_mask=forbidden_mask,
+            object_id=object_id,
+            object_xy=object_xy,
+            marker_index=marker_index,
+        )
+        node.refresh_goal_marker()
         with node.state_lock:
-            node.state = "PLAN_EXPLORATION"
+            node.state = "MISSION3_NAVIGATE_STEP"
         node.get_logger().warning(
-            f"🧭 mission3 step {node.mission3_step_index + 1} unreachable for now - "
-            f"back to exploration to open up the map"
+            f"🧭 mission3 step {node.mission3_step_index + 1} not reached - "
+            "re-publishing the committed subgoal (exploration will not override it)"
         )
         return
 

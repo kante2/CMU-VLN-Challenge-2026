@@ -63,6 +63,10 @@ CONTROL_PERIOD_SEC = 0.20
 # 이 주기(초)마다 다시 써서 덮어쓴다. README의 질문당 10분 제한(재탐색+답변 합산) 표시에도 쓴다.
 MISSION_DASHBOARD_REFRESH_SEC = 1.0
 MISSION_TIME_LIMIT_SEC = 600.0
+# Mission 2는 전체 제한 전에 반드시 marker를 제출할 시간을 확보한다.
+MISSION2_EXPLORATION_TIME_LIMIT_SEC = float(
+    os.getenv("MISSION2_EXPLORATION_TIME_LIMIT_SEC", "420.0")
+)
 PERCEPTION_WHILE_MOVING_INTERVAL_SEC = 1.50
 SENSOR_SYNC_TOLERANCE_SEC = 0.30
 SCAN_BUFFER_SIZE = 40
@@ -79,6 +83,16 @@ GOAL_REACHED_DISTANCE_M = 0.5
 # 최종 target marker에 대한 미션 성공 반경. 탐색 waypoint 허용 반경과 분리해,
 # 향후 탐색 튜닝이 최종 미션 성공 조건을 느슨하게 바꾸지 못하게 한다.
 TARGET_SUCCESS_DISTANCE_M = 0.5
+# Mission 3는 물체/경유점 주변의 실제 trajectory 달성이 채점 대상이다. 가구 가까이의
+# subgoal은 base autonomy의 장애물 안전거리 때문에 0.5m 안까지 못 들어가는 경우가
+# 있으므로, Mission 3의 step 완료 판정에만 1m 반경을 사용한다. Mission 1/2와 탐사
+# waypoint의 도착 반경은 위 값을 그대로 쓴다.
+MISSION3_TARGET_SUCCESS_DISTANCE_M = 1.0
+# Mission 3의 "go to/near <object>" subgoal은 선택된 물체 앞에 있어야 한다. terrain
+# clearance를 만족시키려고 2m 이상 떨어진 점을 고르면 관계 대상은 맞아도 instruction을
+# 수행했다고 보기 어려우므로, 모든 Mission 3 물체 접근점과 실제-waypoint 동기화에
+# 동일한 최대 거리를 적용한다.
+MISSION3_OBJECT_APPROACH_MAX_M = 0.9
 
 # Object Reference 답안(/selected_object_marker) 재발행 주기.
 #
@@ -109,21 +123,11 @@ TARGET_STANDOFF_DISTANCE_M = 0.90
 #   obstacleDisThre    = 0.75   -> TERRAIN_CLEARANCE_M
 # ---------------------------------------------------------------------------
 TERRAIN_OBSTACLE_INTENSITY = 0.05
-# 0.75 -> 0.50 (2026-08-23, 측정 목적의 의도적 불일치).
-#
-# 주의: 이 값은 더 이상 waypointConverter(obstacleDisThre=0.75)의 복제본이 아니다.
-# 낮추면 waypointConverter가 거부할 지점을 우리가 통과시키게 되고, 그러면 base
-# autonomy가 목표를 자기 후보로 갈아끼운다(= PUSHED 이벤트가 늘어난다). 그게 이번
-# 변경의 목적이다 - 실측(6분간 SNAP_FAIL 1125회, 전부 "no point with 0.75m clearance")
-# 에서 0.75가 이 씬에서 사실상 만족 불가능한지, 아니면 아깝게 떨어지는지 모르기 때문에,
-# 문턱을 낮춰 통과시킨 뒤 **실제로 얼마나 밀려나는지**를 PUSHED 수치로 재본다.
-#
-# 판단 기준:
-#   PUSHED 변위가 작다(< 0.3m)  -> 0.75가 과했다. 낮춘 값을 유지할 만하다.
-#   PUSHED 변위가 크다(> 1m)    -> waypointConverter가 결국 거부하는 자리였다.
-#                                  0.75로 되돌리고 목표 선정 자체를 바꿔야 한다.
-# 되돌리려면 SYSNAV_TERRAIN_CLEARANCE_M=0.75.
-TERRAIN_CLEARANCE_M = float(os.getenv("SYSNAV_TERRAIN_CLEARANCE_M", "0.50"))
+# waypointConverter의 obstacleDisThre와 반드시 같은 값이어야 한다. 측정 목적으로
+# 0.50m까지 낮췄을 때 요청 (2.13,-3.19)이 실제 (1.82,-4.48)로 1.32m 밀렸고, 로봇은
+# 실제 목표에 도착했지만 Mission 3 marker까지 1.4m가 남아 무한 재발행했다. 따라서
+# 기본값을 base autonomy와 동일한 0.75m로 유지한다.
+TERRAIN_CLEARANCE_M = float(os.getenv("SYSNAV_TERRAIN_CLEARANCE_M", "0.75"))
 
 # waypointConverter 파라미터의 복제본 (waypoint_converter.launch, 2026-08-21 확인).
 #   adjDisThre    = 5.0 -> TERRAIN_ADJ_DIS_M
@@ -285,6 +289,17 @@ YOLO_IOU = float(os.getenv("YOLO_IOU", "0.50"))
 YOLO_IMAGE_SIZE = int(os.getenv("YOLO_IMAGE_SIZE", "1280"))
 YOLO_MAX_DETECTIONS = int(os.getenv("YOLO_MAX_DETECTIONS", "30"))
 
+# YOLO-World의 open-vocabulary 검출을 COCO 사전학습 YOLO12s로 보강한다. 질문의
+# prompt 중 COCO class로 정확히 매핑되는 것이 있을 때만 두 번째 모델을 실행한다.
+YOLO12_COCO_ENABLED = os.getenv("YOLO12_COCO_ENABLED", "1") not in ("0", "false", "False")
+YOLO12_WEIGHTS = os.getenv("YOLO12_WEIGHTS", "yolo12s.pt")
+YOLO12_CONFIDENCE = float(os.getenv("YOLO12_CONFIDENCE", "0.05"))
+YOLO12_BOOK_CONFIDENCE = float(os.getenv("YOLO12_BOOK_CONFIDENCE", "0.05"))
+YOLO12_DEFAULT_CLASS_CONFIDENCE = float(
+    os.getenv("YOLO12_DEFAULT_CLASS_CONFIDENCE", "0.20")
+)
+YOLO_ENSEMBLE_MERGE_IOU = float(os.getenv("YOLO_ENSEMBLE_MERGE_IOU", "0.50"))
+
 SAM2_CHECKPOINT = os.getenv("SAM2_CHECKPOINT", "")
 SAM2_MODEL_CFG = os.getenv("SAM2_MODEL_CFG", "configs/sam2.1/sam2.1_hiera_t.yaml")
 SAM2_DEVICE = os.getenv("SAM2_DEVICE", "cuda")
@@ -340,6 +355,11 @@ ATTRIBUTE_VERIFICATION_ENABLED = os.getenv(
 SAVE_DEBUG_IMAGES = os.getenv("SYSNAV_SAVE_DEBUG_IMAGES", "1") not in ("0", "false", "False")
 DEBUG_DIR = os.getenv("SYSNAV_DEBUG_DIR", "/home/docker/ai_module/debug")
 
+# 최종 후보 선택 요청이 API/network 문제로 무기한 멈추지 않게 한다. google-genai의
+# HttpOptions.timeout 단위는 millisecond이며, timeout이면 GeminiSelector가 로컬
+# confidence/distance fallback으로 즉시 하나를 확정한다.
+GEMINI_SELECTOR_TIMEOUT_MS = int(os.getenv("GEMINI_SELECTOR_TIMEOUT_MS", "30000"))
+
 # p_camera = T_LIDAR_TO_CAMERA @ p_lidar
 # Default convention: lidar(x forward, y left, z up), camera(x right, y forward, z down)
 T_LIDAR_TO_CAMERA = [
@@ -356,6 +376,7 @@ T_SENSOR_TO_BASE = [
 ]
 PANORAMA_YAW_OFFSET_DEG = float(os.getenv("PANORAMA_YAW_OFFSET_DEG", "0.0"))
 PANORAMA_PITCH_OFFSET_DEG = float(os.getenv("PANORAMA_PITCH_OFFSET_DEG", "0.0"))
+PANORAMA_V_FOV_DEG = float(os.getenv("PANORAMA_V_FOV_DEG", "120.0"))
 GROUNDING_MIN_RANGE_M = 0.30
 GROUNDING_MAX_RANGE_M = 30.0
 GROUNDING_MIN_POINTS = 5

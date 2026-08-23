@@ -243,6 +243,7 @@ class SysNavNode(Node):
         # Mission 2는 탐사 중 발견 즉시 이동하지 않고, 모든 room/frontier를 소진한
         # 뒤 누적 Scene Graph에서 한 번만 최종 target을 고른다.
         self.mission2_exploration_complete = False
+        self.mission2_exploration_deadline_reached = False
         # 채점 대상 답안(/selected_object_marker)을 이미 낸 물체. None이 아니면 "이번
         # 질문의 점수는 확보됐다"는 뜻이다 - 이후 주행이 실패해도 답을 취소하지 않는다
         # (README 채점: Object Reference는 marker bbox 겹침만 본다. 궤적 항목 없음).
@@ -371,6 +372,7 @@ class SysNavNode(Node):
             self.mission3_forbidden_mask = None
             self.mission3_exploration_exhausted = False
             self.mission2_exploration_complete = False
+            self.mission2_exploration_deadline_reached = False
             self.mission2_answer_object_id = None
             self._mission2_answer_extent = None
             self._mission2_last_answer_publish = None
@@ -424,7 +426,8 @@ class SysNavNode(Node):
 
     def actual_waypoint_callback(self, msg: PointStamped) -> None:
         """base autonomy(waypointConverter)가 최종 확정한 목표를 받아, 우리가 요청한
-        좌표와 얼마나 떨어졌는지 기록한다.
+        좌표와 얼마나 떨어졌는지 기록한다. Mission 3의 확정 subgoal 주행 중에는 실제
+        좌표를 현재 목표와 marker에도 반영한다.
 
         waypointConverter는 우리 Pose2D를 그대로 쓰지 않고 obstacleDisThre(0.75m) 조건을
         만족하는 travArea 점으로 갈아끼운다. 그래서 "우리 planner는 A로 가라고 했는데
@@ -440,6 +443,40 @@ class SysNavNode(Node):
         displacement = math.hypot(actual_xy[0] - requested_xy[0], actual_xy[1] - requested_xy[1])
         self.last_waypoint_displacement_m = displacement
         self.goal_publisher.publish_requested_marker(actual_xy=actual_xy)
+
+        # Mission 3 채점은 실제 trajectory를 보는데, 예전에는 marker/도착 판정은 요청
+        # 좌표 A를 계속 사용하고 로봇은 waypointConverter가 확정한 B로 움직였다. 그러면
+        # B에 정상 도착해도 A까지 1m 이상 남아 같은 subgoal을 무한 재발행한다.
+        #
+        # 도착 뒤 vehicle 앞 0.5m를 내보내는 projection 메시지는 위
+        # _is_measurable_waypoint()에서 이미 제외했다. 또한 탐사 waypoint가 Mission 3
+        # marker를 옮기지 않도록 확정 target 주행 상태에서만 동기화한다.
+        task = self.task
+        sync_mission3_target = (
+            task is not None
+            and task.get("mission_type") == MISSION_INSTRUCTION_FOLLOWING
+            and self.state == "MISSION3_NAVIGATE_STEP"
+            and self.current_goal is not None
+            and self.current_goal.get("type") == "target"
+        )
+        if sync_mission3_target:
+            # 물체 subgoal은 실제 waypoint가 물체 앞의 의미 있는 범위 안에 있을 때만
+            # 동기화한다. waypointConverter가 다른 통과점으로 2~3m 밀어낸 좌표까지
+            # goal marker로 채택하면 "go to pillow" marker가 pillow와 무관한 곳에 찍힌다.
+            object_xy = self.target_object_xy
+            if object_xy is not None:
+                actual_object_distance = math.hypot(
+                    actual_xy[0] - object_xy[0], actual_xy[1] - object_xy[1]
+                )
+                sync_mission3_target = (
+                    actual_object_distance <= config.MISSION3_OBJECT_APPROACH_MAX_M
+                )
+        if sync_mission3_target:
+            with self.state_lock:
+                self.target_goal_xy = actual_xy
+                self.current_goal["x"] = actual_xy[0]
+                self.current_goal["y"] = actual_xy[1]
+            self.refresh_goal_marker()
 
         # 같은 목표에 대해 매 프레임(10Hz) 같은 내용을 남기면 trace가 쓸모없어지므로,
         # 임계값을 넘고 직전에 남긴 값과 뚜렷이 달라졌을 때만 기록한다.
@@ -671,7 +708,13 @@ class SysNavNode(Node):
     # task_id, # 현재 처리중인 질문 번호 / worker가 어느 질문인지 확인하기 위함.
     # task # 질문을 query_parser.py에서 분석한 결과
     # 
-    def selection_job(self, task_id: int, task: dict, pose: dict) -> dict:
+    def selection_job(
+        self,
+        task_id: int,
+        task: dict,
+        pose: dict,
+        mission3_step_index: int | None = None,
+    ) -> dict:
         # Mission 2의 최종 후보는 누적 Scene Graph에 실제 Object Node로 들어간 것만
         # 사용한다. ObjectMemory는 이미지/point cloud 원본을 가져오는 backing store이고,
         # 후보 집합 자체의 source of truth는 Scene Graph다.
@@ -685,6 +728,7 @@ class SysNavNode(Node):
             candidate for candidate in self.object_memory.find_by_category(task["target"])
             if int(candidate["object_id"]) in graph_candidate_ids
         ]
+        unfiltered_candidates = list(candidates)
 
         # 문장에 spatial constraint가 있고 Scene Graph에 검증된 Object-Object edge가
         # 존재하면, 해당 edge의 source object만 우선 후보로 사용한다. mission3는 절마다
@@ -709,7 +753,10 @@ class SysNavNode(Node):
             # 실패해서(approximate 등급조차 못 만듦) 3D 위치 자체가 없기 때문.
             image_verified_ids: set[int] = set()
             if candidates:
-                first_relation, _, first_reference = effective_relation_chain(task)[0]
+                # relation-chain tuple은 (source_category, relation, target_category)다.
+                # 첫 원소를 relation으로 잘못 쓰면 "near books" 대신
+                # "potted plant books"처럼 무의미한 이미지 검증 prompt가 만들어진다.
+                _, first_relation, first_reference = effective_relation_chain(task)[0]
                 superlative = first_relation in ("nearest", "closest", "farthest", "furthest")
                 if superlative and len(candidates) > 1:
                     # 최상급(비교) relation은 후보마다 독립적으로 yes/no만 물으면 안 된다 -
@@ -737,7 +784,13 @@ class SysNavNode(Node):
                 # 후보가 아직 없거나, 이미지 확인도 실패(또는 검증 안 됨) - 확정하지
                 # 않고 계속 탐색해서 후보/참조 물체를 더 찾아보거나 다른 각도에서
                 # 다시 시도한다.
-                return {"task_id": task_id, "selected_id": None, "relation_pending": True}
+                if not self.mission2_exploration_deadline_reached:
+                    return {"task_id": task_id, "selected_id": None, "relation_pending": True}
+                candidates = list(unfiltered_candidates)
+                self.get_logger().warning(
+                    "Mission 2 deadline fallback: relation remains unverified; "
+                    "selecting from category candidates"
+                )
 
         # SysNav paper Sec. IV-A-1 (self-attribute): 문장에 속성 제약(예: "black" chair)이
         # 있으면, 후보가 1개뿐이어도 반드시 VLM으로 확인한다 - "후보가 하나뿐이면 그냥
@@ -759,7 +812,13 @@ class SysNavNode(Node):
             if not candidates:
                 # 속성이 확인된 후보가 하나도 없다(전부 불일치했거나 아직 검증 자체가
                 # 안 됨) - 확정하지 않고 계속 탐색해서 진짜 맞는 물체를 더 찾아본다.
-                return {"task_id": task_id, "selected_id": None, "attribute_pending": True}
+                if not self.mission2_exploration_deadline_reached:
+                    return {"task_id": task_id, "selected_id": None, "attribute_pending": True}
+                candidates = list(unfiltered_candidates)
+                self.get_logger().warning(
+                    "Mission 2 deadline fallback: attributes remain unverified; "
+                    "selecting from category candidates"
+                )
 
         # GeminiSelector()
         selected_id = self.selector.select(
@@ -768,11 +827,30 @@ class SysNavNode(Node):
             # 전체 object node 가져오기 - Object Memory에 저장된 모든 객체를 가져
             context_objects=self.object_memory.all_nodes(),
             robot_pose=pose,
+            final_verification=mission3_step_index is not None,
+            # 같은 step/같은 관측 증거에서는 LLM을 다시 호출하지 않는다. 탐사 후
+            # observation_count가 늘거나 후보 구성이 바뀌면 새 증거이므로 한 번 재검증한다.
+            verification_key=(
+                task_id,
+                mission3_step_index,
+                tuple(sorted(
+                    (int(item["object_id"]), int(item.get("observation_count", 1)))
+                    for item in candidates
+                )),
+            ) if mission3_step_index is not None else None,
         )
+        if selected_id is None:
+            return {
+                "task_id": task_id,
+                "selected_id": None,
+                "relation_pending": False,
+                "verification_pending": True,
+            }
         return {
             "task_id": task_id, # 현재 처리중인 질문 번호 / worker가 어느 질문인지 확인하기 위함.
             "selected_id": selected_id,
             "relation_pending": False,
+            "verification_pending": False,
             } # task (질의문장) 에 대해 선택된 object_id 반환
     '''
     Object Memory에 저장된 목표 후보들 중에서, 질문에 가장 맞는 객체 하나의 object_id를 고르는 작업
@@ -1094,6 +1172,14 @@ class SysNavNode(Node):
         if task is None or state in {"IDLE", "SUCCESS", "FAILED"}:
             return
         if self.active_future is not None:
+            return
+
+        # 실행 중인 worker가 없는 경계에서만 deadline 전환해 exploration 결과와
+        # SELECT_TARGET 상태가 서로 덮어쓰는 race를 피한다.
+        if (
+            task.get("mission_type") == MISSION_OBJECT_REFERENCE
+            and mission2_pipe.maybe_force_selection_at_deadline(self, state)
+        ):
             return
 
         with self.sensor_lock:
@@ -1452,7 +1538,9 @@ class SysNavNode(Node):
         """RViz에 표시한 최종 marker의 0.5m 성공 반경 안에 들어왔는지."""
         return self.distance_to_target(pose) <= config.TARGET_SUCCESS_DISTANCE_M
 
-    def approach_pose_for(self, pose: dict, object_position) -> tuple[float, float, float]:
+    def approach_pose_for(
+        self, pose: dict, object_position, max_distance_m: float | None = None
+    ) -> tuple[float, float, float]:
         """물체로 접근할 (x, y, theta)를 정한다. mission2/3가 공용으로 쓴다.
 
         1순위는 /terrain_map 기준으로 base autonomy가 받아들일 지점(TerrainMonitor).
@@ -1461,7 +1549,9 @@ class SysNavNode(Node):
         """
         object_xy = (float(object_position[0]), float(object_position[1]))
         robot_xy = (float(pose["x"]), float(pose["y"]))
-        chosen = self.terrain_monitor.choose_approach_point(object_xy, robot_xy)
+        chosen = self.terrain_monitor.choose_approach_point(
+            object_xy, robot_xy, max_distance_m=max_distance_m
+        )
         if chosen is not None:
             theta = math.atan2(object_xy[1] - chosen[1], object_xy[0] - chosen[0])
             self._trace_navigation(

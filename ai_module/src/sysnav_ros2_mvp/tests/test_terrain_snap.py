@@ -149,6 +149,20 @@ class HasCommandablePointsTest(unittest.TestCase):
         self.assertFalse(monitor.has_commandable_points((0.0, 0.0)))
 
 
+class ApproachDistanceLimitTest(unittest.TestCase):
+    def test_mission_specific_limit_rejects_only_far_approach(self):
+        """일반 탐색기는 2m 접근점을 찾더라도 Mission 3의 0.9m 상한에서는 거부한다."""
+        monitor = _monitor(np.array([[-2.0, 0.0]]), np.empty((0, 2)))
+
+        unrestricted = monitor.choose_approach_point((0.0, 0.0), (-3.0, 0.0))
+        limited = monitor.choose_approach_point(
+            (0.0, 0.0), (-3.0, 0.0),
+            max_distance_m=config.MISSION3_OBJECT_APPROACH_MAX_M,
+        )
+
+        self.assertIsNotNone(unrestricted)
+        self.assertIsNone(limited)
+
 class SnapContractTest(unittest.TestCase):
     def test_snapped_point_would_win_waypoint_converter_cost(self):
         """waypointConverter의 비용식 cost(q) = |q-목표| + 0.5*|q-차량| 에서, 우리가

@@ -41,6 +41,26 @@ def loop(node, state: str, task: dict, task_id: int, pose: dict) -> None:
         _run_navigate_target(node, pose)
 
 
+def maybe_force_selection_at_deadline(node, state: str) -> bool:
+    """Stop Mission 2 exploration after its budget and select current best evidence."""
+    if state not in {"OBSERVE", "PLAN_EXPLORATION", "FOLLOW_EXPLORATION"}:
+        return False
+    started = node.task_start_time
+    if started is None or time.monotonic() - started < config.MISSION2_EXPLORATION_TIME_LIMIT_SEC:
+        return False
+    node.mission2_exploration_deadline_reached = True
+    node.exploration_route.clear()
+    node.current_goal = None
+    with node.state_lock:
+        node.state = "SELECT_TARGET"
+    node.get_logger().warning(
+        f"⏰ MISSION 2 EXPLORATION DEADLINE - "
+        f"{config.MISSION2_EXPLORATION_TIME_LIMIT_SEC:.0f}s elapsed; "
+        "selecting best available Scene Graph candidate"
+    )
+    return True
+
+
 def on_job_result(node, task: dict, kind: str, result: dict, origin_state: str) -> None:
     if kind == "perception":
         _on_perception_result(node, result, origin_state)

@@ -10,6 +10,7 @@
 """
 
 import sys
+import time
 import types
 import unittest
 from collections import deque
@@ -53,6 +54,9 @@ class _Node:
             "relation_chain": [("vase", "on", "cabinet"), ("cabinet", "under", "picture")],
         }
         self.logger = _Logger()
+        self.task_start_time = time.monotonic()
+        self.mission2_exploration_deadline_reached = False
+        self.current_goal = {"x": 1.0, "y": 2.0}
 
     def get_logger(self): return self.logger
 
@@ -107,6 +111,26 @@ class EarlyAnswerTest(unittest.TestCase):
         mission2_pipe._on_exploration_result(node, {"target": "vase"}, {"route": []})
         self.assertTrue(node.mission2_exploration_complete)
         self.assertEqual(node.state, "SELECT_TARGET")
+
+    def test_seven_minute_deadline_forces_best_effort_selection(self):
+        node = _Node(survivors=[5, 16])
+        node.state = "FOLLOW_EXPLORATION"
+        node.exploration_route.extend([{"x": 3.0, "y": 4.0}])
+        node.task_start_time = (
+            time.monotonic() - mission2_pipe.config.MISSION2_EXPLORATION_TIME_LIMIT_SEC - 1.0
+        )
+        self.assertTrue(mission2_pipe.maybe_force_selection_at_deadline(node, node.state))
+        self.assertEqual(node.state, "SELECT_TARGET")
+        self.assertTrue(node.mission2_exploration_deadline_reached)
+        self.assertEqual(list(node.exploration_route), [])
+        self.assertIsNone(node.current_goal)
+
+    def test_deadline_does_not_interrupt_target_navigation(self):
+        node = _Node(survivors=[5, 16])
+        node.state = "NAVIGATE_TARGET"
+        node.task_start_time = time.monotonic() - 999.0
+        self.assertFalse(mission2_pipe.maybe_force_selection_at_deadline(node, node.state))
+        self.assertEqual(node.state, "NAVIGATE_TARGET")
 
 
 if __name__ == "__main__":

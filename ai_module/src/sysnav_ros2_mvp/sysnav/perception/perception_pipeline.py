@@ -27,6 +27,7 @@ class PerceptionPipeline:
             return "none"
         return ", ".join(
             f"{detection['category']}={float(detection.get('confidence', 0.0)):.2f}"
+            f"[{detection.get('detector', '?')}]"
             for detection in detections
         )
 
