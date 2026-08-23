@@ -185,6 +185,12 @@ class ObjectMemory:
                 return
             node["self_attributes"] = {**node.get("self_attributes", {}), **attributes}
     # 저장된 모든 객체를 리스트로 반환
+    def count(self) -> int:
+        """개수만 필요할 때 쓴다. all_nodes()는 대표 이미지까지 복사하므로 대시보드
+        주기(1초)로 부르면 낭비다."""
+        with self._lock:
+            return len(self._nodes)
+
     def all_nodes(self) -> list[dict]:
         with self._lock:
             return [self._copy_node(node) for node in self._nodes.values()]

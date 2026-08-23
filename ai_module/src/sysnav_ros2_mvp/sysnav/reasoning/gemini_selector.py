@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from sysnav import config
+from sysnav.activity_log import LLM, activity
 
 
 class GeminiSelector:
@@ -87,19 +88,20 @@ Return JSON only and never output an object_id outside the target candidate list
                 image = item.get("representative_image")
                 if isinstance(image, np.ndarray) and image.size:
                     contents.append(types.Part.from_bytes(data=self._jpeg(image), mime_type="image/jpeg"))
-            response = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=config.GEMINI_TEMPERATURE,
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "object",
-                        "properties": {"object_id": {"type": "integer"}, "reason": {"type": "string"}},
-                        "required": ["object_id"],
-                    },
-                ),
-            )
+            with activity.operation(LLM, "Gemini 대상 선택"):
+                response = self._client.models.generate_content(
+                    model=config.GEMINI_MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=config.GEMINI_TEMPERATURE,
+                        response_mime_type="application/json",
+                        response_schema={
+                            "type": "object",
+                            "properties": {"object_id": {"type": "integer"}, "reason": {"type": "string"}},
+                            "required": ["object_id"],
+                        },
+                    ),
+                )
             if not response.text:
                 raise RuntimeError("Empty Gemini response")
             selected_id = int(json.loads(response.text)["object_id"])

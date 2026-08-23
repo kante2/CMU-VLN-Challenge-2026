@@ -85,8 +85,10 @@ class TerrainMonitor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _supported(trav: np.ndarray, obstacle: np.ndarray, point: np.ndarray) -> bool:
-        """point 근처에 "waypointConverter가 고를 수 있는 후보"가 존재하는가.
+    def _support_detail(
+        trav: np.ndarray, obstacle: np.ndarray, point: np.ndarray
+    ) -> tuple[bool, float | None]:
+        """(통과 여부, 이 point 근처에서 얻을 수 있는 최선의 클리어런스).
 
         두 조건을 모두 봐야 한다:
           1. 커버리지 - point 근처에 travArea 점이 있어야 한다. 로봇이 아직 그 근처에
@@ -94,21 +96,128 @@ class TerrainMonitor:
              비어 있다.
           2. 클리어런스 - 그 점이 obstacleArea에서 TERRAIN_CLEARANCE_M 이상 떨어져야
              한다. waypointConverter의 하드 필터와 같은 조건.
+
+        두 번째 값을 같이 돌려주는 이유: 둘 중 **어디서** 떨어졌는지 로그가 구분하지
+        못해 접근 지점 로직을 고칠 근거가 없었다(2026-08-23, RETARGET_FAIL 1039회가
+        전부 "no supported point" 한 문장이었다). None이면 커버리지에서 탈락(travArea
+        점 자체가 없음), 숫자면 커버리지는 통과했고 그게 달성 가능한 최대 클리어런스다.
         """
         if len(trav) == 0:
-            return False
+            return False, None
         near = trav[
             np.linalg.norm(trav - point, axis=1) <= config.TERRAIN_SUPPORT_RADIUS_M
         ]
         if len(near) == 0:
-            return False
+            return False, None
         if len(obstacle) == 0:
-            return True
+            return True, float("inf")
         # near의 각 점에 대해 가장 가까운 obstacle까지 거리가 클리어런스 이상이면 통과.
         distances = np.linalg.norm(
             near[:, None, :] - obstacle[None, :, :], axis=2
         ).min(axis=1)
-        return bool(np.any(distances >= config.TERRAIN_CLEARANCE_M))
+        best = float(distances.max())
+        return best >= config.TERRAIN_CLEARANCE_M, best
+
+    @classmethod
+    def _supported(cls, trav: np.ndarray, obstacle: np.ndarray, point: np.ndarray) -> bool:
+        return cls._support_detail(trav, obstacle, point)[0]
+
+    @staticmethod
+    def _min_distance_to_obstacles(points: np.ndarray, obstacle: np.ndarray) -> np.ndarray:
+        """points 각각에서 가장 가까운 obstacle까지의 거리. 전체 행렬을 한 번에 만들면
+        (후보 수 x 장애물 수) 크기가 되어 커지므로 청크로 나눠 계산한다."""
+        result = np.empty(len(points), dtype=np.float64)
+        for start in range(0, len(points), 1024):
+            chunk = points[start:start + 1024]
+            distances = np.linalg.norm(chunk[:, None, :] - obstacle[None, :, :], axis=2)
+            result[start:start + 1024] = distances.min(axis=1)
+        return result
+
+    def has_commandable_points(self, robot_xy) -> bool:
+        """차량 주변(searchDisThre 안)에 waypointConverter가 고를 수 있는 후보가
+        하나라도 있는가.
+
+        이걸 따로 봐야 하는 이유: waypointConverter는 후보가 하나도 없으면
+        (`if (minInd >= 0)`가 거짓) 목표를 갈아끼우지 않고 **우리 좌표를 그대로**
+        내보낸다. 즉 "아무것도 통과 못 하는 좁은 방"에서는 우리가 뭘 찍든 그대로
+        전달된다 - 이때는 발행을 막으면 안 되고 원본을 보내야 한다.
+
+        반대로 후보가 하나라도 있으면 그중 argmin이 뽑히므로, 우리 목표 근처에
+        후보가 없으면 엉뚱한 곳(대개 로봇 발밑)으로 끌려간다.
+        """
+        if not self.ready() or robot_xy is None:
+            return False
+        trav, obstacle = self.snapshot()
+        if len(trav) == 0:
+            return False
+        robot = np.asarray(robot_xy, dtype=np.float64)[:2]
+        near = trav[np.linalg.norm(trav - robot, axis=1) <= config.TERRAIN_SEARCH_DIS_M]
+        if len(near) == 0:
+            return False
+        if len(obstacle) == 0:
+            return True
+        return bool(
+            np.any(self._min_distance_to_obstacles(near, obstacle) >= config.TERRAIN_CLEARANCE_M)
+        )
+
+    def nearest_commandable(
+        self, x: float, y: float, robot_xy=None
+    ) -> tuple[float, float] | None:
+        """(x, y)에 가장 가까운 "base autonomy가 그대로 받아주는" 지점을 돌려준다.
+
+        commandable = 관측된 travArea 점이면서 obstacleArea에서 TERRAIN_CLEARANCE_M 이상
+        떨어진 점. waypointConverter가 후보로 삼는 조건 그대로다. 여기에 맞춰 찍으면
+        스냅이 일어나지 않는다(근거는 config.TERRAIN_SNAP_MAX_M 주석의 비용식 증명).
+
+        반환 None인 경우:
+          - terrain 데이터가 없거나 오래됨 (판정 불가 -> 호출 측은 원본을 그대로 쓴다)
+          - TERRAIN_SNAP_MAX_M 안에 commandable 지점이 없음 (이 목표는 지금 실행 불가)
+        """
+        if not self.ready():
+            self.last_selection = "terrain not ready"
+            return None
+
+        trav, obstacle = self.snapshot()
+        if len(trav) == 0:
+            self.last_selection = "no travArea points"
+            return None
+
+        goal = np.array([float(x), float(y)], dtype=np.float64)
+        to_goal = np.linalg.norm(trav - goal, axis=1)
+        within = to_goal <= config.TERRAIN_SNAP_MAX_M
+        candidates, distances = trav[within], to_goal[within]
+        if len(candidates) == 0:
+            self.last_selection = (
+                f"no travArea point within {config.TERRAIN_SNAP_MAX_M:.2f}m of goal"
+            )
+            return None
+
+        # waypointConverter는 차량에서 searchDisThre 안의 travArea 점만 후보로 본다.
+        # 그 밖의 점을 찍으면 우리 좌표가 아니라 엉뚱한 점이 뽑히므로 여기서도 제외한다.
+        if robot_xy is not None:
+            robot = np.asarray(robot_xy, dtype=np.float64)[:2]
+            reachable = np.linalg.norm(candidates - robot, axis=1) <= config.TERRAIN_SEARCH_DIS_M
+            candidates, distances = candidates[reachable], distances[reachable]
+            if len(candidates) == 0:
+                self.last_selection = "commandable points are outside searchDisThre"
+                return None
+
+        if len(obstacle):
+            margins = self._min_distance_to_obstacles(candidates, obstacle)
+            clear = margins >= config.TERRAIN_CLEARANCE_M
+            if not clear.any():
+                # 최선값을 같이 남긴다 - 0.70m면 아깝게 떨어진 것이고 0.20m면 애초에
+                # 접근 불가한 자리다. 이 둘은 대응이 다르다.
+                self.last_selection = (
+                    f"no point with {config.TERRAIN_CLEARANCE_M:.2f}m clearance near goal "
+                    f"(best {float(margins.max()):.2f}m of {len(candidates)} candidate(s))"
+                )
+                return None
+            candidates, distances = candidates[clear], distances[clear]
+
+        best = int(np.argmin(distances))
+        self.last_selection = f"snap={distances[best]:.2f}m from {len(candidates)} candidate(s)"
+        return float(candidates[best][0]), float(candidates[best][1])
 
     def is_waypoint_supported(self, x: float, y: float) -> bool:
         if not self.ready():
@@ -143,6 +252,11 @@ class TerrainMonitor:
 
         trav, obstacle = self.snapshot()
         tried = 0
+        # 실패 사유 집계 - 커버리지(travArea 점 없음)와 클리어런스(있는데 장애물에
+        # 너무 붙음)는 고쳐야 할 곳이 완전히 다르다. 전자는 "더 가서 봐야 한다",
+        # 후자는 "이 물체는 접근 자체가 불가하다".
+        no_coverage = 0
+        best_clearance: float | None = None
         distance = config.TERRAIN_APPROACH_MIN_M
         while distance <= config.TERRAIN_APPROACH_MAX_M + 1e-9:
             for angle_deg in config.TERRAIN_APPROACH_ANGLES_DEG:
@@ -153,15 +267,28 @@ class TerrainMonitor:
                 ])
                 candidate = object_xy - distance * rotated
                 tried += 1
-                if self._supported(trav, obstacle, candidate):
+                ok, clearance = self._support_detail(trav, obstacle, candidate)
+                if ok:
                     self.last_selection = (
                         f"d={distance:.2f}m angle={angle_deg:+.0f}deg tried={tried}"
                     )
                     return float(candidate[0]), float(candidate[1])
+                if clearance is None:
+                    no_coverage += 1
+                elif best_clearance is None or clearance > best_clearance:
+                    best_clearance = clearance
             distance += config.TERRAIN_APPROACH_STEP_M
 
+        if best_clearance is None:
+            verdict = f"all {tried} unobserved (no travArea point within " \
+                      f"{config.TERRAIN_SUPPORT_RADIUS_M:.2f}m)"
+        else:
+            verdict = (
+                f"{no_coverage}/{tried} unobserved, best clearance "
+                f"{best_clearance:.2f}m < {config.TERRAIN_CLEARANCE_M:.2f}m"
+            )
         self.last_selection = (
-            f"no supported point (tried={tried}, trav={len(trav)}, obstacle={len(obstacle)})"
+            f"no supported point ({verdict}, trav={len(trav)}, obstacle={len(obstacle)})"
         )
         return None
 

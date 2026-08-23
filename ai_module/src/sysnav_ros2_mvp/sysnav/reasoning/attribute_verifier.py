@@ -26,6 +26,7 @@ import numpy as np
 from rclpy.logging import get_logger
 
 from sysnav import config
+from sysnav.activity_log import LLM, activity
 
 
 class AttributeVerifier:
@@ -118,32 +119,33 @@ class AttributeVerifier:
                 else:
                     contents.append("(no image available for this object)")
 
-            response = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "object",
-                        "properties": {
-                            "results": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "object_id": {"type": "integer"},
-                                        "attribute": {"type": "string"},
-                                        "value": {"type": "boolean"},
+            with activity.operation(LLM, "Gemini 속성 검증"):
+                response = self._client.models.generate_content(
+                    model=config.GEMINI_MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                        response_schema={
+                            "type": "object",
+                            "properties": {
+                                "results": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "object_id": {"type": "integer"},
+                                            "attribute": {"type": "string"},
+                                            "value": {"type": "boolean"},
+                                        },
+                                        "required": ["object_id", "attribute", "value"],
                                     },
-                                    "required": ["object_id", "attribute", "value"],
-                                },
-                            }
+                                }
+                            },
+                            "required": ["results"],
                         },
-                        "required": ["results"],
-                    },
-                ),
-            )
+                    ),
+                )
             if not response.text:
                 raise RuntimeError("Gemini가 빈 응답을 반환함")
 

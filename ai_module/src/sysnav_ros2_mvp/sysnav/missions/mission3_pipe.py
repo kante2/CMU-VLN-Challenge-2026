@@ -278,6 +278,34 @@ def _build_forbidden_mask(node, point_a, point_b) -> np.ndarray | None:
     return mask
 
 
+def _step_categories(step: dict) -> list[str]:
+    """이 step을 판정하려면 무엇이 관측돼 있어야 하는가.
+
+    target뿐 아니라 관계의 참조 물체도 포함한다("the cup near the TV remote"라면
+    cup과 tv remote 둘 다). detection_prompts가 이미 그 합집합이다."""
+    if step.get("resolve") == "category":
+        return list(step["parsed"].get("detection_prompts") or [])
+    prompts: list[str] = []
+    for ref in step.get("point_refs", []):
+        prompts.extend(ref.get("detection_prompts") or [])
+    return prompts
+
+
+def _missing_categories(node, step: dict) -> list[str]:
+    return [
+        category for category in _step_categories(step)
+        if not node.object_memory.find_by_category(category)
+    ]
+
+
+def _describe_forbidden(task: dict) -> str:
+    parts = []
+    for forbidden in task.get("global_forbidden", []):
+        refs = ", ".join(str(ref.get("target", "?")) for ref in forbidden["point_refs"])
+        parts.append(f"{forbidden['point_mode']}({refs})")
+    return " + ".join(parts) or "-"
+
+
 def _try_resolve_forbidden(node, task: dict, pose: dict) -> None:
     if node.mission3_forbidden_mask is not None:
         return
@@ -342,6 +370,25 @@ def _on_selection_result(node, result: dict) -> None:
 def _on_exploration_result(node, result: dict) -> None:
     route = result["route"]
     if not route:
+        # 금지구역 참조 물체를 찾으려고 탐사 중이었다면, 여기서 실패로 끝내지 않는다.
+        # 더 볼 곳이 없다는 뜻이므로 "못 찾았다"로 확정하고 step 진행으로 넘어간다 -
+        # 제약은 미검증으로 남지만, 아무것도 못 하는 것보다 부분점수가 낫다.
+        if not node.mission3_exploration_exhausted:
+            # 더 볼 곳이 없다 - 증거가 부족해도 여기서 실패로 끝내지 않고 진행한다.
+            # 부분점수가 있으므로 아무것도 못 하는 것보다 낫다.
+            node.mission3_exploration_exhausted = True
+            with node.state_lock:
+                node.state = "MISSION3_SELECT_STEP"
+            if node.mission3_forbidden_mask is None and node.task and node.task.get("global_forbidden"):
+                node.get_logger().warning(
+                    "🚧 forbidden-area reference not found after full exploration - "
+                    "continuing WITHOUT the avoidance constraint (it cannot be enforced)"
+                )
+            else:
+                node.get_logger().warning(
+                    "🔍 exploration exhausted - deciding with whatever evidence exists"
+                )
+            return
         with node.state_lock:
             node.state = "FAILED"
         node.get_logger().warning(
@@ -356,15 +403,73 @@ def _on_exploration_result(node, result: dict) -> None:
 def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
     steps = task["steps"]
     if node.mission3_step_index >= len(steps):
-        node.last_response_summary = f"{len(steps)}/{len(steps)} steps completed"
+        # 제약을 못 지킨 채 끝났으면 그대로 적어둔다. 예전엔 step 카운트만 보고
+        # SUCCESS를 찍어서, 금지구역을 한 번도 적용 못 한 실행도 초록불로 보였다
+        # (2026-08-22: "avoid the path near the cabinet"인데 cabinet 미발견 -> 마스크
+        # 없음 -> 그대로 SUCCESS). 채점은 그걸 감점하므로 로그가 거짓말을 하면 안 된다.
+        unenforced = bool(task.get("global_forbidden")) and node.mission3_forbidden_mask is None
+        node.last_response_summary = (
+            f"{len(steps)}/{len(steps)} steps completed"
+            + (" (avoidance constraint NOT enforced)" if unenforced else "")
+        )
         with node.state_lock:
             node.state = "SUCCESS"
-        node.get_logger().info("🚩🏁 ALL STEPS COMPLETE (task SUCCESS)")
+        if unenforced:
+            node.get_logger().warning(
+                "🚩 ALL STEPS COMPLETE but the avoidance constraint was never enforced "
+                f"({_describe_forbidden(task)} was never located) - the followed path may "
+                "pass through a forbidden area"
+            )
+        else:
+            node.get_logger().info("🚩🏁 ALL STEPS COMPLETE (task SUCCESS)")
         return
 
     _try_resolve_forbidden(node, task, pose)
 
+    # 금지구역("avoiding the path near/between X")이 문장에 있는데 아직 그 참조 물체를
+    # 못 찾았으면, step을 확정하기 전에 **먼저 찾는다**.
+    #
+    # 왜: 마스크가 없으면 탐사도 목적지 주행도 그 구역을 그대로 지나간다. README 채점은
+    # 실제 주행 궤적 전체를 보고 "passes through areas it is forbidden to go through"를
+    # 감점하므로, 못 찾은 채로 돌아다니는 것 자체가 손해다. 실제로 한 번은 cabinet을
+    # 끝내 못 찾아 마스크 없이 주행하고도 SUCCESS가 떴다(2026-08-22).
+    #
+    # 단 영원히 기다리면 안 된다 - 탐사가 소진되면 forbidden_search_exhausted가 서고,
+    # 그때는 제약 미검증 상태임을 남긴 채 step 진행으로 넘어간다(부분점수라도 받는 게
+    # 아무것도 못 하는 것보다 낫다).
+    if (
+        task.get("global_forbidden")
+        and node.mission3_forbidden_mask is None
+        and not node.mission3_exploration_exhausted
+    ):
+        with node.state_lock:
+            node.state = "PLAN_EXPLORATION"
+        node.get_logger().info(
+            "🚧 exploring first to locate the forbidden-area reference "
+            f"({_describe_forbidden(task)}) before resolving steps"
+        )
+        return
+
     step = steps[node.mission3_step_index]
+
+    # 이 step이 가리키는 물체들(target + 관계의 참조 물체)이 아직 다 안 보이면, 판정을
+    # 시도하지 말고 계속 돌아다니며 지도를 그린다.
+    #
+    # 왜: selection_job은 참조 물체를 3D로 못 잡았을 때 "후보 사진에 그게 보이나"를
+    # Gemini에게 묻는 이미지 폴백으로 넘어간다. 그건 참조 물체가 구조적으로 grounding
+    # 안 되는 경우(유리창 등)를 위한 것인데, 단지 "아직 안 가봐서 못 본" 경우에도 발동해
+    # 성급하게 확정해버린다 - 실측(2026-08-22): tv remote를 한 번도 못 봤는데 컵 2개만
+    # 보고 2:32에 SUCCESS. 게다가 매 시도마다 Gemini 호출이 나가 시간 예산을 깎는다.
+    missing = _missing_categories(node, step)
+    if missing and not node.mission3_exploration_exhausted:
+        with node.state_lock:
+            node.state = "PLAN_EXPLORATION"
+        node.get_logger().info(
+            f"🔍 step {node.mission3_step_index + 1}: still looking for "
+            f"{', '.join(missing)} - continuing exploration before deciding"
+        )
+        return
+
     if step["resolve"] == "category":
         node.submit_job(
             "selection", node.selection_job, task_id, step["parsed"], pose,

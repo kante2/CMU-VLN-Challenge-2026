@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import html
 import os
+import time
 from pathlib import Path
 
 from sysnav import config
+from sysnav.activity_log import activity
 
 _STATE_COLORS = {
     "SUCCESS": "#15803d",
@@ -124,7 +126,11 @@ def _mission_detail_rows(snapshot: dict) -> str:
             forbidden_desc = ", ".join(_describe_forbidden(item) for item in forbidden)
             active = snapshot.get("mission3_forbidden_active")
             status = "active (routing around it)" if active else "not yet resolved"
-            rows.append(_row("Forbidden constraint", f"{_esc(forbidden_desc)} - {status}"))
+            # 제약이 끝내 미적용이면 눈에 띄게 표시한다 - SUCCESS 배지만 보고
+            # "다 됐다"고 오해하면 채점에서 감점되는 걸 놓친다.
+            style = ' style="color:#b91c1c;font-weight:700"' if not active else ""
+            rows.append(_row("Forbidden constraint",
+                             f"<span{style}>{_esc(forbidden_desc)} - {status}</span>"))
     elif mission_type == "numerical":
         rows.append(_row("Target category", task.get("target", "?")))
         rows.append(_row("Attributes", ", ".join(task.get("attributes") or []) or "-"))
@@ -138,6 +144,161 @@ def _mission_detail_rows(snapshot: dict) -> str:
             rows.append(_row("Selected object_id", str(goal["object_id"])))
 
     return "\n".join(rows)
+
+
+_CATEGORY_STYLE = {
+    "state": ("#2563eb", "상태"),
+    "job":   ("#7c3aed", "작업"),
+    "llm":   ("#c2410c", "LLM"),
+    "nav":   ("#0f766e", "주행"),
+    "warn":  ("#b91c1c", "경고"),
+}
+
+
+def _now_panel() -> str:
+    """"지금 무엇을 하고 있는가" - 진행 중인 장기 작업(LLM 질의 등)을 크게 보여준다.
+    아무것도 없으면 주행/대기 중이라는 뜻이다."""
+    items = activity.inflight()
+    if not items:
+        return (
+            '<div style="padding:10px 14px;border-radius:8px;background:#f3f4f6;'
+            'color:#6b7280;font-size:13px;">진행 중인 백그라운드 작업 없음 '
+            '(주행 또는 센서 대기 중)</div>'
+        )
+    blocks = []
+    for item in items:
+        color, tag = _CATEGORY_STYLE.get(item["category"], ("#374151", item["category"]))
+        blocks.append(
+            f'<div style="padding:10px 14px;border-radius:8px;margin-bottom:6px;'
+            f'background:{color}12;border-left:4px solid {color};">'
+            f'<span style="color:{color};font-weight:700;font-size:12px;">{_esc(tag)}</span>'
+            f'<span style="margin-left:10px;font-size:14px;font-weight:600;">{_esc(item["label"])}</span>'
+            f'<span style="float:right;color:#6b7280;font-family:ui-monospace,monospace;'
+            f'font-size:13px;">{item["elapsed_sec"]:.1f}초 경과</span></div>'
+        )
+    return "".join(blocks)
+
+
+def _activity_panel(limit: int = 40) -> str:
+    events = activity.recent(limit)
+    if not events:
+        return '<div style="color:#9ca3af;font-size:13px;">아직 기록된 활동이 없습니다.</div>'
+    rows = []
+    for event in events:
+        color, tag = _CATEGORY_STYLE.get(event["category"], ("#374151", event["category"]))
+        clock = time.strftime("%H:%M:%S", time.localtime(event["time"]))
+        detail = (
+            f'<span style="color:#9ca3af;margin-left:8px;">{_esc(event["detail"])}</span>'
+            if event.get("detail") else ""
+        )
+        rows.append(
+            f'<tr><td style="padding:3px 8px;color:#9ca3af;font-family:ui-monospace,monospace;'
+            f'font-size:12px;white-space:nowrap;">{clock}</td>'
+            f'<td style="padding:3px 8px;white-space:nowrap;"><span style="color:{color};'
+            f'font-weight:700;font-size:11px;">{_esc(tag)}</span></td>'
+            f'<td style="padding:3px 8px;font-size:13px;">{_esc(event["message"])}{detail}</td></tr>'
+        )
+    return (
+        '<div style="max-height:420px;overflow-y:auto;border:1px solid #f3f4f6;'
+        'border-radius:8px;">'
+        f'<table style="border-collapse:collapse;width:100%;">{"".join(rows)}</table></div>'
+    )
+
+
+
+def _stat(label: str, value: str, hint: str = "") -> str:
+    hint_html = (
+        f'<div style="color:#9ca3af;font-size:11px;margin-top:2px;">{_esc(hint)}</div>'
+        if hint else ""
+    )
+    return (
+        '<div style="flex:1 1 150px;min-width:150px;padding:10px 12px;background:#f9fafb;'
+        'border-radius:8px;">'
+        f'<div style="color:#6b7280;font-size:11px;">{_esc(label)}</div>'
+        f'<div style="font-family:ui-monospace,monospace;font-size:16px;font-weight:600;'
+        f'margin-top:2px;">{_esc(value)}</div>{hint_html}</div>'
+    )
+
+
+# 대시보드와 같은 폴더(config.DEBUG_DIR)에 노드가 매 사이클 덮어쓰는 지도 그림들.
+# 상대 경로로 걸면 file:// 로 열어도 그대로 보인다(서버 불필요).
+_MAP_IMAGES = [
+    ("exploration_debug_latest.png", "탐색 지도",
+     "회색=탐사 완료, 검정=벽/미탐사, 노랑=frontier, 파랑=로봇"),
+    ("room_segmentation_latest.png", "방 분할", "색=방 라벨, 회색=미분류 영역"),
+    ("scene_graph_latest.png", "Scene Graph", "room / viewpoint / object 노드"),
+]
+
+
+def _map_images_panel() -> str:
+    """지도 그림을 그대로 띄운다.
+
+    <meta refresh>로 페이지가 1초마다 새로 로드되지만, 파일 이름이 그대로라 브라우저가
+    이미지를 캐시해서 옛 그림이 계속 보인다. 그래서 파일 mtime을 쿼리스트링에 붙여
+    내용이 바뀔 때만 새로 받게 한다."""
+    debug_dir = Path(config.DEBUG_DIR)
+    cards = []
+    for filename, title, caption in _MAP_IMAGES:
+        path = debug_dir / filename
+        if not path.exists():
+            cards.append(
+                f'<div style="flex:1 1 300px;min-width:280px;">'
+                f'<div style="font-size:12px;font-weight:600;margin-bottom:4px;">{_esc(title)}</div>'
+                f'<div style="padding:24px;background:#f9fafb;border-radius:8px;color:#9ca3af;'
+                f'font-size:12px;text-align:center;">아직 생성되지 않음</div></div>'
+            )
+            continue
+        try:
+            stamp = int(path.stat().st_mtime)
+        except OSError:
+            stamp = 0
+        cards.append(
+            f'<div style="flex:1 1 300px;min-width:280px;">'
+            f'<div style="font-size:12px;font-weight:600;margin-bottom:4px;">{_esc(title)}'
+            f'<span style="color:#9ca3af;font-weight:400;margin-left:6px;">'
+            f'{time.strftime("%H:%M:%S", time.localtime(stamp))}</span></div>'
+            f'<img src="{_esc(filename)}?t={stamp}" style="width:100%;border-radius:8px;'
+            f'background:#111;display:block;">'
+            f'<div style="color:#9ca3af;font-size:11px;margin-top:4px;">{_esc(caption)}</div></div>'
+        )
+    return '<div style="display:flex;flex-wrap:wrap;gap:14px;">' + "".join(cards) + "</div>"
+
+
+
+def _map_panel(snapshot: dict) -> str:
+    """지금까지 만든 지도 현황. 우리 occupancy grid는 전역 누적이고 /terrain_map은
+    base autonomy가 만드는 로컬 롤링 윈도우라, 둘을 나란히 보여줘야 "우리는 안다고
+    보는데 base autonomy는 모르는 구역"이 드러난다."""
+    stats = snapshot.get("map_stats") or {}
+    graph = snapshot.get("graph_counts") or {}
+    room = snapshot.get("room_summary") or {}
+    if not stats:
+        return '<div style="color:#9ca3af;font-size:13px;">아직 지도가 없습니다.</div>'
+
+    frontier = stats.get("frontier_cells", 0)
+    frontier_hint = "남은 탐색 경계" if frontier else "탐색할 경계 없음"
+    tiles = [
+        _stat("탐사 면적", f'{stats.get("mapped_area_m2", 0):.1f} m²',
+              f'free {stats.get("free_area_m2", 0):.1f} m² / '
+              f'{stats.get("mapped_cells", 0)}셀 @ {stats.get("resolution_m", 0):.2f}m'),
+        _stat("frontier", f'{frontier} 셀', frontier_hint),
+        _stat("방 / 문", f'{room.get("rooms", 0)} / {room.get("doorways", 0)}',
+              f'현재 방 R{room["active_room_id"]}' if room.get("active_room_id") else "현재 방 미분류"),
+        _stat("viewpoint", str(graph.get("viewpoints", 0)),
+              f'방문 기록 {snapshot.get("viewpoint_memory_count", 0)}'),
+        _stat("물체", str(graph.get("objects", 0)),
+              f'메모리 {snapshot.get("object_memory_count", 0)} / '
+              f'관계 edge {graph.get("object_object_edges", 0)}'),
+        _stat("terrain_map", _esc(snapshot.get("terrain_summary") or "-"),
+              "base autonomy 제공(로컬)"),
+    ]
+    return (
+        '<div style="display:flex;flex-wrap:wrap;gap:8px;">' + "".join(tiles) + "</div>"
+        '<div style="color:#9ca3af;font-size:11px;margin-top:8px;">'
+        'occupancy grid는 전역 누적(60m 범위), terrain_map은 로봇 주변 롤링 윈도우입니다. '
+        '지도는 디스크에 저장되지 않아 노드를 재시작하면 처음부터 다시 만듭니다.</div>'
+    )
+
 
 
 def export_mission_dashboard(snapshot: dict) -> str | None:
@@ -171,6 +332,23 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
     goal = snapshot.get("current_goal")
     if goal:
         rows.append(_row("Current goal", f"({goal.get('x', 0):.2f}, {goal.get('y', 0):.2f}) type={goal.get('type', '-')}"))
+    # base autonomy(waypointConverter)가 우리 좌표를 obstacleDisThre(0.75m) 조건에 맞는
+    # 지점으로 갈아끼운 정도. 값이 크면 "우리가 찍은 곳으로는 애초에 갈 수 없다"는 뜻이라,
+    # planner를 의심할지 좌표 실행 가능성을 의심할지 여기서 바로 갈린다.
+    requested = snapshot.get("requested_waypoint_xy")
+    actual = snapshot.get("actual_waypoint_xy")
+    displacement = snapshot.get("waypoint_displacement_m")
+    snap = snapshot.get("waypoint_snap_m")
+    if snap is not None:
+        rows.append(_row("Waypoint snapped before publish (Layer 1)", f"{snap:.2f} m"))
+    if requested and actual and displacement is not None:
+        warn = " style=\"color:#c0392b;font-weight:bold\"" if displacement >= config.WAYPOINT_DISPLACEMENT_WARN_M else ""
+        rows.append(_row(
+            "Waypoint pushed by base autonomy",
+            f"<span{warn}>{displacement:.2f} m</span>"
+            f" &nbsp; ours=({requested[0]:.2f}, {requested[1]:.2f})"
+            f" &rarr; actual=({actual[0]:.2f}, {actual[1]:.2f})",
+        ))
     target_xy = snapshot.get("target_goal_xy")
     if target_xy:
         distance = snapshot.get("target_distance_m")
@@ -192,6 +370,8 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
   body {{ font-family: -apple-system, "Segoe UI", Arial, sans-serif; background: #f9fafb; margin: 0; padding: 24px; color: #111827; }}
   .card {{ background: white; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 20px 24px; max-width: 720px; margin: 0 auto 16px; }}
   h1 {{ font-size: 18px; margin: 0 0 14px; display:flex; align-items:center; gap:12px; }}
+  h2 {{ font-size: 14px; margin: 0 0 10px; color:#374151; }}
+  .card {{ max-width: 1100px; }}
   table {{ border-collapse: collapse; width: 100%; }}
   tr:not(:last-child) td {{ border-bottom: 1px solid #f3f4f6; }}
   .footer {{ text-align:center; color:#9ca3af; font-size:12px; margin-top: 8px; }}
@@ -203,6 +383,19 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
     <table>
       {"".join(rows)}
     </table>
+  </div>
+  <div class="card">
+    <h2>지도 현황</h2>
+    {_map_panel(snapshot)}
+    <div style="margin-top:14px;">{_map_images_panel()}</div>
+  </div>
+  <div class="card">
+    <h2>지금 하는 일</h2>
+    {_now_panel()}
+  </div>
+  <div class="card">
+    <h2>활동 로그 <span style="font-weight:400;color:#9ca3af;font-size:12px;">(최신순)</span></h2>
+    {_activity_panel()}
   </div>
   <div class="footer">auto-refreshes every {config.MISSION_DASHBOARD_REFRESH_SEC:.0f}s - open this file directly in a browser</div>
 </body>

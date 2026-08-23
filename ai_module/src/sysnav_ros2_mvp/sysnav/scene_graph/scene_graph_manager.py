@@ -247,9 +247,98 @@ class SceneGraphManager:
                 if requested.issubset(set(viewpoint.get("observed_object_ids", [])))
             ]
 
+    def counts(self) -> dict:
+        """대시보드용 개수 요약. snapshot()은 viewpoint/object/edge를 전부 deepcopy해서
+        1초 주기로 부르기엔 비싸다 - 세는 것만 필요할 땐 이걸 쓴다."""
+        with self._lock:
+            return {
+                "viewpoints": len(self._viewpoints),
+                "objects": len(self._objects),
+                "edges": len(self._edges),
+                "object_object_edges": sum(
+                    1 for edge in self._edges.values()
+                    if edge["edge_type"] == "object_object"
+                ),
+                "accumulated_voxels": len(self._accumulated_coverage),
+                "relation_checks": len(self._relation_checks),
+            }
+
     def snapshot(self) -> dict:
         with self._lock:
             return copy.deepcopy(self._snapshot_locked())
+
+    def resolve_relation_chain(self, task: dict) -> list[int]:
+        """문장의 관계 체인을 **전부** 만족하는 target 후보의 object_id 목록.
+
+        전체 snapshot()은 object/edge를 통째로 deepcopy해서 무겁다. 이 조회는 탐사
+        중 매 OBSERVE마다 불리므로 lock 안에서 필요한 것만 훑는다.
+
+        왜 필요한가: Mission 2는 "탐사 100% 완료"를 선택의 유일한 관문으로 삼고 있었다.
+        그런데 실측(2026-08-23)에서 6분 시점에 관계 체인이 이미 GT 정답 하나로 확정됐는데도
+        frontier가 남아 있어 SELECT_TARGET에 못 갔다. frontier는 탐사할수록 늘기도 해서
+        (21 -> 128셀) 언제 끝날지 알 수 없고, 그 사이 10분 제한이 지나간다.
+        답이 확정되면 조기 종료하는 것이 규정에도 맞다(README Timing: 조기 완료 보너스).
+
+        후보가 **정확히 하나**일 때만 의미가 있다 - README는 정답이 유일하다고 보장하므로,
+        둘 이상 남으면 아직 구별할 정보가 부족하다는 뜻이고 더 탐사해야 한다.
+        """
+        chain = effective_relation_chain(task)
+        if not chain:
+            return []
+        threshold = config.SCENE_GRAPH_RELATION_MIN_CONFIDENCE
+        with self._lock:
+            category = {
+                object_id: str(node["category"]).lower()
+                for object_id, node in self._objects.items()
+            }
+            # (source_id, relation) -> 임계값을 넘는 target_id 집합
+            links: dict[tuple[int, str], set[int]] = {}
+            for edge in self._edges.values():
+                if edge.get("edge_type") != "object_object":
+                    continue
+                if float(edge.get("metadata", {}).get("confidence", 0.0)) < threshold:
+                    continue
+                source_id = self._object_id_from_node(edge["source"])
+                if source_id is None:
+                    continue
+                for target in edge.get("targets", []):
+                    target_id = self._object_id_from_node(target)
+                    if target_id is not None:
+                        links.setdefault((source_id, str(edge["relation"])), set()).add(target_id)
+
+        # 체인의 첫 hop source가 target 카테고리다. hop을 따라가며 살아남는 것만 남긴다.
+        target_category = str(chain[0][0]).lower()
+        frontier = {
+            object_id for object_id, name in category.items() if name == target_category
+        }
+        # 각 후보에 대해 체인을 끝까지 따라갈 수 있는지 확인한다.
+        survivors = []
+        for candidate in sorted(frontier):
+            current = {candidate}
+            for source_category, relation, next_category in chain:
+                advanced = set()
+                for object_id in current:
+                    if category.get(object_id) != str(source_category).lower():
+                        continue
+                    for target_id in links.get((object_id, str(relation)), ()):
+                        if category.get(target_id) == str(next_category).lower():
+                            advanced.add(target_id)
+                if not advanced:
+                    break
+                current = advanced
+            else:
+                survivors.append(candidate)
+        return survivors
+
+    @staticmethod
+    def _object_id_from_node(node_id) -> int | None:
+        text = str(node_id)
+        if not text.startswith("object_"):
+            return None
+        try:
+            return int(text.split("_")[-1])
+        except ValueError:
+            return None
 
     def list_viewpoints(self) -> list[dict]:
         """RoomRegistry가 mapping cycle(0.35초)마다 부르는 가벼운 조회 - object/edge

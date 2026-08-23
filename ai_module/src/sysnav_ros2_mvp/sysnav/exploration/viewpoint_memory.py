@@ -23,6 +23,10 @@ class ViewpointMemory:
         with self._lock:
             self._items.clear()
 
+    def count(self) -> int:
+        with self._lock:
+            return len(self._items)
+
     def add(self, x: float, y: float, yaw: float, coverage_score: float | None = None) -> None:
         with self._lock:
             self._items.append({

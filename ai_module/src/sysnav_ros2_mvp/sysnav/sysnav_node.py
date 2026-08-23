@@ -13,7 +13,8 @@ import os
 import threading
 import time
 
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Point, PointStamped, PoseStamped
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -22,6 +23,7 @@ from std_msgs.msg import Int32, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from sysnav import config
+from sysnav.activity_log import JOB, NAV, STATE, WARN, activity
 from sysnav.exploration.coverage_planner import CoveragePlanner
 from sysnav.exploration.exploration_visualizer import export_exploration_debug
 from sysnav.exploration.viewpoint_memory import ViewpointMemory
@@ -107,6 +109,25 @@ consume_future()
 '''
 
 
+_JOB_LABELS = {
+    "perception": "인식(YOLO+SAM+LiDAR)",
+    "selection": "대상 선택(Gemini)",
+    "exploration": "탐색 경로 계획",
+    "count": "개수 확정(Gemini)",
+    "cross_room_select": "다음 방 선택(Gemini)",
+}
+_NAV_LABELS = {
+    "APPROACH": "접근 지점 선정", "GOAL": "목표 확정", "SNAP": "목표 보정(스냅)",
+    "SNAP_FAIL": "목표 발행 불가", "PASSTHRU": "목표 그대로 전달",
+    "SNAP_NO_PROGRESS": "스냅이 전진을 삼킴(건너뜀)",
+    "FAR_THROW": "5m 밖으로 던짐(교착 탈출)", "FAR_THROW_SKIP": "던지기 불가(앞이 막힘)",
+    "PUSHED": "base autonomy가 목표를 옮김", "RETARGET": "접근 지점 재선정",
+    "RETARGET_FAIL": "접근 지점 재선정 실패", "UNREACHABLE": "도달 불가로 판단",
+}
+# 이 이벤트들은 "왜 멈췄나"의 직접 원인이라 경고색으로 띄운다.
+_NAV_PROBLEM_EVENTS = {"SNAP_FAIL", "RETARGET_FAIL", "UNREACHABLE", "PUSHED", "SNAP_NO_PROGRESS"}
+
+
 class SysNavNode(Node):
     def __init__(self) -> None:
         super().__init__("sysnav_node")
@@ -172,6 +193,13 @@ class SysNavNode(Node):
         self.numerical_response_pub = self.create_publisher(
             Int32, config.TOPIC_NUMERICAL_RESPONSE, 10
         )
+        # RViz에서 base autonomy 데이터와 겹쳐 보기 위한 발행 전용 토픽들.
+        # 주행 로직에는 전혀 관여하지 않는다(진단 목적).
+        self.occupancy_pub = self.create_publisher(
+            OccupancyGrid, config.TOPIC_SYSNAV_OCCUPANCY, 1
+        )
+        self.planned_path_pub = self.create_publisher(Path, config.TOPIC_SYSNAV_PATH, 1)
+        self.frontier_pub = self.create_publisher(Marker, config.TOPIC_SYSNAV_FRONTIER, 1)
 
         self.current_goal: dict | None = None
         self.exploration_route = deque()
@@ -208,9 +236,19 @@ class SysNavNode(Node):
         # 필요하다. 다른 미션에서는 안 쓰이므로 매 새 질문마다 리셋만 하면 무해하다.
         self.mission3_step_index = 0
         self.mission3_forbidden_mask = None
+        # 더 볼 frontier가 없는가. mission3는 "금지구역 참조 물체"와 "step에 필요한
+        # 물체들"을 찾을 때까지 탐사를 먼저 하는데, 영원히 기다릴 수는 없으므로 이
+        # 플래그가 서면 증거가 부족해도 진행한다 - mission3_pipe._select_step 주석 참고.
+        self.mission3_exploration_exhausted = False
         # Mission 2는 탐사 중 발견 즉시 이동하지 않고, 모든 room/frontier를 소진한
         # 뒤 누적 Scene Graph에서 한 번만 최종 target을 고른다.
         self.mission2_exploration_complete = False
+        # 채점 대상 답안(/selected_object_marker)을 이미 낸 물체. None이 아니면 "이번
+        # 질문의 점수는 확보됐다"는 뜻이다 - 이후 주행이 실패해도 답을 취소하지 않는다
+        # (README 채점: Object Reference는 marker bbox 겹침만 본다. 궤적 항목 없음).
+        self.mission2_answer_object_id: int | None = None
+        self._mission2_answer_extent: tuple | None = None
+        self._mission2_last_answer_publish: float | None = None
 
         # Cross-room navigation(rooms/cross_room_navigator.py) - 이번 task 안에서
         # 이미 시도해본(가거나, 갔는데 경로가 안 됐던) room_id. 새 질문마다 리셋.
@@ -221,6 +259,21 @@ class SysNavNode(Node):
         self.task_start_time: float | None = None
         self.last_response_summary: str | None = None
         self._last_dashboard_write_time = 0.0
+        # base autonomy가 우리 목표를 옮긴 정도(actual_waypoint_callback이 채운다).
+        self.last_actual_waypoint_xy: tuple[float, float] | None = None
+        self.last_waypoint_displacement_m: float | None = None
+        self._last_traced_displacement_m: float | None = None
+        # 우리가 마지막으로 waypoint를 발행한 시각. 이 직후 값만 밀림 측정에 쓴다.
+        self._last_goal_publish_time: float | None = None
+        # 직전 target goal 발행이 "받아줄 지점 없음"으로 막혔는가. 막힌 채로 두면
+        # 로봇에게 아무 명령도 안 가서 그냥 서 있게 되므로, 그 상태를 감지해
+        # stuck timeout(20초)을 기다리지 않고 바로 unreachable로 넘긴다.
+        self._target_publish_blocked = False
+        # 접근 지점 재선택이 연속으로 실패하기 시작한 시각(성공하면 None으로 되돌린다).
+        self._target_retarget_fail_since: float | None = None
+        # 활동 로그용 - 마지막으로 기록한 상태(전이 감지에 쓴다).
+        self._logged_state = "IDLE"
+        self.active_started_at: float | None = None
 
         self.question_sub = self.create_subscription(
             String,
@@ -255,6 +308,19 @@ class SysNavNode(Node):
             config.TOPIC_TERRAIN_MAP,
             self.terrain_callback,
             qos_profile_sensor_data,
+            callback_group=self.callback_group,
+        )
+        # base autonomy가 우리 좌표를 어디로 옮겼는지 읽기만 한다(발행 없음).
+        self.actual_waypoint_sub = self.create_subscription(
+            PointStamped,
+            config.TOPIC_ACTUAL_WAYPOINT,
+            self.actual_waypoint_callback,
+            10,
+            callback_group=self.callback_group,
+        )
+        self.map_publish_timer = self.create_timer(
+            config.MAP_PUBLISH_INTERVAL_SEC,
+            self._publish_map_topics,
             callback_group=self.callback_group,
         )
         self.control_timer = self.create_timer(
@@ -303,7 +369,11 @@ class SysNavNode(Node):
             self.last_processed_image_stamp = -1.0
             self.mission3_step_index = 0
             self.mission3_forbidden_mask = None
+            self.mission3_exploration_exhausted = False
             self.mission2_exploration_complete = False
+            self.mission2_answer_object_id = None
+            self._mission2_answer_extent = None
+            self._mission2_last_answer_publish = None
             self._cross_room_attempted_ids = set()
             self._early_stop_checked_room_ids = set()
             self.task_start_time = time.monotonic()
@@ -351,6 +421,58 @@ class SysNavNode(Node):
             self.terrain_monitor.update(msg)
         except Exception as error:
             self.get_logger().warning(f"terrain_map parse failed: {error}")
+
+    def actual_waypoint_callback(self, msg: PointStamped) -> None:
+        """base autonomy(waypointConverter)가 최종 확정한 목표를 받아, 우리가 요청한
+        좌표와 얼마나 떨어졌는지 기록한다.
+
+        waypointConverter는 우리 Pose2D를 그대로 쓰지 않고 obstacleDisThre(0.75m) 조건을
+        만족하는 travArea 점으로 갈아끼운다. 그래서 "우리 planner는 A로 가라고 했는데
+        로봇은 B로 갔다"가 조용히 일어나는데, 지금까지는 그걸 볼 방법이 없었다. 여기서
+        차이를 계산해 RViz 마커와 navigation trace에 남긴다(읽기 전용, 주행에 영향 없음).
+        """
+        actual_xy = (float(msg.point.x), float(msg.point.y))
+        requested_xy = self.goal_publisher.last_requested_xy
+        self.last_actual_waypoint_xy = actual_xy
+        if requested_xy is None or not self._is_measurable_waypoint(actual_xy):
+            return
+
+        displacement = math.hypot(actual_xy[0] - requested_xy[0], actual_xy[1] - requested_xy[1])
+        self.last_waypoint_displacement_m = displacement
+        self.goal_publisher.publish_requested_marker(actual_xy=actual_xy)
+
+        # 같은 목표에 대해 매 프레임(10Hz) 같은 내용을 남기면 trace가 쓸모없어지므로,
+        # 임계값을 넘고 직전에 남긴 값과 뚜렷이 달라졌을 때만 기록한다.
+        if displacement < config.WAYPOINT_DISPLACEMENT_WARN_M:
+            return
+        previous = self._last_traced_displacement_m
+        if previous is not None and abs(displacement - previous) < 0.10:
+            return
+        self._last_traced_displacement_m = displacement
+        self._trace_navigation(
+            "PUSHED",
+            f"requested=({requested_xy[0]:.2f},{requested_xy[1]:.2f}) "
+            f"actual=({actual_xy[0]:.2f},{actual_xy[1]:.2f}) "
+            f"displacement={displacement:.2f}m label={self.goal_publisher.last_requested_label}"
+        )
+
+    def _is_measurable_waypoint(self, actual_xy: tuple[float, float]) -> bool:
+        """이 /way_point 값이 "밀림"을 재는 데 쓸 수 있는가 (config.WAYPOINT_PROJ_DIS_M
+        주석 참고). 도달 후 projection 값과 초기값 (0,0)을 걸러낸다."""
+        if actual_xy == (0.0, 0.0):
+            return False
+        published_at = self._last_goal_publish_time
+        if published_at is None:
+            return False
+        if time.monotonic() - published_at > config.WAYPOINT_MEASURE_WINDOW_SEC:
+            return False
+        with self.sensor_lock:
+            pose = None if self.latest_pose is None else dict(self.latest_pose)
+        if pose is not None:
+            from_robot = math.hypot(actual_xy[0] - pose["x"], actual_xy[1] - pose["y"])
+            if abs(from_robot - config.WAYPOINT_PROJ_DIS_M) <= config.WAYPOINT_PROJ_TOLERANCE_M:
+                return False
+        return True
 
     def scan_callback(self, msg: PointCloud2) -> None:
         stamp = message_stamp_to_sec(msg) # ROS 메시지에는 촬영 시간이 존재, 이를 추출
@@ -588,13 +710,15 @@ class SysNavNode(Node):
             image_verified_ids: set[int] = set()
             if candidates:
                 first_relation, _, first_reference = effective_relation_chain(task)[0]
-                if first_relation in ("nearest", "closest") and len(candidates) > 1:
-                    # "nearest"는 최상급(비교) relation이라 후보마다 독립적으로
-                    # yes/no만 물으면 안 된다 - bedside table이 2개 있고 둘 다 사진에
-                    # 창문이 보이면 verify()는 둘 다 통과시켜버려서 어느 게 진짜
-                    # 가까운지 못 가린다. 후보 전부를 한 번에 놓고 VLM이 직접
-                    # 비교해서 하나만 고르게 한다.
-                    winner_id = self.relation_image_verifier.rank_nearest(candidates, first_reference)
+                superlative = first_relation in ("nearest", "closest", "farthest", "furthest")
+                if superlative and len(candidates) > 1:
+                    # 최상급(비교) relation은 후보마다 독립적으로 yes/no만 물으면 안 된다 -
+                    # bedside table이 2개 있고 둘 다 사진에 창문이 보이면 verify()는 둘 다
+                    # 통과시켜버려서 어느 게 진짜 가까운지(먼지) 못 가린다. 후보 전부를
+                    # 한 번에 놓고 VLM이 직접 비교해서 하나만 고르게 한다.
+                    winner_id = self.relation_image_verifier.rank_superlative(
+                        candidates, first_reference, first_relation
+                    )
                     if winner_id is not None:
                         image_verified_ids = {winner_id}
                 else:
@@ -671,7 +795,12 @@ class SysNavNode(Node):
     def exploration_job(self, task_id: int, pose: dict) -> dict:
         room_graph = self.room_registry.snapshot()
         route = self.coverage_planner.plan_route(
-            pose, self.viewpoint_memory, room_segmentation=room_graph
+            pose,
+            self.viewpoint_memory,
+            room_segmentation=room_graph,
+            # 탐사 경로도 금지구역을 피해야 한다. 채점은 목적지 주행이 아니라 실제
+            # 주행 궤적 전체를 보므로, 탐사 중에 지나가면 그대로 감점이다.
+            forbidden_mask=self.mission3_forbidden_mask,
         )
         diagnostics = dict(self.coverage_planner.last_plan_diagnostics)
         return {
@@ -692,6 +821,8 @@ class SysNavNode(Node):
         self.active_kind = kind
         self.active_task_id = self.task_id
         self.active_origin_state = origin_state
+        self.active_started_at = time.monotonic()
+        activity.add(JOB, f"{_JOB_LABELS.get(kind, kind)} 작업 시작", f"state={origin_state}")
 
     # Worker Thread에 맡겨둔 작업이 끝났는지 확인하고, 완료된 결과를 받아 상태 머신에 반영하는 함수
     '''
@@ -738,7 +869,12 @@ class SysNavNode(Node):
 
         # 4. worker 결과 가져오기
         try:
+            elapsed = (
+                "-" if self.active_started_at is None
+                else f"{time.monotonic() - self.active_started_at:.1f}초"
+            )
             result = future.result() # WORKER가 반환한 값을 .result() 을 통해서 가져온다.
+            activity.add(JOB, f"{_JOB_LABELS.get(kind, kind)} 작업 완료", elapsed)
         #  worker에서 예외 발생시,
         except Exception as error: # Worker 함수 안에서 오류가 발생하면 future.result()를 호출할 때 그 예외가 다시 발생
             self.get_logger().error(f"⚠️ {kind} job failed: {error}")
@@ -946,6 +1082,12 @@ class SysNavNode(Node):
             state = self.state
             task = None if self.task is None else dict(self.task)
             task_id = self.task_id
+        # 상태 대입이 미션 파이프 여기저기에 흩어져 있어서, 대입부마다 로그를 넣는 대신
+        # 여기서 변화를 관찰한다 - 이러면 전이를 하나도 안 놓친다.
+        if state != self._logged_state:
+            activity.add(WARN if state == "FAILED" else STATE,
+                         f"상태 {self._logged_state} → {state}")
+            self._logged_state = state
 
         self._update_mission_dashboard(state, task, task_id)
 
@@ -1062,13 +1204,41 @@ class SysNavNode(Node):
 
     # state == "FOLLOW_EXPLORATION" -> publish next exploration goal
     def publish_next_exploration_goal(self) -> None:
-        if not self.exploration_route:
+        # base autonomy가 받아줄 수 없는 hop은 건너뛰고 다음 후보를 바로 시도한다.
+        # 예전엔 그런 좌표도 그대로 발행했는데, waypointConverter가 그걸 로봇 발밑에
+        # 떨어뜨려서 로봇이 서 있고 stuck timeout(8초)을 통째로 버린 뒤에야 다음으로
+        # 넘어갔다 (goal_publisher.publish() docstring의 실측 참고).
+        skipped = 0
+        goal = None
+        published = None
+        while self.exploration_route:
+            candidate = self.exploration_route.popleft()
+            published = self.goal_publisher.publish(
+                candidate["x"], candidate["y"], candidate["theta"],
+                label="exploration viewpoint" if candidate.get("is_viewpoint") else "exploration hop",
+            )
+            if published is not None:
+                goal = candidate
+                break
+            skipped += 1
+
+        if goal is None:
+            if skipped:
+                self.get_logger().info(
+                    f"🧭 exploration route exhausted - {skipped} hop(s) had no point "
+                    f"base autonomy would accept; re-observing"
+                )
             self.current_goal = None
             with self.state_lock:
                 self.state = "OBSERVE"
             return
-        goal = self.exploration_route.popleft()
-        self.goal_publisher.publish(goal["x"], goal["y"], goal["theta"])
+        if skipped:
+            self.get_logger().info(
+                f"🧭 skipped {skipped} unreachable exploration hop(s) before this goal"
+            )
+        # 발행된 좌표(스냅 반영)를 그대로 current_goal로 쓴다 - 원본을 저장하면 로봇이
+        # 갈 수 없는 좌표를 기준으로 도착 판정을 하게 되어 영원히 도착하지 않는다.
+        goal = {**goal, "x": float(published.x), "y": float(published.y)}
         self.current_goal = {**goal, "type": "exploration"}
         self._exploration_goal_best_distance_m = None
         self._exploration_goal_last_progress_time = time.monotonic()
@@ -1105,6 +1275,8 @@ class SysNavNode(Node):
     # ------------------------------------------------------------------
 
     def clear_target_navigation(self) -> None:
+        self._target_publish_blocked = False
+        self._target_retarget_fail_since = None
         self.target_route.clear()
         self.target_goal_xy = None
         self.target_final_theta = None
@@ -1158,6 +1330,22 @@ class SysNavNode(Node):
         )
         self.target_marker_index = marker_index
 
+        # 기본은 목적지 하나만 발행하고 base autonomy에 맡긴다.
+        #
+        # 한때 "항상 A* hop으로 잘라 보내기"로 바꿨다가 되돌렸다(2026-08-22). 근거였던
+        # "우리 좌표가 발밑으로 덤프된다"는 실측은 맞지만, 그건 목표가 5m 안일 때만
+        # 일어나는 일이고(waypointConverter: `if (dis < adjDisThre)`) hop을 써도 마지막
+        # 구간에서 똑같이 겪는다 - 즉 hop으로는 안 풀린다(그건 Layer 1 스냅이 담당).
+        #
+        # 반면 hop을 강제하면 localPlanner의 판단 범위를 실제로 깎는다: pathCropByGoal이
+        # true라 "목표까지 거리 + goalClearRange(0.5m)" 밖의 장애물은 아예 보지 않는다.
+        # 1.5m hop을 주면 시야가 adjacentRange(3.5m) -> 2.0m로 줄어든다. 게다가 우리 A*는
+        # 격자 1셀(0.20m) 클리어런스라 localPlanner의 차체(0.5x0.5m)보다 낙관적이어서,
+        # 우리가 "지나갈 수 있다"고 본 틈 앞에서 로봇이 멈추는 불일치만 늘어난다.
+        #
+        # 예외는 forbidden_mask("avoid the path between A and B")뿐이다. 이 제약은 base
+        # autonomy가 알 방법이 없으므로 우리가 우회 경로를 만들어 hop으로 내보내야 한다
+        # (README 채점: "passes through areas it is forbidden to go through" 감점 항목).
         if forbidden_mask is not None:
             path, elapsed_ms = self._plan_target_path(pose)
             if path:
@@ -1179,23 +1367,64 @@ class SysNavNode(Node):
             f"({self.target_goal_xy[0]:.2f},{self.target_goal_xy[1]:.2f}) "
             f"terrain[{self.terrain_monitor.describe()}]",
         )
-        self._publish_target_goal(
+        if not self._publish_target_goal(
             self.target_goal_xy[0], self.target_goal_xy[1], self.target_final_theta,
             is_final=True,
-        )
+        ):
+            # 목적지 근처에 base autonomy가 받아줄 지점이 없다. 억지로 발행하지 않고
+            # 진행도 감시(target_progress_stalled)가 unreachable로 넘기도록 둔다.
+            self.get_logger().warning(
+                f"🧭 target goal ({self.target_goal_xy[0]:.2f}, {self.target_goal_xy[1]:.2f}) "
+                f"is not commandable - {self.terrain_monitor.last_selection}"
+            )
 
     def publish_next_target_hop(self) -> None:
         """target_route에서 다음 hop을 꺼내 발행한다. state는 건드리지 않는다
         (미션별 state는 missions/*.py가 관리한다)."""
         if not self.target_route:
             return
-        hop = self.target_route.popleft()
-        self._publish_target_goal(
-            hop["x"], hop["y"], hop["theta"], is_final=not self.target_route
+        # 경로의 **가장 먼 hop부터** 거꾸로 훑어 지금 발행 가능한 첫 hop을 쓴다.
+        # 한 번에 최대한 멀리 보내야 명령 횟수가 줄고, terrain 유효 반경(1.75m) 밖
+        # hop은 어차피 발행 판정에서 걸러진다. 직선거리로 "목표에 가장 가까운 점"을
+        # 고르지 않는 이유: 그건 벽 뒤에 목표가 있을 때 벽 앞에서 갇히는 local minimum
+        # 문제가 있다. A* 경로 위에서만 고르면 경로가 이미 벽을 우회하므로 안 갇힌다.
+        hops = list(self.target_route)
+        for index in range(len(hops) - 1, -1, -1):
+            hop = hops[index]
+            if not self.goal_publisher.can_publish(hop["x"], hop["y"]):
+                continue
+            if self._publish_target_goal(
+                hop["x"], hop["y"], hop["theta"], is_final=(index == len(hops) - 1)
+            ):
+                for _ in range(index + 1):
+                    self.target_route.popleft()
+                if index:
+                    self.get_logger().info(
+                        f"🧭 advanced {index + 1} hop(s) at once "
+                        f"({len(self.target_route)} left)"
+                    )
+                return
+        # 남은 hop이 전부 발행 불가 - 억지로 보내지 않고, 진행도 감시(백스톱)가
+        # unreachable로 판정해 재계획하도록 둔다.
+        self.get_logger().warning(
+            f"🧭 none of {len(hops)} remaining target hop(s) are commandable right now"
         )
 
-    def _publish_target_goal(self, x: float, y: float, theta: float, is_final: bool) -> None:
-        self.goal_publisher.publish(x, y, theta)
+    def _publish_target_goal(self, x: float, y: float, theta: float, is_final: bool) -> bool:
+        """목표 hop을 발행한다. base autonomy가 받아줄 지점이 근처에 없어서 발행하지
+        못하면 False를 돌려준다 - 호출 측은 다음 hop으로 넘어가거나 재계획해야 한다.
+        받아줄 수 없는 좌표를 억지로 발행하면 로봇 발밑에 목표가 찍혀 그대로 멈춘다
+        (goal_publisher.publish() docstring 참고)."""
+        # publish()가 base autonomy가 받아줄 지점으로 옮길 수 있으므로, 도착 판정은
+        # 원본이 아니라 실제 발행된 좌표를 기준으로 해야 한다(publish() docstring 참고).
+        published = self.goal_publisher.publish(
+            x, y, theta, label="target goal" if is_final else "target hop"
+        )
+        if published is None:
+            self._target_publish_blocked = True
+            return False
+        self._target_publish_blocked = False
+        x, y = float(published.x), float(published.y)
         self.current_goal = {
             "x": float(x),
             "y": float(y),
@@ -1217,6 +1446,7 @@ class SysNavNode(Node):
             f"is_final={is_final}, remaining_hops={len(self.target_route)}, "
             f"replans={self._target_replan_count}"
         )
+        return True
 
     def target_destination_reached(self, pose: dict) -> bool:
         """RViz에 표시한 최종 marker의 0.5m 성공 반경 안에 들어왔는지."""
@@ -1381,6 +1611,25 @@ class SysNavNode(Node):
         if self._retarget_if_unsupported(pose):
             return "driving"
 
+        # 3.5. 재선택까지 했는데도 목표를 발행하지 못한 상태다. 이때는 로봇에게 아무
+        #      명령도 가 있지 않으므로 기다려봐야 움직이지 않는다 - stuck timeout
+        #      (20초)을 헛되이 소진하지 말고 바로 미션에 알린다. mission3는 탐사로
+        #      되돌아가 지도를 넓히고(그 사이 terrain이 자라 다시 가능해질 수 있다),
+        #      mission2는 자체 정책대로 처리한다.
+        retarget_stuck = (
+            self._target_retarget_fail_since is not None
+            and time.monotonic() - self._target_retarget_fail_since
+            >= config.TARGET_RETARGET_GIVEUP_SEC
+        )
+        if self._target_publish_blocked or retarget_stuck:
+            self._trace_navigation(
+                "UNREACHABLE",
+                f"trigger={'not_commandable' if self._target_publish_blocked else 'retarget_exhausted'} "
+                f"goal=({self.target_goal_xy[0]:.2f},{self.target_goal_xy[1]:.2f}) "
+                f"{self.terrain_monitor.last_selection}",
+            )
+            return "unreachable"
+
         # 4. 최후 백스톱. base autonomy가 스스로 멈춘 것이므로 "더 못 간다"는 판단은
         #    우리 지도가 아니라 로봇의 실제 거동에서 온다.
         if self.target_progress_stalled(pose):
@@ -1415,6 +1664,8 @@ class SysNavNode(Node):
         robot_xy = (float(pose["x"]), float(pose["y"]))
         chosen = self.terrain_monitor.choose_approach_point(self.target_object_xy, robot_xy)
         if chosen is None:
+            if self._target_retarget_fail_since is None:
+                self._target_retarget_fail_since = now
             self._trace_navigation(
                 "RETARGET_FAIL",
                 f"goal=({self.target_goal_xy[0]:.2f},{self.target_goal_xy[1]:.2f}) "
@@ -1430,10 +1681,21 @@ class SysNavNode(Node):
             f"({self.target_goal_xy[0]:.2f},{self.target_goal_xy[1]:.2f}) -> "
             f"({chosen[0]:.2f},{chosen[1]:.2f}) {self.terrain_monitor.last_selection}",
         )
+        if not self._publish_target_goal(chosen[0], chosen[1], theta, is_final=True):
+            if self._target_retarget_fail_since is None:
+                self._target_retarget_fail_since = now
+            # retarget이 고른 지점조차 발행이 안 됐다 - 목표를 바꾸지 않고 실패로 알린다.
+            # 여기서 True를 돌려주면 호출 측이 "새 목표로 가는 중"이라고 착각한다.
+            self._trace_navigation(
+                "RETARGET_FAIL",
+                f"chosen=({chosen[0]:.2f},{chosen[1]:.2f}) not commandable - "
+                f"{self.terrain_monitor.last_selection}",
+            )
+            return False
         self.target_goal_xy = chosen
         self.target_final_theta = theta
         self._target_retarget_count += 1
-        self._publish_target_goal(chosen[0], chosen[1], theta, is_final=True)
+        self._target_retarget_fail_since = None
         self.refresh_goal_marker()
         return True
 
@@ -1453,8 +1715,89 @@ class SysNavNode(Node):
             label=f"goal{self.target_marker_index + 1}",
         )
 
+    def _publish_map_topics(self) -> None:
+        """우리 planner가 보고 있는 지도/경로/frontier를 RViz로 내보낸다.
+
+        base autonomy의 /registered_scan, /terrain_map, /way_point와 같은 map 프레임이라
+        RViz에서 그대로 겹쳐진다 - "우리는 free로 보는데 terrain엔 점이 없는" 구간을
+        눈으로 바로 대조하려고 만든 것이다. 발행 전용이라 주행에는 영향이 없다."""
+        stamp = self.get_clock().now().to_msg()
+        try:
+            self._publish_occupancy(stamp)
+            self._publish_planned_path(stamp)
+            self._publish_frontier(stamp)
+        except Exception as error:      # 진단용이라 실패가 주행을 막으면 안 된다
+            self.get_logger().debug(f"map topic publish skipped: {error}")
+
+    def _publish_occupancy(self, stamp) -> None:
+        snapshot = self.coverage_planner.occupancy_snapshot()
+        if snapshot is None:
+            return
+        grid, origin_x, origin_y, resolution = snapshot
+        message = OccupancyGrid()
+        message.header.stamp = stamp
+        message.header.frame_id = config.OBJECT_MARKER_FRAME_ID
+        message.info.resolution = float(resolution)
+        message.info.width = int(grid.shape[1])
+        message.info.height = int(grid.shape[0])
+        message.info.origin.position.x = origin_x
+        message.info.origin.position.y = origin_y
+        message.info.origin.orientation.w = 1.0
+        # OCC_* 값이 OccupancyGrid 규약(-1/0/100)과 같고, grid[row=y][col=x]에 원점이
+        # 좌하단이라 축 배치도 그대로 맞는다. 변환 없이 평탄화만 하면 된다.
+        # grid는 이미 int8이고 값도 -1/0/100이라 형변환 없이 평탄화만 하면 된다.
+        message.data = grid.ravel().tolist()
+        self.occupancy_pub.publish(message)
+
+    def _publish_planned_path(self, stamp) -> None:
+        """지금 따라가는 A* 경로. 목적지 주행이면 target_route, 탐색이면
+        exploration_route를 쓴다. 로봇 현재 위치를 맨 앞에 붙여야 RViz에서 경로가
+        로봇에서 이어져 보인다."""
+        hops = list(self.target_route) or list(self.exploration_route)
+        message = Path()
+        message.header.stamp = stamp
+        message.header.frame_id = config.OBJECT_MARKER_FRAME_ID
+        with self.sensor_lock:
+            pose = None if self.latest_pose is None else dict(self.latest_pose)
+        goal = self.current_goal
+        if not hops and goal:
+            hops = [goal]
+        points = ([(pose["x"], pose["y"])] if pose else []) + [
+            (hop["x"], hop["y"]) for hop in hops
+        ]
+        for x, y in points:
+            item = PoseStamped()
+            item.header = message.header
+            item.pose.position.x = float(x)
+            item.pose.position.y = float(y)
+            item.pose.orientation.w = 1.0
+            message.poses.append(item)
+        self.planned_path_pub.publish(message)
+
+    def _publish_frontier(self, stamp) -> None:
+        marker = Marker()
+        marker.header.stamp = stamp
+        marker.header.frame_id = config.OBJECT_MARKER_FRAME_ID
+        marker.ns = "sysnav_frontier"
+        marker.id = 0
+        marker.type = Marker.POINTS
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = marker.scale.y = float(config.MAP_RESOLUTION_M)
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = (1.0, 0.85, 0.0, 1.0)
+        for x, y in self.coverage_planner.frontier_points_world():
+            point = Point()
+            point.x, point.y, point.z = float(x), float(y), 0.05
+            marker.points.append(point)
+        self.frontier_pub.publish(marker)
+
     def _trace_navigation(self, event: str, detail: str) -> None:
-        """debug/sysnav_navigation_trace.txt에 한 줄 append (진단 전용, 동작 영향 없음)."""
+        """debug/sysnav_navigation_trace.txt에 한 줄 append (진단 전용, 동작 영향 없음).
+
+        같은 내용을 활동 로그에도 넣는다 - 대시보드에서 "왜 멈췄는지"를 보려면 상태
+        전이와 주행 판단이 한 타임라인에 섞여 있어야 한다."""
+        activity.add(WARN if event in _NAV_PROBLEM_EVENTS else NAV,
+                     _NAV_LABELS.get(event, event), detail)
         if not config.SAVE_DEBUG_IMAGES:
             return
         try:
@@ -1521,11 +1864,27 @@ class SysNavNode(Node):
     # "항상 최신 상태 하나만 남기는" 패턴. MISSION_DASHBOARD_REFRESH_SEC로 스로틀링해서
     # control_loop(0.2초 주기)마다 디스크에 쓰지 않게 한다.
     def _update_mission_dashboard(self, state: str, task: dict | None, task_id: int) -> None:
+        """대시보드 HTML을 다시 쓴다. **진단 전용이라 절대 주행을 막으면 안 된다.**
+
+        control_loop(타이머 콜백)에서 불리는데, 여기서 예외가 나면 rclpy executor가
+        그대로 노드를 죽인다. 실측(2026-08-23): avoid 절이 없는 Mission 3 질문에서
+        mission_dashboard._mission_detail_rows의 forbidden_desc가 미할당이라
+        UnboundLocalError가 났고, 그것 하나로 프로세스가 종료됐다(exit code 1).
+        표시가 깨지는 것과 로봇이 멈추는 것은 심각도가 완전히 다르다.
+        """
         now = time.monotonic()
         if now - self._last_dashboard_write_time < config.MISSION_DASHBOARD_REFRESH_SEC:
             return
         self._last_dashboard_write_time = now
+        try:
+            self._render_mission_dashboard(state, task, task_id)
+        except Exception as error:
+            self.get_logger().warning(
+                f"mission dashboard skipped ({type(error).__name__}: {error})"
+            )
 
+    def _render_mission_dashboard(self, state: str, task: dict | None, task_id: int) -> None:
+        now = time.monotonic()
         with self.sensor_lock:
             pose = None if self.latest_pose is None else dict(self.latest_pose)
 
@@ -1554,7 +1913,39 @@ class SysNavNode(Node):
             "mission2_exploration_complete": self.mission2_exploration_complete,
             "last_response_summary": self.last_response_summary,
             "candidate_count": candidate_count,
+            # base autonomy가 우리 목표를 얼마나 옮겼는지 - "우리 planner는 갈 수 있다고
+            # 보는데 로봇이 안 간다"를 대시보드만 보고 구분하기 위한 값.
+            "requested_waypoint_xy": self.goal_publisher.last_requested_xy,
+            "actual_waypoint_xy": self.last_actual_waypoint_xy,
+            "waypoint_displacement_m": self.last_waypoint_displacement_m,
+            # 발행 직전 스냅(Layer 1)이 좌표를 옮긴 거리. 이게 작동하면 위
+            # waypoint_displacement_m이 0에 수렴해야 한다.
+            "waypoint_snap_m": self.goal_publisher.last_snap_distance_m,
+            # 지도 현황 - "지금 얼마나 만들었고 아직 볼 곳이 남았는지"를 대시보드에서
+            # 바로 보기 위한 것. 전부 개수 계산이라 1초 주기로 불러도 부담 없다.
+            "map_stats": self.coverage_planner.map_stats(),
+            "graph_counts": self.scene_graph.counts(),
+            "room_summary": self._room_summary(),
+            "terrain_summary": self.terrain_monitor.describe(),
+            "object_memory_count": self.object_memory.count(),
+            "viewpoint_memory_count": self.viewpoint_memory.count(),
         })
+
+    def _room_summary(self) -> dict:
+        """방 분할 결과 요약(방/문 개수와 현재 방). segmentation이 아직 없으면 0."""
+        segmentation = self._latest_room_segmentation or {}
+        active = None
+        with self.sensor_lock:
+            pose = None if self.latest_pose is None else dict(self.latest_pose)
+        if pose is not None and segmentation:
+            cell = self.coverage_planner.world_to_grid(pose["x"], pose["y"])
+            if cell is not None:
+                active = self.coverage_planner._active_room_id(cell, segmentation)
+        return {
+            "rooms": len(segmentation.get("rooms", []) or []),
+            "doorways": len(segmentation.get("doorways", []) or []),
+            "active_room_id": active,
+        }
 
     def goal_reached(self, pose: dict) -> bool:
         if self.current_goal is None:

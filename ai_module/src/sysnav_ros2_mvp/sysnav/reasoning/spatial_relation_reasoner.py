@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from sysnav import config
+from sysnav.activity_log import LLM, activity
 from sysnav.task.query_parser import effective_relation_chain
 
 
@@ -387,45 +388,46 @@ and normalized relation exactly. Do not add new object IDs or relations. A relat
 ambiguous must be omitted.
 """.strip()
 
-        response = self._client.models.generate_content(
-            model=config.GEMINI_MODEL,
-            contents=[
-                prompt,
-                types.Part.from_bytes(data=self._jpeg(annotated), mime_type="image/jpeg"),
-            ],
-            config=types.GenerateContentConfig(
-                temperature=config.GEMINI_TEMPERATURE,
-                response_mime_type="application/json",
-                response_schema={
-                    "type": "object",
-                    "properties": {
-                        "relations": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "source_object_id": {"type": "integer"},
-                                    "target_object_ids": {
-                                        "type": "array",
-                                        "items": {"type": "integer"},
+        with activity.operation(LLM, "Gemini 공간관계 판정"):
+            response = self._client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=[
+                    prompt,
+                    types.Part.from_bytes(data=self._jpeg(annotated), mime_type="image/jpeg"),
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=config.GEMINI_TEMPERATURE,
+                    response_mime_type="application/json",
+                    response_schema={
+                        "type": "object",
+                        "properties": {
+                            "relations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "source_object_id": {"type": "integer"},
+                                        "target_object_ids": {
+                                            "type": "array",
+                                            "items": {"type": "integer"},
+                                        },
+                                        "relation": {"type": "string"},
+                                        "confidence": {"type": "number"},
+                                        "reason": {"type": "string"},
                                     },
-                                    "relation": {"type": "string"},
-                                    "confidence": {"type": "number"},
-                                    "reason": {"type": "string"},
+                                    "required": [
+                                        "source_object_id",
+                                        "target_object_ids",
+                                        "relation",
+                                        "confidence",
+                                    ],
                                 },
-                                "required": [
-                                    "source_object_id",
-                                    "target_object_ids",
-                                    "relation",
-                                    "confidence",
-                                ],
-                            },
-                        }
+                            }
+                        },
+                        "required": ["relations"],
                     },
-                    "required": ["relations"],
-                },
-            ),
-        )
+                ),
+            )
         if not response.text:
             return []
 
@@ -466,10 +468,15 @@ ambiguous must be omitted.
         # "nearest/closest"는 경쟁하는 후보 중 argmin 하나만 참이 되는 최상급 relation이라
         # 나머지(pairwise 판정) relation과 채점 방식이 다르다. 체인이면 candidate마다 relation이
         # 다를 수 있으므로(예: "A closest to B near C") relation별로 나눠서 처리한다.
-        nearest_candidates = [c for c in candidates if c["relation"] in ("nearest", "closest")]
-        other_candidates = [c for c in candidates if c["relation"] not in ("nearest", "closest")]
+        superlatives = {"nearest": min, "closest": min, "farthest": max, "furthest": max}
+        nearest_candidates = [c for c in candidates if c["relation"] in superlatives]
+        other_candidates = [c for c in candidates if c["relation"] not in superlatives]
 
-        output = list(self._infer_nearest_with_geometry(nearest_candidates, records)) if nearest_candidates else []
+        output = []
+        for relation, pick in superlatives.items():
+            group = [c for c in nearest_candidates if c["relation"] == relation]
+            if group:
+                output.extend(self._infer_superlative_with_geometry(group, records, pick))
         for candidate in other_candidates:
             source = records[candidate["source_object_id"]]
             targets = [records[object_id] for object_id in candidate["target_object_ids"]]
@@ -490,7 +497,9 @@ ambiguous must be omitted.
         return output
 
     @staticmethod
-    def _infer_nearest_with_geometry(candidates: list[dict], records: dict[int, dict]) -> list[dict]:
+    def _infer_superlative_with_geometry(
+        candidates: list[dict], records: dict[int, dict], pick=min
+    ) -> list[dict]:
         """"nearest/closest"는 근접 threshold(near)와 달리 최상급(argmin) relation이다:
         같은 hop(예: "bedside table nearest window")에서 경쟁하는 모든 (source, target)
         후보 쌍 중 거리가 가장 짧은 단 하나만 참이 된다. hop 식별은 (source_category,
@@ -511,14 +520,63 @@ ambiguous must be omitted.
         for scored in groups.values():
             if not scored:
                 continue
-            winner, winner_distance = min(scored, key=lambda item: item[1])
+            winner, winner_distance = pick(scored, key=lambda item: item[1])
             output.append({
                 **winner,
                 "confidence": 1.0,
                 "method": "geometry",
-                "reason": f"xy_distance={winner_distance:.3f}m (min among {len(scored)} candidate(s))",
+                "reason": f"xy_distance={winner_distance:.3f}m "
+                          f"({'min' if pick is min else 'max'} among {len(scored)} candidate(s))",
             })
         return output
+
+    @staticmethod
+    def _xy_gap(
+        source_min: np.ndarray, source_max: np.ndarray,
+        target_min: np.ndarray, target_max: np.ndarray,
+    ) -> float:
+        """두 XY bbox가 떨어진 거리. 겹치면 0.
+
+        중심 사이 거리를 안 쓰는 이유: 캐비닛(폭 1.75m) 위의 그림(폭 0.90m)처럼 크기가
+        많이 다르면 중심이 자연스럽게 어긋난다. 겹침을 봐야 크기 차이에 안 휘둘린다.
+        """
+        dx = max(0.0, float(target_min[0] - source_max[0]), float(source_min[0] - target_max[0]))
+        dy = max(0.0, float(target_min[1] - source_max[1]), float(source_min[1] - target_max[1]))
+        return math.hypot(dx, dy)
+
+    @classmethod
+    def _vertical_relation(
+        cls, gap: float,
+        source_min: np.ndarray, source_max: np.ndarray,
+        target_min: np.ndarray, target_max: np.ndarray,
+    ) -> tuple[bool, float, str]:
+        """"A under B" / "A above B" 판정. 높이 순서 + 수평 정렬 + 높이차 상한.
+
+        수평 정렬을 반드시 같이 봐야 한다 (2026-08-23 GT 대조로 발견): 예전에는 높이차만
+        봐서 방 반대편 물체끼리 성립했다 -
+          cabinet#1(2.19,-0.79) --under--> picture#8(-2.62,-6.55) conf=0.937, 수평 7.51m
+        이 엉터리 edge가 정답 체인을 밀어내고 틀린 화병을 가리키게 만들었다.
+
+        신뢰도를 "높이차가 작을수록 높게"에서 바꾼 이유도 같다. 그림은 캐비닛에 붙어
+        있지 않고 0.5~1.2m 위에 걸린다. 붙어 있을수록 높다고 점수를 주면 정상 쌍
+        (실측 0.604m -> 0.396)이 임계값 0.55에 못 미쳐 탈락하고, 우연히 높이가 맞은
+        방 반대편 쌍이 이긴다. 그래서 수평 정렬을 주 신호로 쓰고 높이차는 상한만 본다.
+        """
+        margin = config.SCENE_GRAPH_VERTICAL_HORIZONTAL_MARGIN_M
+        max_gap = config.SCENE_GRAPH_VERTICAL_MAX_GAP_M
+        xy_gap = cls._xy_gap(source_min, source_max, target_min, target_max)
+        ordered = gap >= -config.SCENE_GRAPH_ON_VERTICAL_TOLERANCE_M
+        holds = ordered and xy_gap <= margin and gap <= max_gap
+        # 수평 정렬이 주 신호다. 높이차는 위 gate(max_gap)에서 이미 걸렀으므로 여기서는
+        # 동점을 가르는 정도로만 반영한다(최대 30% 감점) - 그림은 캐비닛 바로 위에
+        # 붙지 않고 0.5~1.2m 떠 있는 게 정상이라, 이걸 크게 깎으면 정상 쌍이 임계값
+        # 아래로 떨어진다(실측: 곱셈으로 하면 정답 쌍이 0.501 < 0.55로 탈락했다).
+        horizontal_score = max(0.0, 1.0 - xy_gap / max(margin, 1e-6))
+        vertical_score = max(0.0, 1.0 - max(0.0, gap) / max(max_gap, 1e-6))
+        confidence = horizontal_score * (0.7 + 0.3 * vertical_score) if holds else 0.0
+        return holds, confidence, (
+            f"vertical_gap={gap:.3f}m, xy_gap={xy_gap:.3f}m (max {margin:.2f}m)"
+        )
 
     @staticmethod
     def _local_xy(position: tuple[float, float, float], pose: dict) -> np.ndarray:
@@ -578,12 +636,14 @@ ambiguous must be omitted.
         target_min = np.asarray(targets[0]["bbox_3d_min"], dtype=np.float64)
         target_max = np.asarray(targets[0]["bbox_3d_max"], dtype=np.float64)
 
-        if relation == "above":
-            gap = float(source_min[2] - target_max[2])
-            return gap >= -config.SCENE_GRAPH_ON_VERTICAL_TOLERANCE_M, max(0.0, 1.0 - abs(gap)), f"vertical_gap={gap:.3f}m"
-        if relation == "under":
-            gap = float(target_min[2] - source_max[2])
-            return gap >= -config.SCENE_GRAPH_ON_VERTICAL_TOLERANCE_M, max(0.0, 1.0 - abs(gap)), f"vertical_gap={gap:.3f}m"
+        if relation in ("above", "under"):
+            if relation == "above":
+                gap = float(source_min[2] - target_max[2])
+            else:
+                gap = float(target_min[2] - source_max[2])
+            return self._vertical_relation(
+                gap, source_min, source_max, target_min, target_max
+            )
         if relation == "on":
             vertical_gap = float(source_min[2] - target_max[2])
             horizontal_inside = (

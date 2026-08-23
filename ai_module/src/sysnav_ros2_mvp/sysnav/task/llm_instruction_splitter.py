@@ -22,6 +22,7 @@ import os
 from rclpy.logging import get_logger
 
 from sysnav import config
+from sysnav.activity_log import LLM, activity
 
 _PROMPT_TEMPLATE = """
 You split a multi-step robot navigation instruction into an ordered list of clauses,
@@ -123,15 +124,16 @@ class LLMInstructionSplitter:
             self._load()
             from google.genai import types
 
-            response = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=_PROMPT_TEMPLATE.format(question=question),
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema=_RESPONSE_SCHEMA,
-                ),
-            )
+            with activity.operation(LLM, "Gemini 지시문 절 분해"):
+                response = self._client.models.generate_content(
+                    model=config.GEMINI_MODEL,
+                    contents=_PROMPT_TEMPLATE.format(question=question),
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                        response_schema=_RESPONSE_SCHEMA,
+                    ),
+                )
             if not response.text:
                 raise RuntimeError("Gemini가 빈 응답을 반환함")
             clauses = json.loads(response.text).get("clauses") or []

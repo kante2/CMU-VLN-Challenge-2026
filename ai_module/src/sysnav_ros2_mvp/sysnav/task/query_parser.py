@@ -27,6 +27,13 @@ _RELATIONS = [
     # "near" 하나로만 잡힌다. 반드시 "near"보다 먼저 (문자열 자체가 아니라 리스트에)
     # 있을 필요는 없다 - _find_leftmost_relation이 위치(start index) 기준으로 고르므로.
     ("closest to", "nearest"), ("nearest to", "nearest"), ("close to", "nearest"),
+    # "farthest/furthest"는 nearest의 반대쪽 최상급(argmax)이다. 이게 없으면 관계
+    # 자체가 매칭되지 않아 "table farthest from the column" 전체가 target 문자열로
+    # 넘어가고, 그 문자열이 그대로 YOLO 프롬프트가 된다(questions.json 75문항 중
+    # 9문항이 이 경로로 검출과 관계 판정을 동시에 잃고 있었다).
+    ("farthest from", "farthest"), ("furthest from", "farthest"),
+    ("farthest away from", "farthest"), ("furthest away from", "farthest"),
+    ("far from", "farthest"),
     ("near", "near"), ("between", "between"), ("on top of", "on"),
     ("on", "on"), ("under", "under"), ("below", "under"),
     ("above", "above"), ("behind", "behind"),
@@ -116,6 +123,13 @@ def _extract_relation_chain(phrase: str) -> list[dict]:
         if canonical == "between":
             rest = remaining[end:]
             for part in re.split(r"\band\b|,", rest, flags=re.IGNORECASE):
+                # 참조 쪽에 관계절이 중첩될 수 있다("between the vase and the stone
+                # decoration that is closest to the vase"). 그대로 두면 참조 카테고리가
+                # "stone decoration closest to vase"가 되어 scene graph 카테고리와도
+                # 안 맞고 YOLO 프롬프트로도 못 쓴다 - 머리 명사만 남긴다.
+                nested = _find_leftmost_relation(part)
+                if nested is not None:
+                    part = part[:nested[1]]
                 ref, ref_attributes = _split_attributes(_clean(part))
                 if ref:
                     chain.append({"object": ref, "attributes": ref_attributes, "relation": None})

@@ -22,6 +22,7 @@ import numpy as np
 from rclpy.logging import get_logger
 
 from sysnav import config
+from sysnav.activity_log import LLM, activity
 
 
 class RoomClassifier:
@@ -88,31 +89,32 @@ class RoomClassifier:
                 contents.append(f"room_id={item['room_id']} image:")
                 contents.append(types.Part.from_bytes(data=self._jpeg(item["image"]), mime_type="image/jpeg"))
 
-            response = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "object",
-                        "properties": {
-                            "results": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "room_id": {"type": "integer"},
-                                        "category": {"type": "string"},
+            with activity.operation(LLM, "Gemini 방 분류"):
+                response = self._client.models.generate_content(
+                    model=config.GEMINI_MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                        response_schema={
+                            "type": "object",
+                            "properties": {
+                                "results": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "room_id": {"type": "integer"},
+                                            "category": {"type": "string"},
+                                        },
+                                        "required": ["room_id", "category"],
                                     },
-                                    "required": ["room_id", "category"],
-                                },
-                            }
+                                }
+                            },
+                            "required": ["results"],
                         },
-                        "required": ["results"],
-                    },
-                ),
-            )
+                    ),
+                )
             if not response.text:
                 raise RuntimeError("Gemini가 빈 응답을 반환함")
 

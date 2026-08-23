@@ -26,6 +26,7 @@ from typing import Any
 from rclpy.logging import get_logger
 
 from sysnav import config
+from sysnav.activity_log import LLM, activity
 from sysnav.task.query_parser import extract_target
 
 _RESPONSE_SCHEMA = {
@@ -51,6 +52,10 @@ _RESPONSE_SCHEMA = {
 _RELATION_ALIASES = {
     "closest_to": "nearest",
     "nearest_to": "nearest",
+    "farthest_from": "farthest",
+    "furthest_from": "farthest",
+    "farthest": "farthest",
+    "furthest": "farthest",
     "next_to": "beside",
 }
 
@@ -76,7 +81,7 @@ Rules:
   counted) - never include "how many"/"count"/"the number of" or the verb
   "is"/"are"/"was"/"were" in target.
 - Each constraint has a canonical snake_case relation (near, beside, left_of,
-  right_of, in_front_of, behind, on, under, above, between, nearest) and concrete
+  right_of, in_front_of, behind, on, under, above, between, nearest, farthest) and concrete
   reference object categories.
 - Keep multiword categories intact (e.g. "trash can", "knife rack").
 - Do not invent objects or constraints that are not stated in the instruction.
@@ -179,15 +184,16 @@ class LLMQueryParser:
             self._load()
             from google.genai import types
 
-            response = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=_PROMPT_TEMPLATE.format(question=question),
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema=_RESPONSE_SCHEMA,
-                ),
-            )
+            with activity.operation(LLM, "Gemini 질문 파싱"):
+                response = self._client.models.generate_content(
+                    model=config.GEMINI_MODEL,
+                    contents=_PROMPT_TEMPLATE.format(question=question),
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                        response_schema=_RESPONSE_SCHEMA,
+                    ),
+                )
             if not response.text:
                 raise RuntimeError("Gemini가 빈 응답을 반환함")
             parsed = normalize_llm_result(question, json.loads(response.text))

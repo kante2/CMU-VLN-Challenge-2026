@@ -52,6 +52,12 @@ class _SceneGraph:
     def snapshot(self):
         return {"objects": list(self.candidates)}
 
+    @staticmethod
+    def resolve_relation_chain(task):
+        # 이 픽스처의 task에는 관계 체인이 없어 조기 종료가 걸리지 않는다.
+        # (조기 종료 자체는 tests/test_mission2_early_answer.py가 검증한다.)
+        return []
+
 
 class _CoveragePlanner:
     @staticmethod
@@ -65,9 +71,11 @@ class _Node:
         self.state = "OBSERVE"
         self.exploration_route = deque([{"x": 1.0}])
         self.mission2_exploration_complete = False
+        self.mission2_answer_object_id = None
         self.object_memory = _ObjectMemory(candidates)
         self.scene_graph = _SceneGraph(candidates)
         self.coverage_planner = _CoveragePlanner()
+        self.task = {"target": "pillows"}
         self.logger = _Logger()
 
     def get_logger(self):
@@ -116,7 +124,8 @@ class Mission2ExploreFirstTest(unittest.TestCase):
         node.mission2_exploration_complete = True
         mission2_pipe._give_up_target(node)
         self.assertTrue(node.target_navigation_cleared)
-        self.assertEqual(node.state, "FAILED")
+        self.assertEqual(node.state, "FAILED",
+                         "답을 아직 못 냈으므로 도달 실패는 진짜 실패다")
 
 
 if __name__ == "__main__":

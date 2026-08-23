@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import cv2
 import numpy as np
 from rclpy.logging import get_logger
 
 from sysnav import config
+from sysnav.activity_log import LLM, activity
 
 
 class DetectionVerifier:
@@ -24,6 +26,32 @@ class DetectionVerifier:
         self.api_key = os.getenv("GEMINI_API_KEY")
         self._client = None
         self._logger = get_logger("sysnav_detection_verifier")
+        # (카테고리, 양자화 bbox) -> (판정, 기록 시각). config.DETECTION_VERIFICATION_
+        # CACHE_TTL_SEC 주석 참고 - 같은 박스를 매 프레임 다시 묻는 것을 막는다.
+        self._cache: dict[tuple, tuple[bool, float]] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    @staticmethod
+    def _cache_key(detection: dict) -> tuple:
+        quant = max(1, int(config.DETECTION_VERIFICATION_CACHE_BBOX_QUANT_PX))
+        x1, y1, x2, y2 = detection["bbox"]
+        return (
+            str(detection["category"]).lower(),
+            int(x1) // quant, int(y1) // quant, int(x2) // quant, int(y2) // quant,
+        )
+
+    def _cached(self, detection: dict) -> bool | None:
+        entry = self._cache.get(self._cache_key(detection))
+        if entry is None:
+            return None
+        verdict, stored_at = entry
+        if time.monotonic() - stored_at > config.DETECTION_VERIFICATION_CACHE_TTL_SEC:
+            return None
+        return verdict
+
+    def _remember(self, detection: dict, verdict: bool) -> None:
+        self._cache[self._cache_key(detection)] = (verdict, time.monotonic())
 
     def _load(self) -> None:
         if self._client is not None:
@@ -71,14 +99,36 @@ class DetectionVerifier:
         if not config.DETECTION_VERIFICATION_ENABLED or not self.api_key:
             return [True] * len(detections)
 
+        # 이미 같은 박스를 물어봤으면 그 답을 재사용한다. 같은 입력이니 같은 답이고,
+        # 프레임마다 반복되는 왕복(실측 45초 중 30초)을 그대로 없앤다.
+        #
+        # 이 블록도 반드시 try 안이어야 한다 - 밖에 두면 detection 형태가 예상과 다를 때
+        # (예: bbox 키 없음) 예외가 그대로 올라가 perception job을 죽인다. 이 클래스의
+        # 계약은 "검증이 실패해도 원래 탐지를 막지 않는다"(fail-open)이다.
+        # results는 항상 detections와 같은 길이를 유지한다 - 호출 측이 인덱스로 짝지으므로
+        # 중간에 예외가 나도 길이가 달라지면 안 된다.
+        results: list[bool | None] = [None] * len(detections)
+        pending: list[int] = []
         try:
+            for index, detection in enumerate(detections):
+                cached = self._cached(detection)
+                results[index] = cached
+                if cached is None:
+                    pending.append(index)
+            self.cache_hits += len(detections) - len(pending)
+            self.cache_misses += len(pending)
+            if not pending:
+                return [bool(value) for value in results]
+
+            asked = [detections[index] for index in pending]
+
             self._load()
             from google.genai import types
 
-            annotated = self._annotate(image_rgb, detections)
+            annotated = self._annotate(image_rgb, asked)
             candidates = [
-                {"index": index, "category": detection["category"]}
-                for index, detection in enumerate(detections)
+                {"index": position, "category": detection["category"]}
+                for position, detection in enumerate(asked)
             ]
             prompt = f"""
 You double-check low-confidence object detections for a mobile robot's perception
@@ -90,43 +140,47 @@ inside that specific box. Set confirmed=true only when the label clearly matches
 If the box actually shows a different or generic object, or you are unsure, set
 confirmed=false. Judge each box only by its own contents, not the rest of the scene.
 """.strip()
-            response = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=[
-                    prompt,
-                    types.Part.from_bytes(data=self._jpeg(annotated), mime_type="image/jpeg"),
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "object",
-                        "properties": {
-                            "results": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "index": {"type": "integer"},
-                                        "confirmed": {"type": "boolean"},
+            with activity.operation(LLM, "Gemini 검출 재확인"):
+                response = self._client.models.generate_content(
+                    model=config.GEMINI_MODEL,
+                    contents=[
+                        prompt,
+                        types.Part.from_bytes(data=self._jpeg(annotated), mime_type="image/jpeg"),
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                        response_schema={
+                            "type": "object",
+                            "properties": {
+                                "results": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "index": {"type": "integer"},
+                                            "confirmed": {"type": "boolean"},
+                                        },
+                                        "required": ["index", "confirmed"],
                                     },
-                                    "required": ["index", "confirmed"],
-                                },
-                            }
+                                }
+                            },
+                            "required": ["results"],
                         },
-                        "required": ["results"],
-                    },
-                ),
-            )
+                    ),
+                )
             if not response.text:
-                return [True] * len(detections)
+                return [True if value is None else value for value in results]
 
-            confirmed_by_index = {
+            confirmed_by_position = {
                 int(item["index"]): bool(item["confirmed"])
                 for item in json.loads(response.text).get("results", [])
                 if "index" in item
             }
-            results = [confirmed_by_index.get(index, True) for index in range(len(detections))]
+            for position, index in enumerate(pending):
+                verdict = confirmed_by_position.get(position, True)
+                results[index] = verdict
+                self._remember(detections[index], verdict)
             rejected = [
                 f"{detections[index]['category']}#{index}"
                 for index, ok in enumerate(results)
@@ -134,7 +188,8 @@ confirmed=false. Judge each box only by its own contents, not the rest of the sc
             ]
             if rejected:
                 self._logger.info(f"Detection verification rejected: {rejected}")
-            return results
+            return [True if value is None else value for value in results]
         except Exception as error:
+            # fail-open. 실패는 캐시에 남기지 않는다 - 다음 프레임엔 다시 시도해야 한다.
             self._logger.warning(f"Detection verification skipped (fail-open): {error}")
-            return [True] * len(detections)
+            return [True if value is None else value for value in results]

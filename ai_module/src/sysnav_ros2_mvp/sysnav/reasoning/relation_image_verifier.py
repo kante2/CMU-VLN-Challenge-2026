@@ -25,6 +25,7 @@ import numpy as np
 from rclpy.logging import get_logger
 
 from sysnav import config
+from sysnav.activity_log import LLM, activity
 
 
 class RelationImageVerifier:
@@ -89,31 +90,32 @@ class RelationImageVerifier:
                     )
                 )
 
-            response = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "object",
-                        "properties": {
-                            "results": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "object_id": {"type": "integer"},
-                                        "holds": {"type": "boolean"},
+            with activity.operation(LLM, "Gemini 관계 이미지 검증"):
+                response = self._client.models.generate_content(
+                    model=config.GEMINI_MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                        response_schema={
+                            "type": "object",
+                            "properties": {
+                                "results": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "object_id": {"type": "integer"},
+                                            "holds": {"type": "boolean"},
+                                        },
+                                        "required": ["object_id", "holds"],
                                     },
-                                    "required": ["object_id", "holds"],
-                                },
-                            }
+                                }
+                            },
+                            "required": ["results"],
                         },
-                        "required": ["results"],
-                    },
-                ),
-            )
+                    ),
+                )
             if not response.text:
                 raise RuntimeError("Gemini가 빈 응답을 반환함")
             allowed = {int(candidate["object_id"]) for candidate in usable}
@@ -128,7 +130,9 @@ class RelationImageVerifier:
             self._logger.warning(f"Relation image verification skipped (unverified, not fail-open): {error}")
             return set()
 
-    def rank_nearest(self, candidates: list[dict], reference_category: str) -> int | None:
+    def rank_superlative(
+        self, candidates: list[dict], reference_category: str, relation: str = "nearest"
+    ) -> int | None:
         """"nearest"/"closest"는 최상급(비교) relation이라 verify()처럼 후보마다
         독립적으로 yes/no만 물어보면 안 된다 - 예를 들어 bedside table이 2개 있고
         둘 다 사진에 창문이 보이면 둘 다 "yes"가 나와서 어느 게 진짜 더 가까운지
@@ -147,9 +151,11 @@ class RelationImageVerifier:
             self._load()
             from google.genai import types
 
+            farthest = relation in ("farthest", "furthest")
+            wording = "farthest from" if farthest else "closest to"
             contents: list[object] = [
                 "Each image below shows a different candidate object and its surrounding "
-                f"context. Decide which single candidate is closest to a {reference_category} "
+                f"context. Decide which single candidate is {wording} a {reference_category} "
                 f"visible in its own photo. If a candidate's photo doesn't show a "
                 f"{reference_category} at all, it cannot be the answer. If none of the "
                 f"candidates show a {reference_category}, set reference_visible_in_any to "
@@ -164,22 +170,23 @@ class RelationImageVerifier:
                     )
                 )
 
-            response = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "object",
-                        "properties": {
-                            "object_id": {"type": "integer"},
-                            "reference_visible_in_any": {"type": "boolean"},
+            with activity.operation(LLM, "Gemini 관계 이미지 검증"):
+                response = self._client.models.generate_content(
+                    model=config.GEMINI_MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                        response_schema={
+                            "type": "object",
+                            "properties": {
+                                "object_id": {"type": "integer"},
+                                "reference_visible_in_any": {"type": "boolean"},
+                            },
+                            "required": ["object_id", "reference_visible_in_any"],
                         },
-                        "required": ["object_id", "reference_visible_in_any"],
-                    },
-                ),
-            )
+                    ),
+                )
             if not response.text:
                 raise RuntimeError("Gemini가 빈 응답을 반환함")
             result = json.loads(response.text)

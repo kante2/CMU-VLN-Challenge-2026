@@ -100,6 +100,80 @@ class CoveragePlanner:
         with self._lock:
             return self.max_height.copy()
 
+    def occupancy_snapshot(self) -> tuple[np.ndarray, float, float, float] | None:
+        """(grid, origin_x, origin_y, resolution). 원점이 아직 없으면 None.
+
+        ROS 메시지로 만드는 건 호출 측(sysnav_node)이 한다 - 이 모듈은 ROS에 의존하지
+        않게 유지한다(테스트가 ROS 없이 돈다)."""
+        with self._lock:
+            if self.origin_x is None or self.origin_y is None:
+                return None
+            return self.grid.copy(), float(self.origin_x), float(self.origin_y), self.resolution
+
+    def frontier_points_world(self) -> list[tuple[float, float]]:
+        """현재 frontier 셀들의 world 좌표. RViz 표시용."""
+        with self._lock:
+            if self.origin_x is None:
+                return []
+            mask = self.frontier_extractor._mask(self.grid)
+            origin_x, origin_y, res = self.origin_x, self.origin_y, self.resolution
+        return [
+            (float(origin_x + (col + 0.5) * res), float(origin_y + (row + 0.5) * res))
+            for row, col in np.argwhere(mask)
+        ]
+
+    def clear_distance_along(
+        self,
+        start_xy: tuple[float, float],
+        direction: tuple[float, float],
+        max_distance_m: float,
+    ) -> float:
+        """start_xy에서 direction 방향으로 벽을 만나기 전까지 뚫려 있는 거리.
+
+        UNKNOWN은 막지 않는다 - 탐색은 미지 영역으로 가는 게 목적이라 "아직 안 본 곳"을
+        벽으로 치면 던질 수 있는 방향이 하나도 안 남는다. (A*의 traversable 판정은
+        반대로 unknown을 통과 불가로 본다 - 기준이 다르다.)
+        """
+        norm = math.hypot(float(direction[0]), float(direction[1]))
+        if norm < 1e-6:
+            return 0.0
+        ux, uy = float(direction[0]) / norm, float(direction[1]) / norm
+        with self._lock:
+            if self.origin_x is None:
+                return 0.0
+            grid = self.grid
+            distance = 0.0
+            while distance <= max_distance_m:
+                cell = self.world_to_grid(
+                    start_xy[0] + ux * distance, start_xy[1] + uy * distance
+                )
+                if cell is None or grid[cell] == config.OCC_OCCUPIED:
+                    return distance
+                distance += self.resolution
+        return float(max_distance_m)
+
+    def map_stats(self) -> dict:
+        """대시보드용 occupancy grid 요약. deepcopy 없이 numpy 카운트만 하므로
+        대시보드 주기(1초)로 불러도 부담이 없다."""
+        with self._lock:
+            grid = self.grid
+            free = int(np.count_nonzero(grid == config.OCC_FREE))
+            occupied = int(np.count_nonzero(grid == config.OCC_OCCUPIED))
+            origin_ready = self.origin_x is not None
+            frontier = int(np.count_nonzero(self.frontier_extractor._mask(grid)))
+        cell_area = self.resolution * self.resolution
+        return {
+            "origin_ready": origin_ready,
+            "free_cells": free,
+            "occupied_cells": occupied,
+            "mapped_cells": free + occupied,
+            "free_area_m2": free * cell_area,
+            "mapped_area_m2": (free + occupied) * cell_area,
+            "frontier_cells": frontier,
+            "resolution_m": self.resolution,
+            "grid_span_m": self.size_cells * self.resolution,
+        }
+
     def surface_point_mask(self, grid: np.ndarray) -> np.ndarray:
         """논문의 surface point set S(free/non-free 경계) - plan_route()가 candidate
         점수(wcov)를 매길 때 쓰는 것과 동일한 마스크. 디버그 시각화 전용으로 외부에
@@ -156,24 +230,65 @@ class CoveragePlanner:
                 & (points_base[:, 2] <= config.MAP_OBSTACLE_Z_MAX_M)
             )
             points_base = points_base[valid]
-            if len(points_base) > config.MAP_MAX_RAYS_PER_SCAN:
-                points_base = points_base[np.linspace(0, len(points_base) - 1, config.MAP_MAX_RAYS_PER_SCAN, dtype=np.int64)]
-
+            # 여기서 서브샘플링하면 안 된다. 아래 방위각별 최단거리 선별이 "그 방향에서
+            # 가장 가까운 장애물"을 찾는 건데, 미리 point를 솎아내면 정작 가구를 맞힌
+            # point가 빠져서 그 뒤가 다시 free로 칠해진다(실측: 46000점을 1200점으로
+            # 줄이자 가구 차폐가 전혀 안 걸렸다). 광선 수는 MAP_AZIMUTH_BINS로 상한이
+            # 잡히므로 별도 제한이 필요 없다.
             yaw = float(pose["yaw"])
             x_map = math.cos(yaw) * points_base[:, 0] - math.sin(yaw) * points_base[:, 1] + float(pose["x"])
             y_map = math.sin(yaw) * points_base[:, 0] + math.cos(yaw) * points_base[:, 1] + float(pose["y"])
+
+            # (1) max_height: **모든** 유효 point로 갱신한다. RoomSegmenter가 "진짜 벽"을
+            #     가릴 때 쓰는 값이라(ROOM_WALL_MIN_HEIGHT_M) 벽 윗부분 point가 필요하다.
+            #     아래 폐색 판정처럼 방위각별 최단 point만 쓰면 늘 벽의 가장 낮은 부분만
+            #     기록돼 max_height가 0 근처에 머물고 벽이 하나도 안 잡힌다(실측으로 확인).
+            #     point가 수만~수십만이라 파이썬 루프면 스캔 3회에 17초가 걸린다 -
+            #     np.maximum.at으로 벡터화한다(같은 조건에서 10ms).
+            cols = np.floor((x_map - self.origin_x) / self.resolution).astype(np.int64)
+            rows = np.floor((y_map - self.origin_y) / self.resolution).astype(np.int64)
+            inside = (
+                (rows >= 0) & (rows < self.size_cells)
+                & (cols >= 0) & (cols < self.size_cells)
+            )
+            if inside.any():
+                np.maximum.at(
+                    self.max_height,
+                    (rows[inside], cols[inside]),
+                    points_base[inside, 2].astype(np.float32),
+                )
+
+            # (2) free/occupied는 얇은 수평 띠 + 방위각별 최단거리로만 판정한다.
+            #     - 얇은 띠(config.MAP_FREE_Z_MAX_M): 가구 위로 넘어간 광선을 배제
+            #     - 방위각별 최단거리: 그 방향에서 가장 가까운 장애물 뒤는 관측된 적이
+            #       없으므로 UNKNOWN으로 남긴다(3D 스캔을 2D 슬라이스로 환원하는 것)
+            occlusion = (
+                (points_base[:, 2] >= config.MAP_FREE_Z_MIN_M)
+                & (points_base[:, 2] <= config.MAP_FREE_Z_MAX_M)
+            )
+            if not occlusion.any():
+                return
+            ox, oy = x_map[occlusion], y_map[occlusion]
+            azimuth = np.arctan2(oy - float(pose["y"]), ox - float(pose["x"]))
+            ranges_map = np.hypot(ox - float(pose["x"]), oy - float(pose["y"]))
+            bin_count = int(config.MAP_AZIMUTH_BINS)
+            bins = np.clip(
+                ((azimuth + math.pi) / (2 * math.pi) * bin_count).astype(np.int64),
+                0, bin_count - 1,
+            )
+            order = np.lexsort((ranges_map, bins))
+            bins_sorted = bins[order]
+            first = np.ones(len(bins_sorted), dtype=bool)
+            first[1:] = bins_sorted[1:] != bins_sorted[:-1]
+
             endpoints = []
-            for x, y, z in zip(x_map, y_map, points_base[:, 2]):
-                endpoint = self.world_to_grid(float(x), float(y))
+            for index in order[first]:
+                endpoint = self.world_to_grid(float(ox[index]), float(oy[index]))
                 if endpoint is None:
                     continue
                 ray = _bresenham(robot_cell[0], robot_cell[1], endpoint[0], endpoint[1])
-                # 이미 벽으로 확정된 셀을 만나면 ray를 거기서 멈춘다 - 실제 LiDAR는
-                # 벽을 못 뚫으므로, 이 point가 그 벽 너머까지 도달했다는 건(반사 노이즈,
-                # multi-path, 혹은 Unity raycast가 얇은 콜라이더를 놓친 경우 등 원인이
-                # 뭐든) 신뢰할 수 없다는 뜻이다. 예전엔 "그 한 칸만 안 덮어쓰고" 계속
-                # 진행해서 벽 너머 공간을 통째로 free로 잘못 마킹했었다(탐색 디버그
-                # 이미지에서 벽을 뚫고 나가는 것처럼 보이는 frontier의 원인).
+                # 이미 벽으로 확정된 셀을 만나면 ray를 거기서 멈춘다 - 실제 LiDAR는 벽을
+                # 못 뚫으므로, point가 그 너머까지 도달했다는 건 신뢰할 수 없다는 뜻이다.
                 blocked = False
                 for row, col in ray[:-1]:
                     if self.grid[row, col] == config.OCC_OCCUPIED:
@@ -181,12 +296,10 @@ class CoveragePlanner:
                         break
                     self.grid[row, col] = config.OCC_FREE
                 if blocked:
-                    continue  # 벽 너머로 찍힌 것으로 추정되는 endpoint도 신뢰 안 함(occupied로도 안 찍음)
-                endpoints.append((endpoint[0], endpoint[1], float(z)))
-            for row, col, z in endpoints:
+                    continue
+                endpoints.append(endpoint)
+            for row, col in endpoints:
                 self.grid[row, col] = config.OCC_OCCUPIED
-                if z > self.max_height[row, col]:
-                    self.max_height[row, col] = z
             rr, cc = robot_cell
             radius = max(1, int(round(0.35 / self.resolution)))
             self.grid[max(0, rr - radius):min(self.size_cells, rr + radius + 1), max(0, cc - radius):min(self.size_cells, cc + radius + 1)] = config.OCC_FREE
@@ -254,24 +367,36 @@ class CoveragePlanner:
         return min(candidates)[1] if candidates else None
 
     @staticmethod
-    def _room_scoped_traversable(
-        traversable: np.ndarray,
-        robot_cell: tuple[int, int],
-        room_segmentation: dict | None,
-    ) -> np.ndarray:
-        """room_segmentation(room_segmenter.RoomSegmenter.segment()의 결과)에서 로봇이
-        지금 있는 방의 room_id를 찾아, traversable을 그 방 mask로만 제한한다. room
-        segmentation이 없거나(아직 계산 전) 로봇 위치가 어느 방으로도 분류 안 됐으면
-        (예: 문 한복판, watershed boundary) 원래 traversable을 그대로 반환한다."""
-        if not room_segmentation:
-            return traversable
-        labels = room_segmentation.get("labels")
-        if labels is None or labels.shape != traversable.shape:
-            return traversable
-        room_id = CoveragePlanner._active_room_id(robot_cell, room_segmentation)
-        if room_id is None:
-            return traversable
-        return traversable & (labels == room_id)
+    def _active_room_mask(labels: np.ndarray, active_room_id: int) -> np.ndarray:
+        """active_room_id에 속한 셀 + "다른 어떤 방보다 이 방에 더 가까운" 미라벨 경계 띠.
+
+        RoomSegmenter의 watershed는 unknown/벽을 배경 marker로 잡아서, 경계 주변에 어느
+        방에도 속하지 않는 띠를 남긴다(실측 폭 0.3~1.1m, known-free의 40% 이상). frontier는
+        정의상 free/unknown 경계(FrontierExtractor._mask)라 전부 그 띠 안에 있고, 예전처럼
+        `labels == room_id`를 1셀(0.20m)만 dilate해서 쓰면 방 안 frontier가 0개가 되어
+        "이 방 다 봤다"로 탐색이 조기 종료됐다(실측: frontier 102개 중 0개 통과).
+
+        단순히 dilate 반경만 키우면 옆방 frontier까지 빨아들여서 room scoping의 목적
+        (후보 pool을 지금 방 크기로 고정)이 깨지므로, 두 distance transform을 비교해서
+        "이 방 쪽" 띠만 남긴다.
+        """
+        active = labels == active_room_id
+        if not active.any():
+            return active
+        radius = config.ROOM_FRONTIER_ASSIGN_RADIUS_M / float(config.MAP_RESOLUTION_M)
+        # distanceTransform은 "0이 아닌 셀에서 가장 가까운 0 셀까지의 거리"를 준다 -
+        # 방 mask를 반전시켜 넣으면 각 셀에서 그 방까지의 거리가 나온다.
+        distance_to_active = cv2.distanceTransform(
+            (~active).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        within_radius = distance_to_active <= radius
+        other = (labels > 0) & ~active
+        if not other.any():
+            return within_radius
+        distance_to_other = cv2.distanceTransform(
+            (~other).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        return within_radius & (distance_to_active <= distance_to_other)
 
     @staticmethod
     def _astar_path(traversable: np.ndarray, start: tuple[int, int], goal: tuple[int, int]) -> list[tuple[int, int]] | None:
@@ -484,7 +609,15 @@ class CoveragePlanner:
         robot_pose: dict,
         viewpoint_memory: ViewpointMemory,
         room_segmentation: dict | None = None,
+        forbidden_mask: np.ndarray | None = None,
     ) -> list[dict]:
+        """forbidden_mask: mission3의 "avoiding the path near/between X" 제약 영역.
+
+        탐사 경로도 이 영역을 피해야 한다. 예전엔 목적지 주행(plan_direct_path)에만
+        적용해서, "결정 전에 방을 다 돌아본다"는 흐름에서 탐사가 금지구역을 그대로
+        지나갈 수 있었다 - README 채점의 감점 항목("passes through areas it is forbidden
+        to go through")은 목적지 주행이 아니라 **실제 주행 궤적 전체**를 본다.
+        """
         diag: dict = {}
         with self._lock:
             grid = self.grid.copy()
@@ -495,6 +628,12 @@ class CoveragePlanner:
         if robot_cell is None:
             return self._fail(diag, "robot_cell_out_of_map")
         traversable, inflated = self._build_traversable(grid)
+        # 금지구역은 통행 불가로 취급한다 - 후보 샘플링과 A* 둘 다 여기서 갈린다.
+        diag["forbidden_active"] = False
+        if forbidden_mask is not None and forbidden_mask.shape == traversable.shape:
+            traversable = traversable & (~forbidden_mask)
+            diag["forbidden_active"] = True
+            diag["forbidden_cell_count"] = int(forbidden_mask.sum())
         occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
         start = self._nearest_traversable(traversable, *robot_cell, radius=10)
         diag["robot_cell"] = robot_cell
@@ -512,23 +651,58 @@ class CoveragePlanner:
         # 스치기만 해도 안 보인다고 잘못 판정돼서 coverage 점수가 0이 돼버린다(문 근처
         # frontier가 이래서 계속 후보에서 못 뽑히는 원인이 됐었다). 그래서 LOS 차단에는
         # 대각선 코너 스침만 막을 정도의 작은 margin만 쓴다.
-        los_margin = max(1, int(round(config.FRONTIER_LOS_WALL_MARGIN_M / self.resolution)))
-        los_blocking = cv2.dilate(occupied, np.ones((2 * los_margin + 1, 2 * los_margin + 1), np.uint8)).astype(bool)
+        # max(1, ...)로 하한을 두면 안 된다 - 셀이 0.20m라 margin이 0.15든 0.20이든 똑같이
+        # 1셀이 되어 LOS 마스크가 위 inflated(=ROBOT_CLEARANCE_M 팽창)와 완전히 같아진다.
+        # 그러면 위 주석이 막으려던 바로 그 오판이 그대로 일어난다(실측: frontier 0.4m 앞에
+        # 선 anchor 7개 중 5개가 "안 보임"으로 떨어져 scov가 전부 0이 됐다).
+        los_margin = int(round(config.FRONTIER_LOS_WALL_MARGIN_M / self.resolution))
+        los_blocking = (
+            occupied.astype(bool)
+            if los_margin <= 0
+            else cv2.dilate(
+                occupied, np.ones((2 * los_margin + 1, 2 * los_margin + 1), np.uint8)
+            ).astype(bool)
+        )
 
         active_room_id = self._active_room_id(robot_cell, room_segmentation)
-        diag["active_room_id"] = active_room_id
-        diag["room_scope_active"] = active_room_id is not None
+        diag["fell_back_to_whole_map"] = False
 
         # 논문의 surface point set S: free / non-free(occupied+unknown) 경계. 방이
         # 분할된 뒤에는 현재 room mask에 속한 surface만 남긴다. 예전 구현은 candidate만
         # 현재 방으로 제한하고 score/anchor는 집 전체 frontier를 사용해서, 방을 다 봐도
         # 다른 방의 frontier를 쫓아 나가 room-query 단계가 사실상 실행되지 않았다.
         frontier_mask = self.frontier_extractor._mask(grid)
+        room_mask = None
         if active_room_id is not None:
-            labels = room_segmentation["labels"]
-            room_mask = labels == active_room_id
-            room_margin = cv2.dilate(room_mask.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
-            frontier_mask = frontier_mask & room_margin
+            room_mask = self._active_room_mask(room_segmentation["labels"], active_room_id)
+            scoped_frontier = frontier_mask & room_mask
+            # 안전망: room segmentation이 어긋나서 방 안 frontier가 0개가 됐는데 전역엔
+            # 아직 남아있다면, "이 방 다 봤다"로 끝내지 말고 room scope를 풀고 계속한다.
+            # 방 판정 문제 하나가 탐색을 영구 정지시키면 안 된다(mission3는 빈 route를
+            # 곧바로 FAILED로 해석하므로 태스크 자체가 죽는다).
+            if not scoped_frontier.any() and frontier_mask.any():
+                active_room_id = None
+                room_mask = None
+                diag["fell_back_to_whole_map"] = True
+            else:
+                frontier_mask = scoped_frontier
+
+        diag["active_room_id"] = active_room_id
+        diag["room_scope_active"] = active_room_id is not None
+
+        def drop_room_scope() -> tuple[np.ndarray, np.ndarray]:
+            """이번 사이클에 room scope가 쓸모없다고 판명됐을 때 완전히 풀고 전체 맵으로
+            돌아간다. active_room_id까지 같이 비워야 아래 diag["room_complete"]가 "이 방을
+            다 봤다"고 잘못 주장하지 않는다(그 플래그를 sysnav_node가 방 완료 확정과
+            cross-room 이동 판단에 그대로 쓴다)."""
+            nonlocal active_room_id, room_mask
+            active_room_id = None
+            room_mask = None
+            diag["active_room_id"] = None
+            diag["room_scope_active"] = False
+            diag["fell_back_to_whole_map"] = True
+            return traversable, np.argwhere(traversable)
+
         surface_points = {tuple(cell) for cell in np.argwhere(frontier_mask)}
         diag["surface_point_count"] = len(surface_points)
         diag["room_surface_point_count"] = len(surface_points)
@@ -554,25 +728,23 @@ class CoveragePlanner:
         # 남은 frontier(예: 문 하나)가 작고 멀면 운 나쁘게 계속 못 뽑아서 "후보가 하나도 없다"
         # (No reachable frontier remains)로 잘못 실패하는 경우가 생겼다. 방 안으로 제한하면
         # 맵 전체가 아무리 커져도 후보 pool은 "지금 방 크기"로 고정돼서 이 문제가 없다.
-        active_traversable = self._room_scoped_traversable(traversable, robot_cell, room_segmentation)
+        active_traversable = traversable if room_mask is None else (traversable & room_mask)
         traversable_cells = np.argwhere(active_traversable)
         diag["room_scoped_traversable_cell_count"] = len(traversable_cells)
-        diag["fell_back_to_whole_map"] = False
-        if len(traversable_cells) == 0:
-            if active_room_id is None:
-                active_traversable = traversable
-                traversable_cells = np.argwhere(traversable)
-                diag["fell_back_to_whole_map"] = True
-            else:
-                diag["room_complete"] = True
-                return self._fail(diag, "no_traversable_cells_in_active_room")
-        if active_room_id is not None:
+        if len(traversable_cells) == 0 and room_mask is not None:
+            # 방 mask 안에 설 자리가 하나도 없다 - 위 frontier 폴백과 같은 이유로 실패
+            # 시키지 않고 전체 맵으로 돌아간다.
+            active_traversable, traversable_cells = drop_room_scope()
+        if room_mask is not None:
             room_start = self._nearest_traversable(active_traversable, *robot_cell, radius=10)
             if room_start is None:
-                diag["room_complete"] = True
-                return self._fail(diag, "robot_not_near_traversable_cell_in_active_room")
-            start = room_start
-            diag["start_cell"] = start
+                # 방 mask 안에서는 출발점을 못 잡았다 - 여기서 실패시키면 방 판정 오류가
+                # 또 탐색 영구 정지가 되므로 전체 맵으로 되돌린다 (whole-map `start`는
+                # 이미 위에서 구해둔 것이 그대로 유효하다).
+                active_traversable, traversable_cells = drop_room_scope()
+            else:
+                start = room_start
+                diag["start_cell"] = start
         diag["active_traversable_cell_count"] = len(traversable_cells)
         if len(traversable_cells) == 0:
             return self._fail(diag, "no_traversable_cells_anywhere")
