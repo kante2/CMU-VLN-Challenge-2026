@@ -12,7 +12,7 @@ stop at the vase between the TV and the door." - avoid 절이 없어 global_forb
 
 import unittest
 
-from sysnav.mission_dashboard import _mission_detail_rows
+from sysnav.mission_dashboard import _mission_detail_rows, _target_panel
 
 
 def _snapshot(**overrides):
@@ -79,3 +79,54 @@ class OtherMissionRowsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TargetDistancePanelTest(unittest.TestCase):
+    """목표가 정해진 뒤 "어디로, 얼마나 남았나"를 대시보드에서 바로 읽을 수 있어야 한다.
+
+    예전에는 좌표 한 줄(dest=..., dist=...)뿐이라, 목적지는 도착 반경 안인데 물체는
+    아직 먼 상황과 중간 hop을 도는 상황이 구분되지 않았다.
+    """
+
+    _POSE = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+    _FULL = {
+        "pose": _POSE,
+        "target_goal_xy": (3.0, 4.0),          # 로봇에서 5m
+        "target_distance_m": 5.0,
+        "target_object_xy": (6.0, 8.0),        # 로봇에서 10m
+        "target_object_distance_m": 10.0,
+        "target_success_radius_m": 1.0,
+        "target_hops_remaining": 2,
+        "target_replans": 3,
+        "target_best_distance_m": 4.8,
+        "target_no_progress_sec": 7.0,
+        "current_goal": {"x": 1.0, "y": 0.0, "type": "target"},
+    }
+
+    def test_no_goal_yet(self):
+        self.assertIn("아직 목표가 정해지지", _target_panel({"pose": self._POSE}))
+
+    def test_shows_coordinate_and_distance_for_each_goal(self):
+        panel = _target_panel(self._FULL)
+        self.assertIn("(3.00, 4.00)", panel)
+        self.assertIn("5.00 m", panel)
+        self.assertIn("(6.00, 8.00)", panel)
+        self.assertIn("10.00 m", panel)
+        # 현재 발행 goal까지의 거리는 pose로 직접 계산한다(스냅샷에 없는 값).
+        self.assertIn("(1.00, 0.00)", panel)
+        self.assertIn("1.00 m", panel)
+
+    def test_remaining_distance_uses_mission_success_radius(self):
+        self.assertIn("도착까지 4.00 m", _target_panel(self._FULL))
+        arrived = _target_panel({**self._FULL, "target_distance_m": 0.7})
+        self.assertNotIn("도착까지", arrived)
+
+    def test_stall_is_visible(self):
+        panel = _target_panel(self._FULL)
+        self.assertIn("7초째 정체", panel)
+        self.assertIn("재계획 3회", panel)
+
+    def test_missing_optional_fields_do_not_raise(self):
+        # 목표만 있고 나머지가 아직 안 채워진 tick에서도 렌더링은 죽으면 안 된다.
+        panel = _target_panel({"target_goal_xy": (1.0, 2.0)})
+        self.assertIn("(1.00, 2.00)", panel)

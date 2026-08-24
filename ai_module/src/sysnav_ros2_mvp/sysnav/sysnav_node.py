@@ -2054,6 +2054,26 @@ class SysNavNode(Node):
             "target_distance_m": None if pose is None else self.distance_to_target(pose),
             "target_hops_remaining": len(self.target_route),
             "target_replans": self._target_replan_count,
+            # 목표까지의 거리를 대시보드에서 바로 읽기 위한 값들. 셋을 나란히 놔야
+            # "왜 아직 도착이 아닌지"가 구분된다: 목적지(=접근 지점)는 도착 반경 안인데
+            # 물체는 아직 먼지, 중간 hop을 도는 중인지, 아니면 아예 전진이 멈췄는지.
+            "target_object_xy": self.target_object_xy,
+            "target_object_distance_m": None if (pose is None or self.target_object_xy is None) else math.hypot(
+                self.target_object_xy[0] - float(pose["x"]),
+                self.target_object_xy[1] - float(pose["y"]),
+            ),
+            # 미션마다 도착 반경이 다르다(mission3는 1.0m, 그 외 0.5m) - 거리만 보고
+            # "왜 아직인가"를 판단하려면 그 기준도 같이 보여야 한다.
+            "target_success_radius_m": (
+                config.MISSION3_TARGET_SUCCESS_DISTANCE_M
+                if (task or {}).get("mission_type") == MISSION_INSTRUCTION_FOLLOWING
+                else config.TARGET_SUCCESS_DISTANCE_M
+            ),
+            # 역대 최단거리와 그 뒤 경과 시간 - 값이 안 줄어든 채 시간만 흐르면
+            # 로봇이 목표를 향해 실제로는 못 가고 있다는 뜻이다(stuck 판정과 같은 값).
+            "target_best_distance_m": self._target_goal_best_distance_m,
+            "target_no_progress_sec": None if self._target_goal_last_progress_time is None
+            else now - self._target_goal_last_progress_time,
             "mission3_step_index": self.mission3_step_index,
             "mission3_forbidden_active": self.mission3_forbidden_mask is not None,
             "mission2_exploration_complete": self.mission2_exploration_complete,

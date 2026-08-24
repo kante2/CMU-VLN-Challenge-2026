@@ -12,6 +12,7 @@ dict -> HTML 문자열 변환만 한다 (다른 *_visualizer.py들과 동일한 
 from __future__ import annotations
 
 import html
+import math
 import os
 import time
 from pathlib import Path
@@ -302,6 +303,110 @@ def _stat(label: str, value: str, hint: str = "") -> str:
     )
 
 
+def _distance_bar(distance_m: float, success_radius_m: float) -> str:
+    """도착 반경 대비 남은 거리. 반경 안이면 초록으로 꽉 찬다.
+
+    막대의 기준 길이는 반경의 8배로 잡는다 - 목적지 주행은 대개 몇 m 단위라 이 정도면
+    "거의 다 왔다/아직 멀다"가 한눈에 구분되고, 그보다 멀면 그냥 가득 찬 막대로 둔다."""
+    span = max(success_radius_m * 8.0, 1e-6)
+    ratio = max(0.0, min(1.0, 1.0 - distance_m / span))
+    inside = distance_m <= success_radius_m
+    color = "#15803d" if inside else ("#b45309" if ratio > 0.5 else "#2563eb")
+    return (
+        f'<div style="width:100%;height:8px;background:#e5e7eb;border-radius:4px;'
+        f'overflow:hidden;margin-top:4px;">'
+        f'<div style="width:{(100.0 if inside else ratio * 100.0):.1f}%;height:100%;'
+        f'background:{color};"></div></div>'
+    )
+
+
+def _distance_tile(label: str, xy, distance_m: float | None, hint: str = "",
+                   success_radius_m: float | None = None) -> str:
+    """좌표와 로봇까지의 거리를 한 타일에 묶는다 - 둘을 따로 보면 매번 눈으로 빼야 한다."""
+    if xy is None:
+        return _stat(label, "-", hint)
+    coordinate = f"({xy[0]:.2f}, {xy[1]:.2f})"
+    distance_text = "-" if distance_m is None else f"{distance_m:.2f} m"
+    bar = (
+        _distance_bar(distance_m, success_radius_m)
+        if distance_m is not None and success_radius_m else ""
+    )
+    return (
+        '<div style="flex:1 1 190px;min-width:190px;padding:10px 12px;background:#f9fafb;'
+        'border-radius:8px;">'
+        f'<div style="color:#6b7280;font-size:11px;">{_esc(label)}</div>'
+        f'<div style="font-family:ui-monospace,monospace;font-size:18px;font-weight:600;'
+        f'margin-top:2px;">{_esc(distance_text)}</div>'
+        f'<div style="color:#6b7280;font-family:ui-monospace,monospace;font-size:12px;'
+        f'margin-top:2px;">{_esc(coordinate)}</div>{bar}'
+        f'<div style="color:#9ca3af;font-size:11px;margin-top:2px;">{_esc(hint)}</div></div>'
+    )
+
+
+def _target_panel(snapshot: dict) -> str:
+    """목표가 정해진 뒤(Mission 2 NAVIGATE_TARGET / Mission 3 NAVIGATE_STEP)의
+    "어디로, 얼마나 남았나".
+
+    좌표만으로는 진행 상황을 못 읽어서 매번 로그를 뒤져야 했다. 세 거리를 나란히
+    두는 이유는 서로 다른 실패를 가리키기 때문이다:
+      - 목적지(접근 지점)까지: 도착 판정에 실제로 쓰이는 거리.
+      - 목표 물체까지: 접근 지점이 물체에서 얼마나 떨어졌는지(= 관측 품질).
+      - 현재 발행 goal까지: forbidden 우회로 중간 hop을 도는 중이면 목적지와 다르다.
+    거리가 안 줄어든 채 시간만 흐르면 "정체"로 따로 표시한다.
+    """
+    target_xy = snapshot.get("target_goal_xy")
+    if not target_xy:
+        return (
+            '<div style="color:#9ca3af;font-size:13px;">아직 목표가 정해지지 않았습니다 '
+            "(탐색 중이거나 대상 선택 전).</div>"
+        )
+
+    radius = snapshot.get("target_success_radius_m")
+    distance = snapshot.get("target_distance_m")
+    remaining = (
+        "도착" if distance is not None and radius and distance <= radius
+        else (f"도착까지 {distance - radius:.2f} m" if distance is not None and radius else "")
+    )
+    tiles = [
+        _distance_tile(
+            "목적지(접근 지점)", target_xy, distance,
+            f"{remaining} / 도착 반경 {radius:.2f} m" if radius else remaining,
+            success_radius_m=radius,
+        ),
+        _distance_tile(
+            "목표 물체", snapshot.get("target_object_xy"),
+            snapshot.get("target_object_distance_m"), "선택된 물체의 3D 위치",
+        ),
+    ]
+
+    goal = snapshot.get("current_goal")
+    pose = snapshot.get("pose")
+    hops = snapshot.get("target_hops_remaining", 0)
+    if goal and pose:
+        goal_xy = (float(goal.get("x", 0.0)), float(goal.get("y", 0.0)))
+        goal_distance = math.hypot(goal_xy[0] - pose["x"], goal_xy[1] - pose["y"])
+        tiles.append(_distance_tile(
+            "현재 발행 goal", goal_xy, goal_distance,
+            f"중간 hop {hops}개 남음" if hops else "목적지를 직접 발행 중",
+        ))
+
+    best = snapshot.get("target_best_distance_m")
+    stalled = snapshot.get("target_no_progress_sec")
+    if best is not None:
+        stalled_text = "-" if stalled is None else f"{stalled:.0f}초째 정체"
+        color = "#b91c1c" if (stalled or 0) >= config.TARGET_RETARGET_GIVEUP_SEC else "#111827"
+        tiles.append(
+            '<div style="flex:1 1 190px;min-width:190px;padding:10px 12px;background:#f9fafb;'
+            'border-radius:8px;">'
+            '<div style="color:#6b7280;font-size:11px;">최단 접근 기록</div>'
+            f'<div style="font-family:ui-monospace,monospace;font-size:18px;font-weight:600;'
+            f'margin-top:2px;color:{color};">{best:.2f} m</div>'
+            f'<div style="color:#9ca3af;font-size:11px;margin-top:6px;">{_esc(stalled_text)} / '
+            f'재계획 {snapshot.get("target_replans", 0)}회</div></div>'
+        )
+    return '<div style="display:flex;flex-wrap:wrap;gap:8px;">' + "".join(tiles) + "</div>"
+
+
 # 대시보드와 같은 폴더(config.DEBUG_DIR)에 노드가 매 사이클 덮어쓰는 지도 그림들.
 # 상대 경로로 걸면 file:// 로 열어도 그대로 보인다(서버 불필요).
 _MAP_IMAGES = [
@@ -427,16 +532,6 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
             f" &nbsp; ours=({requested[0]:.2f}, {requested[1]:.2f})"
             f" &rarr; actual=({actual[0]:.2f}, {actual[1]:.2f})",
         ))
-    target_xy = snapshot.get("target_goal_xy")
-    if target_xy:
-        distance = snapshot.get("target_distance_m")
-        distance_text = "-" if distance is None else f"{distance:.2f}m"
-        rows.append(_row(
-            "Target progress",
-            f"dest=({target_xy[0]:.2f}, {target_xy[1]:.2f}), dist={distance_text}, "
-            f"hops_left={snapshot.get('target_hops_remaining', 0)}, "
-            f"replans={snapshot.get('target_replans', 0)}",
-        ))
 
     doc = f"""<!doctype html>
 <html>
@@ -461,6 +556,10 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
     <table>
       {"".join(rows)}
     </table>
+  </div>
+  <div class="card">
+    <h2>목표까지 거리 <span style="font-weight:400;color:#9ca3af;font-size:12px;">(Mission 2 / 3 - 목표가 정해진 뒤)</span></h2>
+    {_target_panel(snapshot)}
   </div>
   <div class="card">
     <h2>지도 현황</h2>
