@@ -36,6 +36,7 @@ from rclpy.logging import get_logger
 
 from sysnav import config
 from sysnav.activity_log import LLM, activity
+from sysnav.llm_trace import llm_trace
 
 
 class RelationImageVerifier:
@@ -69,6 +70,17 @@ class RelationImageVerifier:
             candidate for candidate in candidates
             if isinstance(candidate.get("context_image"), np.ndarray)
             and candidate["context_image"].size
+        ]
+
+    @staticmethod
+    def _traced_images(usable: list[dict]) -> list[tuple[str, np.ndarray]]:
+        """모델에 올린 그 context_image들을 대시보드용 캡션과 함께 돌려준다."""
+        return [
+            (
+                f"{candidate.get('category', '?')}#{int(candidate['object_id'])} context",
+                candidate["context_image"],
+            )
+            for candidate in usable
         ]
 
     @staticmethod
@@ -196,6 +208,23 @@ class RelationImageVerifier:
                     continue
                 key = self._verify_key(candidate, relation, reference_category)
                 results[object_id] = {key: holds[object_id]}
+            llm_trace.record(
+                kind="관계 이미지 검증",
+                question=f"각 사진에 {reference_category}이(가) {relation_phrase} 보이는가",
+                images=self._traced_images(usable),
+                verdicts=[
+                    (
+                        f"{candidate.get('category', '?')}#{int(candidate['object_id'])}",
+                        holds.get(int(candidate["object_id"])),
+                        "",
+                    )
+                    for candidate in usable
+                ],
+                summary=(
+                    f"통과 {sum(1 for value in holds.values() if value)} / "
+                    f"질의 {len(usable)} (캐시 {cached_count})"
+                ),
+            )
             passed = sorted(object_id for object_id, value in holds.items() if value)
             self._logger.info(
                 f"Relation image verification ({relation} {reference_category}): "
@@ -279,6 +308,16 @@ class RelationImageVerifier:
                 raise RuntimeError("Gemini가 빈 응답을 반환함")
             result = json.loads(response.text)
             if not result.get("reference_visible_in_any"):
+                llm_trace.record(
+                    kind="관계 이미지 최상급 비교",
+                    question=f"어느 후보가 {wording} a {reference_category}",
+                    images=self._traced_images(usable),
+                    verdicts=[
+                        (f"{candidate.get('category', '?')}#{int(candidate['object_id'])}", False, "")
+                        for candidate in usable
+                    ],
+                    summary=f"어느 후보 사진에도 {reference_category}이(가) 안 보임 - 전원 탈락",
+                )
                 self._logger.info(
                     f"Relation image nearest-ranking ({reference_category}): "
                     "reference not visible in any candidate"
@@ -289,6 +328,20 @@ class RelationImageVerifier:
             if winner not in allowed:
                 raise RuntimeError(f"Gemini가 후보 밖의 object_id를 반환함: {winner}")
             self._logger.info(f"Relation image nearest-ranking ({reference_category}): winner={winner}")
+            llm_trace.record(
+                kind="관계 이미지 최상급 비교",
+                question=f"어느 후보가 {wording} a {reference_category}",
+                images=self._traced_images(usable),
+                verdicts=[
+                    (
+                        f"{candidate.get('category', '?')}#{int(candidate['object_id'])}",
+                        int(candidate["object_id"]) == winner,
+                        "",
+                    )
+                    for candidate in usable
+                ],
+                summary=f"승자 object_id={winner} (후보 {len(usable)})",
+            )
             return {
                 int(candidate["object_id"]): {key: int(candidate["object_id"]) == winner}
                 for candidate in usable

@@ -27,6 +27,7 @@ from rclpy.logging import get_logger
 
 from sysnav import config
 from sysnav.activity_log import LLM, activity
+from sysnav.llm_trace import llm_trace
 
 
 class AttributeVerifier:
@@ -110,12 +111,18 @@ class AttributeVerifier:
                     ensure_ascii=False,
                 )
             ]
+            traced: list[tuple[str, np.ndarray]] = []
             for item in pending:
                 candidate = item["candidate"]
                 image = candidate.get("representative_image")
                 contents.append(f"object_id={int(candidate['object_id'])} image:")
                 if isinstance(image, np.ndarray) and image.size:
                     contents.append(types.Part.from_bytes(data=self._jpeg(image), mime_type="image/jpeg"))
+                    traced.append((
+                        f"{candidate.get('category', '?')}#{int(candidate['object_id'])} "
+                        f"({', '.join(item['missing'])})",
+                        image,
+                    ))
                 else:
                     contents.append("(no image available for this object)")
 
@@ -161,6 +168,24 @@ class AttributeVerifier:
                     continue
                 output.setdefault(key[0], {})[key[1]] = bool(entry["value"])
             self._logger.info(f"Attribute inference: {output}")
+            # 모델이 본 후보 크롭과 (속성별) 판정을 대시보드에 남긴다. 응답에 아예
+            # 빠진 (id, 속성)은 verdict=None("확인 안 됨")으로 구분해서 보여준다.
+            llm_trace.record(
+                kind="속성 검증",
+                question=", ".join(sorted({attr for _, attr in allowed})),
+                images=traced,
+                verdicts=[
+                    (
+                        f"{item['candidate'].get('category', '?')}"
+                        f"#{int(item['candidate']['object_id'])} = {attribute}",
+                        output.get(int(item["candidate"]["object_id"]), {}).get(attribute),
+                        "",
+                    )
+                    for item in pending
+                    for attribute in item["missing"]
+                ],
+                summary=f"후보 {len(pending)}개 / 속성 판정 {sum(len(v) for v in output.values())}건",
+            )
             return output
         except Exception as error:
             self._logger.warning(f"Attribute inference skipped (unverified, not fail-open): {error}")

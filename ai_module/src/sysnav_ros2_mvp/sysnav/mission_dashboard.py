@@ -18,6 +18,7 @@ from pathlib import Path
 
 from sysnav import config
 from sysnav.activity_log import activity
+from sysnav.llm_trace import llm_trace
 
 _STATE_COLORS = {
     "SUCCESS": "#15803d",
@@ -207,6 +208,86 @@ def _activity_panel(limit: int = 80) -> str:
 
 
 
+def _verdict_chip(verdict: bool | None) -> str:
+    """판정 3상태를 색으로 구분한다 - "거짓"과 "아직 확인 안 됨"은 의미가 전혀 다르다."""
+    if verdict is True:
+        color, text = "#15803d", "TRUE"
+    elif verdict is False:
+        color, text = "#b91c1c", "false"
+    else:
+        color, text = "#9ca3af", "미확인"
+    return (
+        f'<span style="display:inline-block;min-width:52px;text-align:center;padding:1px 6px;'
+        f'border-radius:4px;font-size:11px;font-weight:700;color:white;background:{color};">'
+        f"{text}</span>"
+    )
+
+
+def _llm_trace_card(record: dict) -> str:
+    """질의 한 건 = 카드 하나. 위에 모델이 실제로 본 이미지, 아래에 그 판정."""
+    clock = time.strftime("%H:%M:%S", time.localtime(record["time"]))
+    thumbs = []
+    for item in record["images"]:
+        # 썸네일을 누르면 원본 파일이 새 탭에서 열린다(파노라마는 축소본으로는 안 보인다).
+        thumbs.append(
+            f'<div style="flex:0 0 auto;max-width:260px;">'
+            f'<a href="{_esc(item["path"])}" target="_blank">'
+            f'<img src="{_esc(item["path"])}" style="max-width:100%;max-height:150px;'
+            f'border-radius:6px;background:#111;display:block;"></a>'
+            f'<div style="color:#9ca3af;font-size:10px;margin-top:2px;word-break:break-all;">'
+            f'{_esc(item["caption"])}</div></div>'
+        )
+    images_html = (
+        '<div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0;">' + "".join(thumbs) + "</div>"
+        if thumbs else
+        '<div style="color:#9ca3af;font-size:12px;margin:6px 0;">(이미지 없음 - 텍스트만 질의)</div>'
+    )
+    verdict_rows = "".join(
+        f'<tr><td style="padding:2px 8px 2px 0;white-space:nowrap;">'
+        f'{_verdict_chip(item["verdict"])}</td>'
+        f'<td style="padding:2px 8px;font-family:ui-monospace,monospace;font-size:12px;'
+        f'white-space:nowrap;">{_esc(item["label"])}</td>'
+        f'<td style="padding:2px 8px;font-size:12px;color:#6b7280;">{_esc(item["reason"])}</td></tr>'
+        for item in record["verdicts"]
+    )
+    verdicts_html = (
+        f'<table style="border-collapse:collapse;width:100%;">{verdict_rows}</table>'
+        if verdict_rows else
+        '<div style="color:#9ca3af;font-size:12px;">(항목별 판정 없음)</div>'
+    )
+    question = (
+        f'<div style="font-size:12px;color:#374151;margin-top:2px;">'
+        f'&ldquo;{_esc(record["question"])}&rdquo;</div>'
+        if record.get("question") else ""
+    )
+    return (
+        '<div style="border:1px solid #f3f4f6;border-radius:8px;padding:10px 12px;'
+        'margin-bottom:10px;">'
+        f'<div><span style="color:#9ca3af;font-family:ui-monospace,monospace;font-size:12px;">'
+        f'{clock}</span>'
+        f'<span style="margin-left:10px;color:#7c3aed;font-weight:700;font-size:12px;">'
+        f'{_esc(record["kind"])}</span>'
+        f'<span style="float:right;color:#6b7280;font-size:12px;">{_esc(record["summary"])}</span>'
+        f"</div>{question}{images_html}{verdicts_html}</div>"
+    )
+
+
+def _llm_trace_panel(limit: int = 6) -> str:
+    """"LLM이 어떤 이미지를 보고 무슨 판단을 했나" - 활동 로그가 "질의했다"까지만
+    보여주는 것을 실제 입력(사진)과 출력(판정)까지 펼친 패널."""
+    records = llm_trace.recent(limit)
+    if not records:
+        return (
+            '<div style="color:#9ca3af;font-size:13px;">아직 이미지 기반 LLM 질의가 '
+            "없습니다.</div>"
+        )
+    return (
+        '<div style="max-height:640px;overflow-y:auto;">'
+        + "".join(_llm_trace_card(record) for record in records)
+        + "</div>"
+    )
+
+
 def _stat(label: str, value: str, hint: str = "") -> str:
     hint_html = (
         f'<div style="color:#9ca3af;font-size:11px;margin-top:2px;">{_esc(hint)}</div>'
@@ -389,6 +470,10 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
   <div class="card">
     <h2>지금 하는 일</h2>
     {_now_panel()}
+  </div>
+  <div class="card">
+    <h2>LLM 판단 기록 <span style="font-weight:400;color:#9ca3af;font-size:12px;">(최신순 - 모델이 실제로 본 이미지와 그 판정)</span></h2>
+    {_llm_trace_panel()}
   </div>
   <div class="card">
     <h2>활동 로그 <span style="font-weight:400;color:#9ca3af;font-size:12px;">(최신순)</span></h2>

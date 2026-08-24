@@ -19,6 +19,7 @@ from rclpy.logging import get_logger
 
 from sysnav import config
 from sysnav.activity_log import LLM, activity
+from sysnav.llm_trace import llm_trace
 
 
 class DetectionVerifier:
@@ -186,6 +187,20 @@ confirmed=false. Judge each box only by its own contents, not the rest of the sc
                 for index, ok in enumerate(results)
                 if not ok
             ]
+            llm_trace.record(
+                kind="검출 재확인",
+                question="주석 박스 안의 물체가 정말 그 카테고리인가",
+                images=[("주석 이미지 (모델이 본 그대로)", annotated)],
+                verdicts=[
+                    (
+                        f"{detection['category']} (box {position})",
+                        confirmed_by_position.get(position),
+                        "",
+                    )
+                    for position, detection in enumerate(asked)
+                ],
+                summary=f"확인 {sum(1 for v in confirmed_by_position.values() if v)} / 질의 {len(asked)}",
+            )
             if rejected:
                 self._logger.info(f"Detection verification rejected: {rejected}")
             return [True if value is None else value for value in results]

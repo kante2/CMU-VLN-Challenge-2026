@@ -11,6 +11,7 @@ from rclpy.logging import get_logger
 
 from sysnav import config
 from sysnav.activity_log import LLM, activity
+from sysnav.llm_trace import llm_trace
 
 
 class GeminiSelector:
@@ -67,6 +68,39 @@ class GeminiSelector:
             "observation_count": int(item.get("observation_count", 1)),
         }
 
+    @staticmethod
+    def _trace(
+        question: str,
+        candidates: list[dict],
+        traced: list[tuple[str, np.ndarray]],
+        parsed: dict,
+        final_verification: bool,
+    ) -> None:
+        """모델이 실제로 본 후보 크롭과 그 선택 결과를 대시보드용으로 남긴다.
+        누가 선택됐고 왜인지(reason)를 후보별 verdict로 펼쳐서 기록한다."""
+        selected_id = int(parsed["object_id"])
+        accepted = bool(parsed.get("accepted", True))
+        reason = str(parsed.get("reason", ""))
+        verdicts = [
+            (
+                f"{item['category']}#{int(item['object_id'])}",
+                int(item["object_id"]) == selected_id and accepted,
+                reason if int(item["object_id"]) == selected_id else "",
+            )
+            for item in candidates
+        ]
+        summary = (
+            f"선택 object_id={selected_id}"
+            if accepted else f"거부(accepted=false) - 후보 {selected_id} 기각"
+        )
+        llm_trace.record(
+            kind="대상 선택" + (" (Mission 3 최종 검증)" if final_verification else ""),
+            question=question,
+            images=traced,
+            verdicts=verdicts,
+            summary=summary,
+        )
+
     def select(
         self,
         question: str,
@@ -106,22 +140,26 @@ Return JSON only and never output an object_id outside the target candidate list
 {verification_instruction}
 """.strip()
             contents: list[object] = [prompt]
+            traced: list[tuple[str, np.ndarray]] = []
             for item in candidates:
-                contents.append(f"candidate object_id={int(item['object_id'])} isolated crop:")
+                object_id = int(item["object_id"])
+                contents.append(f"candidate object_id={object_id} isolated crop:")
                 image = item.get("representative_image")
                 if isinstance(image, np.ndarray) and image.size:
                     contents.append(types.Part.from_bytes(data=self._jpeg(image), mime_type="image/jpeg"))
+                    traced.append((f"{item['category']}#{object_id} isolated", image))
                 if final_verification:
                     context_image = item.get("context_image")
                     if isinstance(context_image, np.ndarray) and context_image.size:
                         contents.append(
-                            f"candidate object_id={int(item['object_id'])} context crop:"
+                            f"candidate object_id={object_id} context crop:"
                         )
                         contents.append(
                             types.Part.from_bytes(
                                 data=self._jpeg(context_image), mime_type="image/jpeg"
                             )
                         )
+                        traced.append((f"{item['category']}#{object_id} context", context_image))
             with activity.operation(LLM, "Gemini 대상 선택"):
                 response = self._client.models.generate_content(
                     model=config.GEMINI_MODEL,
@@ -144,6 +182,7 @@ Return JSON only and never output an object_id outside the target candidate list
                 raise RuntimeError("Empty Gemini response")
             parsed = json.loads(response.text)
             selected_id = int(parsed["object_id"])
+            self._trace(question, candidates, traced, parsed, final_verification)
             if selected_id not in valid_ids:
                 raise RuntimeError(f"Invalid Gemini object_id: {selected_id}")
             if final_verification and not bool(parsed.get("accepted")):

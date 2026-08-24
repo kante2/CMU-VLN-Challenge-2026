@@ -24,6 +24,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from sysnav import config
 from sysnav.activity_log import JOB, NAV, PERCEPTION, STATE, WARN, activity
+from sysnav.llm_trace import llm_trace
 from sysnav.exploration.coverage_planner import CoveragePlanner
 from sysnav.exploration.exploration_visualizer import export_exploration_debug
 from sysnav.exploration.viewpoint_memory import ViewpointMemory
@@ -140,6 +141,10 @@ _NAV_PROBLEM_EVENTS = {
 class SysNavNode(Node):
     def __init__(self) -> None:
         super().__init__("sysnav_node")
+
+        # 지난 실행이 debug/llm_trace/에 남긴 이미지를 지운다(레코드는 메모리라 새
+        # 프로세스에선 이미 비어있는데, 파일만 남으면 폴더가 계속 커진다).
+        llm_trace.reset()
 
         self.callback_group = ReentrantCallbackGroup()
         # control_timer 전용 - MultiThreadedExecutor + ReentrantCallbackGroup 조합에서는

@@ -19,6 +19,7 @@ import numpy as np
 
 from sysnav import config
 from sysnav.activity_log import LLM, activity
+from sysnav.llm_trace import llm_trace
 from sysnav.task.query_parser import effective_relation_chain
 
 
@@ -459,6 +460,7 @@ ambiguous must be omitted.
                 ),
             )
         if not response.text:
+            self._trace(question, annotated, candidates, records, [])
             return []
 
         allowed = {
@@ -487,7 +489,49 @@ ambiguous must be omitted.
                 "method": "gemini",
                 "reason": str(item.get("reason", "")),
             })
+        self._trace(question, annotated, candidates, records, output)
         return output
+
+    @staticmethod
+    def _trace(
+        question: str,
+        annotated: np.ndarray,
+        candidates: list[dict],
+        records: dict[int, dict],
+        accepted: list[dict],
+    ) -> None:
+        """모델이 본 주석 이미지 그대로와 candidate별 판정을 대시보드용으로 남긴다.
+        sysnav_relation_check.txt와 같은 내용이지만, 사진과 같은 카드에 붙는다."""
+        accepted_by_key = {
+            (edge["source_object_id"], tuple(edge["target_object_ids"]), edge["relation"]): edge
+            for edge in accepted
+        }
+
+        def name(object_id: int) -> str:
+            record = records.get(int(object_id))
+            return f"{record['category']}#{object_id}" if record else f"#{object_id}"
+
+        verdicts = []
+        for candidate in candidates:
+            key = (
+                candidate["source_object_id"],
+                tuple(candidate["target_object_ids"]),
+                candidate["relation"],
+            )
+            edge = accepted_by_key.get(key)
+            targets = ", ".join(name(value) for value in candidate["target_object_ids"])
+            verdicts.append((
+                f"{name(candidate['source_object_id'])} {candidate['relation']} {targets}",
+                edge is not None,
+                str(edge.get("reason", "")) if edge else "",
+            ))
+        llm_trace.record(
+            kind="공간관계 판정",
+            question=question,
+            images=[("주석 파노라마 (모델이 본 그대로)", annotated)],
+            verdicts=verdicts,
+            summary=f"참으로 판정된 관계 {len(accepted)} / 후보 {len(candidates)}",
+        )
 
     # 이미지만으로는 판정이 구조적으로 불가능한 관계들. 360도 파노라마는 원근이
     # 심하게 왜곡돼서, 몇 미터 떨어진 선반 위 물건과 바닥의 스툴이 "위에 놓인" 것처럼
