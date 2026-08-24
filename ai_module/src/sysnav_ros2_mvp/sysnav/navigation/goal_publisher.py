@@ -112,6 +112,37 @@ class GoalPublisher:
                       f"goal=({requested[0]:.2f},{requested[1]:.2f}) label={label} "
                       f"no candidate anywhere - waypointConverter will use it as-is")
             return requested, None
+        # 여기까지 왔다 = "통과 후보는 어딘가 있는데 목표 근처(1.5m)엔 없다".
+        # 예전엔 무조건 거부했지만, 그러면 로봇에게 아무 명령도 안 가서 한 발짝도 못
+        # 움직인다(실측 2026-08-24: mission3 step 1/2가 이 상태로 4초 만에 포기).
+        # 저쪽은 우리 1.5m 규칙을 모르고 후보가 있으면 argmin을 고르므로, 그 점을 우리가
+        # 예측해서 **전진이 되는 경우에만** 그 점으로 보낸다. 물체 앞까지는 못 가도
+        # 그쪽으로 전진하면 terrain이 자라 다음 tick엔 더 가까운 점이 생긴다.
+        predicted = (
+            monitor.predict_converter_choice(x, y, robot_xy)
+            if config.PREDICT_CONVERTER_FALLBACK_ENABLED else None
+        )
+        if predicted is not None and robot_xy is not None:
+            point, gap_to_goal, candidate_count = predicted
+            robot_gap = math.dist(robot_xy, requested)
+            travel = math.dist(robot_xy, point)
+            gain = robot_gap - gap_to_goal
+            if (
+                gain >= config.PREDICT_CONVERTER_MIN_GAIN_M
+                and travel > config.GOAL_REACHED_DISTANCE_M
+            ):
+                if trace is not None:
+                    trace("PREDICT_FALLBACK",
+                          f"goal=({requested[0]:.2f},{requested[1]:.2f}) -> "
+                          f"({point[0]:.2f},{point[1]:.2f}) gain={gain:.2f}m "
+                          f"travel={travel:.2f}m gap={gap_to_goal:.2f}m "
+                          f"of {candidate_count} commandable label={label}")
+                return point, point
+            if trace is not None:
+                trace("PREDICT_REJECT",
+                      f"goal=({requested[0]:.2f},{requested[1]:.2f}) -> "
+                      f"({point[0]:.2f},{point[1]:.2f}) gain={gain:.2f}m "
+                      f"travel={travel:.2f}m - no forward progress label={label}")
         if trace is not None:
             trace("SNAP_FAIL",
                   f"goal=({requested[0]:.2f},{requested[1]:.2f}) label={label} "

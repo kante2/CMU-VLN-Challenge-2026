@@ -160,6 +160,57 @@ class TerrainMonitor:
             np.any(self._min_distance_to_obstacles(near, obstacle) >= config.TERRAIN_CLEARANCE_M)
         )
 
+    def predict_converter_choice(self, x: float, y: float, robot_xy):
+        """우리가 (x, y)를 그대로 발행했을 때 waypointConverter가 **실제로 고를** 점을
+        우리가 미리 계산해서 돌려준다. 후보가 없으면 None.
+
+        비용식은 waypointConverter 그대로다(모듈 상단 주석):
+
+            cost(c) = dist(c, our_goal) + 0.5 * dist(c, robot)
+            c in {travArea 점, 로봇에서 searchDisThre 안, obstacle에서 clearance 이상}
+
+        왜 필요한가: nearest_commandable()은 "목표 1.5m 안"이라는 우리 규칙으로만 보고,
+        거기서 못 찾으면 발행을 거부한다. 그런데 저쪽은 그 규칙을 모른다 - 후보가 어딘가
+        있으면 무조건 argmin을 고른다. 즉 우리가 거부해서 아무 명령도 안 보내는 동안,
+        저쪽은 "보내줬다면 골랐을 점"을 갖고 있다.
+
+        실측 2026-08-24(mission3 step 1): 목표 (2.24,0.12) 1.5m 안에 travArea 점이 349개
+        있었지만 clearance가 최대 0.67m라 0.75m 기준에 걸려 전부 탈락 -> 4초간 20번
+        발행 거부 -> step 포기. 벽에 붙은 가구(bedside table, picture) 앞은 벽과 물체가
+        양쪽에서 clearance를 깎아 이 상황이 구조적으로 발생한다.
+
+        호출 측(goal_publisher.resolve)은 이 점이 **전진이 되는지** 따로 확인해야 한다.
+        argmin이 로봇 뒤쪽으로 나올 수 있고(비용에 0.5*dist(c,robot)이 있어 발밑이
+        싸다), 그건 예전에 겪은 "목표 반대로 끌려감"이라 걸러야 한다.
+        """
+        if not self.ready() or robot_xy is None:
+            self.last_selection = "terrain not ready"
+            return None
+        trav, obstacle = self.snapshot()
+        if len(trav) == 0:
+            return None
+
+        goal = np.array([float(x), float(y)], dtype=np.float64)
+        robot = np.asarray(robot_xy, dtype=np.float64)[:2]
+        to_robot = np.linalg.norm(trav - robot, axis=1)
+        candidates = trav[to_robot <= config.TERRAIN_SEARCH_DIS_M]
+        to_robot = to_robot[to_robot <= config.TERRAIN_SEARCH_DIS_M]
+        if len(candidates) == 0:
+            return None
+        if len(obstacle):
+            clear = self._min_distance_to_obstacles(candidates, obstacle) >= config.TERRAIN_CLEARANCE_M
+            candidates, to_robot = candidates[clear], to_robot[clear]
+            if len(candidates) == 0:
+                return None
+        to_goal = np.linalg.norm(candidates - goal, axis=1)
+        cost = to_goal + config.TERRAIN_CONVERTER_ROBOT_COST_WEIGHT * to_robot
+        best = int(np.argmin(cost))
+        return (
+            (float(candidates[best][0]), float(candidates[best][1])),
+            float(to_goal[best]),
+            len(candidates),
+        )
+
     def nearest_commandable(
         self, x: float, y: float, robot_xy=None
     ) -> tuple[float, float] | None:

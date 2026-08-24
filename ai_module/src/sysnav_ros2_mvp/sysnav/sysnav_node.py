@@ -127,9 +127,14 @@ _NAV_LABELS = {
     "FAR_THROW": "5m 밖으로 던짐(교착 탈출)", "FAR_THROW_SKIP": "던지기 불가(앞이 막힘)",
     "PUSHED": "base autonomy가 목표를 옮김", "RETARGET": "접근 지점 재선정",
     "RETARGET_FAIL": "접근 지점 재선정 실패", "UNREACHABLE": "도달 불가로 판단",
+    "PREDICT_FALLBACK": "converter 예측 지점으로 전진",
+    "PREDICT_REJECT": "예측 지점이 전진 아님(발행 안 함)",
 }
 # 이 이벤트들은 "왜 멈췄나"의 직접 원인이라 경고색으로 띄운다.
-_NAV_PROBLEM_EVENTS = {"SNAP_FAIL", "RETARGET_FAIL", "UNREACHABLE", "PUSHED", "SNAP_NO_PROGRESS"}
+_NAV_PROBLEM_EVENTS = {
+    "SNAP_FAIL", "RETARGET_FAIL", "UNREACHABLE", "PUSHED", "SNAP_NO_PROGRESS",
+    "PREDICT_REJECT",
+}
 
 
 class SysNavNode(Node):
@@ -276,6 +281,9 @@ class SysNavNode(Node):
         self.mission2_answer_object_id: int | None = None
         self._mission2_answer_extent: tuple | None = None
         self._mission2_last_answer_publish: float | None = None
+        # 최종 target 주행이 "도달 불가"로 끝난 횟수(mission2_pipe._give_up_target).
+        # config.MISSION2_TARGET_MAX_RETRIES를 넘으면 답안을 낸 채로 마무리한다.
+        self.mission2_target_retries = 0
 
         # 디버깅용 미션 상태 대시보드(mission_dashboard.py)용 상태.
         self.task_start_time: float | None = None
@@ -455,6 +463,7 @@ class SysNavNode(Node):
             self.mission2_answer_object_id = None
             self._mission2_answer_extent = None
             self._mission2_last_answer_publish = None
+            self.mission2_target_retries = 0
             self.task_start_time = time.monotonic()
             self.last_response_summary = None
             # 여기까지 왔으면 이 문장은 실제 task가 됐다 - 이후 같은 문장의 반복
@@ -1738,7 +1747,17 @@ class SysNavNode(Node):
             and time.monotonic() - self._target_retarget_fail_since
             >= config.TARGET_RETARGET_GIVEUP_SEC
         )
-        if self._target_publish_blocked or retarget_stuck:
+        # 재선정이 계속 실패해도 **로봇이 목표에 가까워지고 있으면** 포기하지 않는다.
+        # goal_publisher의 예측 폴백(PREDICT_FALLBACK)이 생긴 뒤로는 "접근점 재선정은
+        # 실패하지만 예측 지점을 향해 실제로 전진 중"인 상태가 정상 경로가 됐다.
+        # 그때도 5초에 잘라버리면 폴백이 벌어준 전진을 그대로 버린다. 전진이 멈춘
+        # 뒤에야 이 판정을 쓰고, 완전한 정지는 아래 20초 백스톱이 따로 잡는다.
+        progressing = (
+            self._target_goal_last_progress_time is not None
+            and time.monotonic() - self._target_goal_last_progress_time
+            < config.TARGET_RETARGET_GIVEUP_SEC
+        )
+        if self._target_publish_blocked or (retarget_stuck and not progressing):
             self._trace_navigation(
                 "UNREACHABLE",
                 f"trigger={'not_commandable' if self._target_publish_blocked else 'retarget_exhausted'} "

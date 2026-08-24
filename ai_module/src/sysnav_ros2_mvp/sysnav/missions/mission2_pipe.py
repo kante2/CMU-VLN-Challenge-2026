@@ -26,6 +26,7 @@ SELECT_TARGET -> NAVIGATE_TARGET -> SUCCESS.
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 
@@ -157,7 +158,13 @@ def _on_selection_result(node, result: dict) -> None:
     # 접근 지점은 /terrain_map 기준으로 고른다 - base autonomy의 waypointConverter가
     # 우리 좌표를 자기 traversable area로 스냅해버리므로, 그쪽이 받아들일 지점을
     # 처음부터 찍어야 엉뚱한 데로 끌려가지 않는다 (navigation/terrain_monitor.py).
-    x, y, theta = node.approach_pose_for(pose, selected["position"])
+    # allow_relaxed=True: 링 샘플링(1.0~2.2m x 7각도)이 전부 실패하면 terrain을 아예
+    # 안 보는 고정 standoff로 폴백하는데, 그 좌표는 base autonomy가 받아주지 않아
+    # 주행이 시작도 못 한다(실측 2026-08-24: toilet 접근점 (2.24,1.93)이 "no travArea
+    # point within 1.50m"으로 발행 거부 -> 첫 tick에 unreachable). Mission 3와 달리
+    # Mission 2에는 "물체에서 몇 m 안에 서야 한다"는 의미 규칙이 없다 - 주행의 목적이
+    # extent_3d 정밀화뿐이므로, 조금 멀어도 실제로 갈 수 있는 지점이 항상 낫다.
+    x, y, theta = node.approach_pose_for(pose, selected["position"], allow_relaxed=True)
     node.start_target_navigation(
         pose, (x, y), theta,
         object_id=selected["object_id"],
@@ -275,7 +282,7 @@ def _run_navigate_target(node, pose: dict) -> None:
     if outcome == "arrived":
         _finish_navigate_target(node, pose)
     elif outcome == "unreachable":
-        _give_up_target(node)
+        _give_up_target(node, pose)
 
 
 def _finish_navigate_target(node, pose: dict) -> None:
@@ -288,6 +295,7 @@ def _finish_navigate_target(node, pose: dict) -> None:
         node._mission2_last_answer_publish = None      # 주기 제한 무시하고 즉시
         _refresh_answer(node)
     node.clear_target_navigation()
+    node.mission2_target_retries = 0
     with node.state_lock:
         node.state = "SUCCESS"
     node.get_logger().info(
@@ -298,7 +306,40 @@ def _finish_navigate_target(node, pose: dict) -> None:
     )
 
 
-def _give_up_target(node) -> None:
+def _retry_with_relaxed_approach(node, pose: dict) -> bool:
+    """최신 terrain으로 접근 지점을 다시 골라 주행을 재시작한다. 성공하면 True.
+
+    지도가 계속 자라므로, 조금 전에 "갈 수 있는 지점이 없다"였던 물체 주변에 지금은
+    통과 지점이 생겼을 수 있다. 여기서는 selection job을 다시 돌리지 않는다 - 고른
+    물체는 그대로 두고 그 물체로 가는 **길만** 다시 찾는 것이므로 LLM 비용이 없다.
+
+    같은 지점을 다시 고른 것이면 결과가 같으므로 False를 돌려 다음 수단(탐사 복귀)로
+    넘긴다.
+    """
+    object_xy = node.target_object_xy
+    if object_xy is None:
+        return False
+    x, y, theta = node.approach_pose_for(
+        pose, (object_xy[0], object_xy[1], 0.0), allow_relaxed=True
+    )
+    if node.target_goal_xy is not None and math.hypot(
+        x - node.target_goal_xy[0], y - node.target_goal_xy[1]
+    ) < config.GOAL_REACHED_DISTANCE_M:
+        return False
+    node.start_target_navigation(
+        pose, (x, y), theta,
+        object_id=node.target_object_id,
+        object_xy=object_xy,
+    )
+    node.get_logger().warning(
+        f"🚧 target unreachable ({node.mission2_target_retries}/"
+        f"{config.MISSION2_TARGET_MAX_RETRIES}) - retargeting to ({x:.2f}, {y:.2f}) "
+        f"[{node.terrain_monitor.last_selection}]"
+    )
+    return True
+
+
+def _give_up_target(node, pose: dict) -> None:
     """step_target_navigation()이 "지금 지도로는 갈 방법이 없다"고 판단했을 때 불린다.
 
     답안(marker)을 이미 냈다면 **FAILED가 아니다.** Object Reference의 점수는 marker
@@ -306,18 +347,56 @@ def _give_up_target(node) -> None:
     물체가 캐비닛 위처럼 접근 불가한 자리에 있으면 base autonomy가 받아줄 지점이
     아예 없을 수 있는데, 그건 답이 틀렸다는 뜻이 아니다.
 
-    아직 답을 못 냈고 탐사도 안 끝났으면 예전처럼 탐사로 되돌린다.
+    다만 "답을 냈으니 즉시 끝"은 너무 이르다. 실측 2026-08-24: TARGET SELECTED 7ms
+    뒤에 여기로 들어와 그대로 마무리했다 - 접근점이 처음부터 발행 불가라 로봇은 한
+    발짝도 안 움직였고, 남은 6분과 함께 "가까이서 본 정밀한 extent_3d"(=bbox 겹침
+    점수)를 통째로 버렸다. 그래서 포기 전에 MISSION2_TARGET_MAX_RETRIES까지:
+
+      1. 최신 terrain으로 접근 지점만 다시 고른다(LLM 비용 없음).
+      2. 그것도 안 되면 탐사로 돌아가 지도를 넓힌다 - 물체 주변이 아직 관측되지
+         않아 travArea 점이 없는 것이 이 실패의 가장 흔한 원인이고, 그건 더 가서
+         보면 해결된다. 이미 낸 답안은 그대로 유지한다(재선택해도 같은 물체가
+         나오며, 그 사이에도 _refresh_answer()가 계속 돌 수 있다).
+
+    상한을 넘기면 예전 동작 그대로 - 답을 냈으면 그 답으로 마무리, 못 냈으면 실패.
     """
+    node.mission2_target_retries += 1
+    exhausted = node.mission2_target_retries >= config.MISSION2_TARGET_MAX_RETRIES
+
+    if not exhausted and _retry_with_relaxed_approach(node, pose):
+        return
+
     node.clear_target_navigation()
+
+    if not exhausted:
+        # 탐사를 다시 열어준다. mission2_exploration_complete를 되돌리지 않으면
+        # _on_exploration_result()가 곧바로 "탐사 끝"으로 처리해 지도를 넓힐 기회가
+        # 없다. 탐사가 실제로 소진되면 그쪽에서 다시 True로 돌아온다.
+        node.mission2_exploration_complete = False
+        with node.state_lock:
+            node.state = "PLAN_EXPLORATION"
+        node.get_logger().warning(
+            f"🧭 back to exploration to open up the map "
+            f"(target unreachable {node.mission2_target_retries}/"
+            f"{config.MISSION2_TARGET_MAX_RETRIES}"
+            + (
+                f", answer #{node.mission2_answer_object_id} stands"
+                if node.mission2_answer_object_id is not None else ""
+            )
+            + ")"
+        )
+        return
+
     if node.mission2_answer_object_id is not None:
-        _settle_answered(node, "could not reach the object, but the answer stands")
+        _settle_answered(
+            node,
+            f"could not reach the object after {node.mission2_target_retries} attempts, "
+            f"but the answer stands",
+        )
         return
-    if node.mission2_exploration_complete:
-        _fail_after_full_exploration(node, "selected target remained unreachable after replanning")
-        return
-    with node.state_lock:
-        node.state = "PLAN_EXPLORATION"
-    node.get_logger().warning("🧭 back to exploration to open up the map")
+    _fail_after_full_exploration(
+        node, "selected target remained unreachable after replanning"
+    )
 
 
 def _settle_answered(node, reason: str) -> None:

@@ -165,6 +165,20 @@ MISSION3_GATE_EXTENSION_M = 0.3
 # 0.5초 주기 x 20 = 약 10초.
 MISSION3_SUBGOAL_MAX_RETRIES = int(os.getenv("SYSNAV_MISSION3_SUBGOAL_MAX_RETRIES", "20"))
 
+# Mission 2에서 최종 target까지의 주행이 "도달 불가"로 끝났을 때 몇 번까지 다시
+# 시도할 것인가.
+#
+# 실측 2026-08-24: toilet을 옳게 고르고도 접근점이 base autonomy에게 명령 불가라
+# TARGET SELECTED 7ms 뒤에 바로 주행을 접었다(로그: "target goal (2.24, 1.93) is not
+# commandable" -> "ANSWER SUBMITTED (navigation incomplete)"). 답 자체는 이미 냈으니
+# FAILED는 아니지만, 물체에 가까이 가서 extent_3d를 정밀하게 만드는 이득(그게 곧
+# bbox 겹침 점수다)을 통째로 못 받았다. 남은 시간이 6분이었는데도 그랬다.
+#
+# 재시도 1회 = (a) 접근 상한을 푼 재선정, 실패하면 (b) 탐사로 돌아가 지도를 넓히고
+# 다시 선택. mission3와 달리 매 tick 도는 게 아니라 "주행이 끝난 뒤"에만 세므로
+# 횟수는 작게 잡는다 - (b)는 selection job(LLM 호출 가능)을 한 번씩 더 쓴다.
+MISSION2_TARGET_MAX_RETRIES = int(os.getenv("SYSNAV_MISSION2_TARGET_MAX_RETRIES", "3"))
+
 # Object Reference 답안(/selected_object_marker) 재발행 주기.
 #
 # 왜 한 번으로 부족한가: 이 publisher는 기본 QoS(RELIABLE/VOLATILE)라, 평가 노드가
@@ -224,10 +238,42 @@ TERRAIN_SEARCH_DIS_M = 5.0
 # 값 선택 근거 (2026-08-21 라이브 실측, 실제로 목표 삼을 만한 지점 120개에서 가장 가까운
 # commandable 지점까지의 거리): 중앙값 0.68m, 90퍼센타일 1.29m, 최대 2.12m.
 #   반경 0.75m -> 54% / 1.00m -> 73% / 1.50m -> 95% / 2.00m -> 99%
-# 1.0m면 요청의 1/4이 "스냅 대상 없음"으로 빠지는데, 그때는 원본이 그대로 나가서 결국
-# base autonomy가 1.5~2.5m 던져버린다. 우리가 1.5m 안에서 통제해 옮기는 편이 낫다.
-# (근본 해법은 애초에 commandable 지점만 후보로 고르는 것 - Layer 2.)
-TERRAIN_SNAP_MAX_M = 1.50
+# 1.5 -> 1.0 (2026-08-24). 1.5를 고른 근거는 "여기서 못 찾으면 원본이 그대로 나가서
+# base autonomy가 1.5~2.5m 던져버린다"였는데, PREDICT_CONVERTER_FALLBACK이 생기면서
+# 그 전제가 사라졌다 - 이제 못 찾으면 원본 발행이 아니라 converter 비용식 argmin으로
+# 넘어간다(아래 PREDICT_CONVERTER_FALLBACK_ENABLED 주석).
+#
+# 두 규칙의 차이가 곧 이 값을 줄이는 이유다:
+#   - 여기(nearest_commandable)는 |q - 우리목표|만 본다. 비용식의 0.5*|q - 차량| 항을
+#     빼먹은 근사라, 목표가 멀수록 converter의 실제 선택과 어긋난다. 게다가 전진 가드가
+#     SNAP_NO_PROGRESS 하나뿐이라 목표 옆/뒤 지점으로도 1.5m까지 옮길 수 있었다
+#     (실측 PUSHED: 요청 (-3.07,0.01) -> 실제 (-0.63,-0.02), 반대 방향 2.44m).
+#   - 예측 폴백은 비용식을 그대로 쓰고 gain >= PREDICT_CONVERTER_MIN_GAIN_M도 요구한다.
+# 즉 근사 규칙의 관할을 좁혀 가드 있는 규칙으로 더 많이 보내는 것이 이 변경의 목적이다.
+# 0.75m까지 더 줄이면 위 실측 분포상 54%만 스냅되어 폴백 의존이 과해지므로 1.0에서 멈춘다.
+TERRAIN_SNAP_MAX_M = float(os.getenv("SYSNAV_TERRAIN_SNAP_MAX_M", "1.00"))
+
+# waypointConverter의 후보 비용식 cost(c) = dist(c, our_goal) + 0.5 * dist(c, robot)에서
+# 로봇 거리 항의 가중치. 저쪽 소스 값(0.5)을 그대로 복제한 것이라 바꿀 일은 없고,
+# 예측식(terrain_monitor.predict_converter_choice)이 무엇을 흉내내는지 드러내려고 상수로 뺐다.
+TERRAIN_CONVERTER_ROBOT_COST_WEIGHT = 0.5
+
+# "목표 근처에 통과 지점이 없다"고 발행을 거부하는 대신, waypointConverter가 고를 점을
+# 우리가 예측해서 그 점으로 보낼 것인가.
+#
+# 왜: 벽에 붙은 가구 앞은 벽과 물체가 양쪽에서 clearance를 깎아 0.75m 기준을 만족하는
+# 점이 구조적으로 없다(실측 2026-08-24 mission3 step 1: 목표 1.5m 안 travArea 349점,
+# 최대 clearance 0.67m). 지금은 그럴 때 아무 명령도 안 보내서 로봇이 한 발짝도 못 가고
+# step/target을 통째로 포기했다. 저쪽은 후보가 있으면 어차피 argmin을 고르므로, 그 점이
+# **전진이 되는 경우에 한해** 우리가 먼저 그 점을 찍어주는 편이 항상 낫다.
+#
+# 끄려면 SYSNAV_PREDICT_CONVERTER_FALLBACK=0. 끄면 예전처럼 SNAP_FAIL로 거부한다.
+PREDICT_CONVERTER_FALLBACK_ENABLED = os.getenv(
+    "SYSNAV_PREDICT_CONVERTER_FALLBACK", "1"
+) not in ("0", "false", "False")
+# 예측 지점을 채택할 최소 전진량: "로봇->목표 거리"가 이만큼은 줄어야 한다. 이 값이
+# 없으면 목표 옆이나 뒤쪽 점을 골라 제자리에서 왕복한다(SNAP_NO_PROGRESS와 같은 문제).
+PREDICT_CONVERTER_MIN_GAIN_M = 0.30
 
 # ---------------------------------------------------------------------------
 # Far throw - "받아줄 지점이 로봇 코앞에만 있는" 교착 탈출
