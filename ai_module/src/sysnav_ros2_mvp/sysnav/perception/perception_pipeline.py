@@ -6,6 +6,7 @@ import numpy as np
 from rclpy.logging import get_logger
 
 from sysnav import config
+from sysnav.activity_log import PERCEPTION, activity
 from sysnav.perception.debug_visualize import save_debug_image
 from sysnav.perception.detection_verifier import DetectionVerifier
 from sysnav.perception.detector import YoloWorldDetector
@@ -20,6 +21,24 @@ class PerceptionPipeline:
         self.grounder = PanoramaLidarGrounder()
         self.detection_verifier = DetectionVerifier()
         self._logger = get_logger("sysnav_perception")
+
+    @staticmethod
+    def _summarize(detections: list[dict]) -> str:
+        """카테고리별 개수 + 최고 confidence. 대시보드 한 줄에 들어가야 하므로
+        _format_detections(전체 나열)와 달리 압축한다."""
+        if not detections:
+            return "없음"
+        best: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for detection in detections:
+            category = str(detection.get("category", "?"))
+            confidence = float(detection.get("confidence", 0.0))
+            counts[category] = counts.get(category, 0) + 1
+            best[category] = max(best.get(category, 0.0), confidence)
+        return ", ".join(
+            f"{category} {counts[category]}개(최고 {best[category]:.2f})"
+            for category in sorted(counts, key=lambda c: -counts[c])
+        )
 
     @staticmethod
     def _format_detections(detections: list[dict]) -> str:
@@ -66,7 +85,13 @@ class PerceptionPipeline:
             f"[Perception] YOLO-World detected: {self._format_detections(detections)} "
             f"(prompts={prompts})"
         )
+        activity.add(
+            PERCEPTION, f"① YOLO 검출 {len(detections)}개",
+            f"{self._summarize(detections)} | prompts={', '.join(prompts)}",
+        )
         if not detections:
+            activity.add(PERCEPTION, "① YOLO 검출 0개 - 이 프레임은 여기서 끝",
+                         f"prompts={', '.join(prompts)}")
             return []
 
         verified = self._verify_low_confidence(image_rgb, detections)
@@ -74,6 +99,14 @@ class PerceptionPipeline:
             self._logger.info(
                 f"[Perception] after confidence verification: {self._format_detections(verified)}"
             )
+        rejected = len(detections) - len(verified)
+        activity.add(
+            PERCEPTION,
+            f"② 검출 재확인 - {rejected}개 기각, {len(verified)}개 통과",
+            f"conf<{config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD:.2f}인 것만 Gemini에 물어봄"
+            if rejected or len(verified) != len(detections)
+            else f"conf<{config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD:.2f}인 검출이 없어 건너뜀",
+        )
         detections = verified
         if not detections:
             return []
@@ -82,12 +115,22 @@ class PerceptionPipeline:
         self._logger.info(
             f"[Perception] SAM2 segmented {len(segmented)}/{len(detections)} detections"
         )
+        activity.add(PERCEPTION, f"③ SAM2 분할 {len(segmented)}/{len(detections)}")
         if not segmented:
             return []
         grounded = self.grounder.ground(image_rgb, points_sensor, segmented, robot_pose)
         self._logger.info(
             f"[Perception] LiDAR-grounded to 3D: "
             f"{[(item['category'], tuple(round(v, 2) for v in item['position']), item.get('grounding_quality', '?'), item.get('num_points', 0)) for item in grounded]}"
+        )
+        precise = sum(1 for item in grounded if item.get("grounding_quality") == "precise")
+        dropped = len(segmented) - len(grounded)
+        activity.add(
+            PERCEPTION,
+            f"④ LiDAR 3D 위치 확정 {len(grounded)}/{len(segmented)}",
+            f"precise {precise} / approximate {len(grounded) - precise}"
+            + (f" | {dropped}개는 대응 point가 없어 탈락" if dropped else "")
+            + (f" | {self._summarize(grounded)}" if grounded else ""),
         )
         save_debug_image(image_rgb, segmented, grounded) # ai_module/debug에 저장
         return grounded

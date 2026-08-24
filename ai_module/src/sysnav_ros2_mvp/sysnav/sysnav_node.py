@@ -23,7 +23,7 @@ from std_msgs.msg import Int32, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from sysnav import config
-from sysnav.activity_log import JOB, NAV, STATE, WARN, activity
+from sysnav.activity_log import JOB, NAV, PERCEPTION, STATE, WARN, activity
 from sysnav.exploration.coverage_planner import CoveragePlanner
 from sysnav.exploration.exploration_visualizer import export_exploration_debug
 from sysnav.exploration.viewpoint_memory import ViewpointMemory
@@ -59,6 +59,15 @@ from sysnav.task.query_parser import effective_relation_chain
 
 # state 이름 -> 처리할 mission pipe 모듈. 미션에 없는 state로 잘못 분기되지 않도록
 # question_callback에서 항상 task["mission_type"]을 이 dict의 키 중 하나로 채운다.
+def normalize_question(text: str) -> str:
+    """질문 문자열 비교용 정규화. 앞뒤 공백과 연속 공백만 접는다.
+
+    같은 문장이 1Hz로 반복 발행될 때 중복 판정에 쓰인다(_claim_question). 발행 쪽
+    포맷팅 차이(줄바꿈/두 칸 띄어쓰기)로 같은 질문이 다른 질문으로 보이면, 그때마다
+    task가 새로 만들어져 지도와 메모리가 초기화된다."""
+    return " ".join(str(text or "").strip().split())
+
+
 _MISSION_PIPES = {
     MISSION_OBJECT_REFERENCE: mission2_pipe,
     MISSION_NUMERICAL: mission1_pipe,
@@ -149,8 +158,20 @@ class SysNavNode(Node):
         self.task_id = 0
         self.task: dict | None = None
         self.state = "IDLE"
+        # 반복 발행되는 같은 질문을 걸러내기 위한 상태(config의 "같은 질문의 반복 발행
+        # 처리" 주석 참고). _accepted_ok는 "이 문장을 실제로 task로 받는 데 성공했는가"다 -
+        # 파싱에 실패한 문장은 재시도 간격 뒤에 다시 받아야 하므로 구분이 필요하다.
+        self._accepted_question: str | None = None
+        self._accepted_question_at = 0.0
+        self._accepted_question_ok = False
+        self._duplicate_question_count = 0
+        self._last_duplicate_log = 0.0
         self.last_processed_image_stamp = -1.0
         self.last_perception_wall_time = 0.0
+        # perception job을 못 던지는 이유(진단 전용). OBSERVE에서 아무 로그도 없이
+        # 영원히 대기하는 상황을 밖에서 판별할 방법이 없어서 넣었다.
+        self._snapshot_block_reason: str | None = None
+        self._last_sensor_wait_log = 0.0
 
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sysnav_worker")
         self.map_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sysnav_map")
@@ -338,25 +359,78 @@ class SysNavNode(Node):
     '''
     # ------------------------------------------------------------------
 
+    def _claim_question(self, question: str) -> bool:
+        """이 문장을 새 task로 처리해야 하면 True, 무시해야 하면 False.
+
+        채점 환경은 /challenge_question을 1Hz로 계속 발행한다(--once 없이). 그대로
+        받으면 매 초 Gemini 파싱을 다시 돌리고 task_id를 올리며 object_memory와
+        scene_graph, coverage_planner를 통째로 초기화해서 로봇이 첫 관측 상태를
+        영원히 못 벗어난다. 그래서 "지금 처리 중인 문장과 같은 문장"은 여기서 끊는다.
+
+        파싱 **전에** 선점하는 이유: 구독 콜백이 ReentrantCallbackGroup이라, 파싱이
+        2~14초 걸리는 동안 들어온 중복 메시지가 다른 executor 스레드에서 동시에
+        파싱을 시작해버린다. 선점을 파싱 뒤로 미루면 중복 차단 자체가 무의미해진다.
+
+        파싱에 실패한 문장은 영영 막아두면 복구가 안 되므로
+        QUESTION_REPARSE_RETRY_SEC 뒤에는 다시 받아준다.
+        """
+        now = time.monotonic()
+        dropped = 0
+        with self.state_lock:
+            already_handled = question == self._accepted_question and (
+                self._accepted_question_ok
+                or now - self._accepted_question_at < config.QUESTION_REPARSE_RETRY_SEC
+            )
+            if already_handled:
+                self._duplicate_question_count += 1
+                if now - self._last_duplicate_log < config.QUESTION_DUPLICATE_LOG_INTERVAL_SEC:
+                    return False
+                self._last_duplicate_log = now
+                dropped = self._duplicate_question_count
+            else:
+                self._accepted_question = question
+                self._accepted_question_at = now
+                self._accepted_question_ok = False
+        if already_handled:
+            self.get_logger().info(
+                f"🔁 같은 질문이 계속 들어옴 - 누적 {dropped}건 무시 "
+                f"(진행 중인 Task #{self.task_id} 유지)"
+            )
+            return False
+        return True
+
     def question_callback(self, msg: String) -> None:
+        # 채점 환경은 같은 문장을 1Hz로 계속 발행한다. 파싱보다 **먼저** 걸러야 한다 -
+        # Gemini 파싱은 2~14초가 걸리는데, 그 사이 들어온 중복 메시지들이 다른 executor
+        # 스레드에서 동시에 파싱을 시작해버리기 때문이다(구독 콜백이 Reentrant 그룹).
+        # 그래서 파싱 전에 문장을 "선점"해두고, 같은 문장은 여기서 바로 돌려보낸다.
+        question = normalize_question(msg.data)
+        if not question:
+            return
+        if not self._claim_question(question):
+            return
+
         # 문장이 세 미션(Numerical/Object Reference/Instruction-Following) 중 어디로
         # 가야 하는지부터 정한다 - 응답 형식/상태머신이 미션마다 완전히 다르다
         # (MISSION_1/2/3_*_CLAUDE.txt 참고).
-        mission_type = classify_mission(msg.data)
+        mission_type = classify_mission(question)
         if mission_type == MISSION_INSTRUCTION_FOLLOWING:
             # 다단계 목적지 + 경로 제약 문장이라 단일 target G=(c_tgt,Φ) 파서로는
             # 못 담는다 - 절 단위로 쪼개서 목적지 절마다 같은 LLMQueryParser를 재사용.
-            parsed = mission3_pipe.parse_instruction(self, msg.data)
+            parsed = mission3_pipe.parse_instruction(self, question)
             is_valid = bool(parsed.get("steps"))
         else:
             # SysNav paper Sec. III의 G=(c_tgt, Φ) 파싱을 LLM이 하고, 실패하면 항상
             # 규칙 기반 query_parser.extract_target()로 자동 폴백한다.
-            parsed = self.query_parser.parse(msg.data)
+            parsed = self.query_parser.parse(question)
             is_valid = bool(parsed.get("target"))
         parsed["mission_type"] = mission_type
 
         if not is_valid:
-            self.get_logger().error(f"Could not parse question ({mission_type}): {msg.data}")
+            # 선점은 유지한 채 실패로 남긴다 - _claim_question()이
+            # QUESTION_REPARSE_RETRY_SEC 뒤에 같은 문장을 다시 받아준다(그 전까지는
+            # 1Hz 반복 발행이 그대로 Gemini 호출로 이어지지 않도록 막는다).
+            self.get_logger().error(f"Could not parse question ({mission_type}): {question}")
             return
 
         with self.state_lock: # 읽는 도중 콜백으로 덮어쓰지 않도록 lock을 걸어준다.
@@ -383,6 +457,10 @@ class SysNavNode(Node):
             self._mission2_last_answer_publish = None
             self.task_start_time = time.monotonic()
             self.last_response_summary = None
+            # 여기까지 왔으면 이 문장은 실제 task가 됐다 - 이후 같은 문장의 반복
+            # 발행은 _claim_question()이 전부 무시한다(재시도 간격도 적용 안 됨).
+            self._accepted_question_ok = True
+            self._duplicate_question_count = 0
 
         if not config.KEEP_MEMORY_BETWEEN_TASKS:
             self.object_memory.clear()
@@ -397,12 +475,12 @@ class SysNavNode(Node):
 
         if mission_type == MISSION_INSTRUCTION_FOLLOWING:
             self.get_logger().info(
-                f"📩 NEW QUESTION [{mission_type}] - Task #{self.task_id}: \"{msg.data}\" -> "
+                f"📩 NEW QUESTION [{mission_type}] - Task #{self.task_id}: \"{question}\" -> "
                 f"steps={parsed['steps']}"
             )
         else:
             self.get_logger().info(
-                f"📩 NEW QUESTION [{mission_type}] - Task #{self.task_id}: \"{msg.data}\" -> "
+                f"📩 NEW QUESTION [{mission_type}] - Task #{self.task_id}: \"{question}\" -> "
                 f"target={parsed['target']}, attributes={parsed['attributes']}, "
                 f"relation={parsed['relation']}, references={parsed['reference_objects']}, "
                 f"prompts={parsed['detection_prompts']}, parser={parsed.get('parser', 'rules')}"
@@ -560,11 +638,32 @@ class SysNavNode(Node):
     Occupancy Grid 갱신
     '''
 
+    def stamp_age_sec(self, stamp: float) -> float:
+        """ROS stamp가 지금으로부터 몇 초 전인지. 진단 로그용."""
+        return max(0.0, self.get_clock().now().nanoseconds * 1e-9 - float(stamp))
+
+    def _log_sensor_wait(self, state: str) -> None:
+        """센서가 안 맞아 perception job을 못 던지는 동안 이유를 주기적으로 남긴다.
+        진단 전용이라 주행 로직은 건드리지 않는다 - 예전에는 완전 무음이라 "질문은
+        접수됐는데 그 뒤로 아무 일도 안 일어남" 상태를 밖에서 구분할 수 없었다."""
+        now = time.monotonic()
+        if now - self._last_sensor_wait_log < config.SENSOR_WAIT_LOG_INTERVAL_SEC:
+            return
+        self._last_sensor_wait_log = now
+        reason = self._snapshot_block_reason or "(이유 미기록)"
+        self.get_logger().warning(f"⏳ {state} 대기 - perception 못 던짐: {reason}")
+        activity.add(WARN, f"{state} 대기 - perception 못 던짐", reason)
+
     def sensor_snapshot(self):
         with self.sensor_lock: 
             # 이 블록 안에서 센서 데이터를 읽는 동안 다른 callback이 같은 센서 변수에 접근하는 것을 잠시 막는다.
             # 블록이 끝나면 lock은 자동으로 해제된다.
             if self.latest_image is None or self.latest_pose is None:
+                self._snapshot_block_reason = (
+                    f"latest_image={'None' if self.latest_image is None else 'ok'}, "
+                    f"latest_pose={'None' if self.latest_pose is None else 'ok'} "
+                    f"(scan_buffer={len(self.scan_buffer)}, pose_buffer={len(self.pose_buffer)})"
+                )
                 return None
             image_msg = self.latest_image
             image_stamp = message_stamp_to_sec(image_msg)
@@ -579,7 +678,15 @@ class SysNavNode(Node):
                 config.SENSOR_SYNC_TOLERANCE_SEC,
             )
             if scan_msg is None:
+                stamps = [stamp for stamp, _ in self.scan_buffer]
+                nearest = min((stamp - image_stamp for stamp in stamps), key=abs, default=None)
+                self._snapshot_block_reason = (
+                    "scan_buffer 비어있음" if not stamps else
+                    f"image stamp {image_stamp:.3f}에서 ±{config.SENSOR_SYNC_TOLERANCE_SEC}s 안에 "
+                    f"scan 없음 (scan {len(stamps)}개, 가장 가까운 것 {nearest:+.3f}s)"
+                )
                 return None
+            self._snapshot_block_reason = None
             if pose is None:
                 pose = dict(self.latest_pose) # 참조를 하여 POSE를 넘기는 이유는 callback을 통해 데이터가 변형될 수 있기 때문.
             return image_msg, scan_msg, dict(pose), image_stamp # 4개의 튜플 형태로 반환된다.
@@ -626,7 +733,15 @@ class SysNavNode(Node):
         3D Object Observation
         '''
         # update()의 반환값은 observations 순서에 대응하는 실제 object_id 목록이다.
+        memory_before = self.object_memory.count()
         observed_object_ids = self.object_memory.update(observations, timestamp=image_stamp)
+        memory_after = self.object_memory.count()
+        activity.add(
+            PERCEPTION,
+            f"⑤ 메모리 반영 - 신규 {memory_after - memory_before}개, "
+            f"기존과 병합 {len(set(observed_object_ids)) - (memory_after - memory_before)}개",
+            f"누적 물체 {memory_after}개",
+        )
         observed_object_nodes = [
             node
             for object_id in dict.fromkeys(observed_object_ids)
@@ -646,6 +761,17 @@ class SysNavNode(Node):
             object_ids=observed_object_ids,
             object_nodes=observed_object_nodes,
             task=task,
+        )
+        relation_edges = graph_update.get("relation_edges") or []
+        activity.add(
+            PERCEPTION,
+            "⑥ Scene Graph 갱신"
+            + (f" - viewpoint {graph_update.get('viewpoint_id')} 신규 추가"
+               if graph_update.get("viewpoint_created") else " - viewpoint 추가 없음"),
+            f"새 관계 edge {len(relation_edges)}개"
+            + (f" ({', '.join(str(e.get('relation')) for e in relation_edges[:4])})"
+               if relation_edges else "")
+            + f" | novel_voxels={graph_update.get('novel_voxel_count', 0)}",
         )
         return {
             "task_id": task_id,
@@ -1023,6 +1149,13 @@ class SysNavNode(Node):
             and mission2_pipe.maybe_force_selection_at_deadline(self, state)
         ):
             return
+        # Mission 1도 같은 이유로 탈출구가 필요하다 - 참조 물체를 못 찾으면
+        # mission1_pipe의 게이트가 집계를 계속 미루므로, 예산을 넘기면 강제로 센다.
+        if (
+            task.get("mission_type") == MISSION_NUMERICAL
+            and mission1_pipe.maybe_force_count_at_deadline(self, state)
+        ):
+            return
 
         with self.sensor_lock:
             pose = None if self.latest_pose is None else dict(self.latest_pose)
@@ -1091,9 +1224,19 @@ class SysNavNode(Node):
         if state == "OBSERVE":
             snapshot = self.sensor_snapshot()
             if snapshot is None:
+                self._log_sensor_wait("OBSERVE")
                 return
             image_msg, scan_msg, synced_pose, image_stamp = snapshot
             if image_stamp <= self.last_processed_image_stamp:
+                # 카메라 프레임이 갱신되지 않고 있다. latest_image가 이미 처리한
+                # 프레임 그대로면 여기서 영원히 되돌아가는데, 예전엔 아무 로그도
+                # 없어서 "OBSERVE인데 아무 일도 안 일어남"으로만 보였다.
+                self._snapshot_block_reason = (
+                    f"새 카메라 프레임 없음 - latest_image stamp {image_stamp:.3f}는 "
+                    f"이미 처리함(last_processed={self.last_processed_image_stamp:.3f}, "
+                    f"{self.stamp_age_sec(image_stamp):.1f}초 전 프레임)"
+                )
+                self._log_sensor_wait("OBSERVE")
                 return
             self.submit_job(
                 "perception",

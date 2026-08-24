@@ -67,8 +67,63 @@ MISSION_TIME_LIMIT_SEC = 600.0
 MISSION2_EXPLORATION_TIME_LIMIT_SEC = float(
     os.getenv("MISSION2_EXPLORATION_TIME_LIMIT_SEC", "420.0")
 )
+# Mission 1도 같은 이유로 집계 시각을 보장한다. Mission 1은 "관계의 참조 물체를 다
+# 볼 때까지 집계하지 않는다"는 게이트가 있어서(missions/mission1_pipe.py), 참조 물체가
+# 끝내 안 보이면 답을 영영 못 낼 수 있다. 무응답은 0점이라 최악이므로, 이 시간이 지나면
+# 가진 근거만으로 집계해서 발행한다.
+MISSION1_EXPLORATION_TIME_LIMIT_SEC = float(
+    os.getenv("MISSION1_EXPLORATION_TIME_LIMIT_SEC", "420.0")
+)
+# 참조 물체를 기다리는 동안 같은 로그를 매 사이클 찍지 않기 위한 간격(초).
+MISSION1_MISSING_LOG_INTERVAL_SEC = 10.0
+# 관계 체인이 확정된 뒤, 집계 대상 개수가 이 횟수만큼 연속으로 변하지 않으면 탐색을
+# 끝내고 답을 낸다.
+#
+# 왜 "확정되면 즉시"가 아닌가: "table with a vase" 하나를 검증한 순간에 세면, 그 테이블
+# 주위를 아직 반밖에 안 돌아서 의자가 3개만 잡혀 있을 수 있다(실측 2026-08-24: GT 8개인데
+# 대시보드에 3개). 관계가 확정됐다는 것과 대상을 다 봤다는 것은 다른 얘기다.
+# 반대로 개수가 여러 관측에 걸쳐 그대로면 더 볼 게 없다는 뜻이므로 거기서 끊는다.
+MISSION1_SETTLED_STABLE_OBSERVATIONS = int(
+    os.getenv("MISSION1_SETTLED_STABLE_OBSERVATIONS", "3")
+)
 PERCEPTION_WHILE_MOVING_INTERVAL_SEC = 1.50
+
+# ---------------------------------------------------------------------------
+# 같은 질문의 반복 발행 처리
+#
+# 대회 채점 환경은 /challenge_question을 한 번만 쏘지 않고 **계속 발행**한다
+# (`ros2 topic pub`에서 --once를 뺀 형태 = 1Hz 반복). 예전 question_callback은 들어오는
+# 메시지마다 무조건 새 task로 받아서, 매 초 Gemini 파싱을 다시 돌리고 task_id를 올리고
+# object_memory/scene_graph/coverage_planner를 통째로 초기화했다. 그러면 로봇은 영원히
+# 첫 관측 상태를 벗어나지 못한다.
+#
+# 그래서 "지금 처리 중인 문장과 같은 문장"은 무시한다. 문장이 실제로 바뀌면 그때만
+# 새 task로 받는다.
+# ---------------------------------------------------------------------------
+# 파싱에 실패한 문장은 계속 막아두면 영영 못 받으므로 이 간격 뒤에는 다시 시도한다.
+# (1Hz 그대로 재시도하면 Gemini 호출로 시간 예산을 태운다.)
+QUESTION_REPARSE_RETRY_SEC = float(os.getenv("QUESTION_REPARSE_RETRY_SEC", "30.0"))
+# 중복 문장을 몇 개 버렸는지 알려주는 로그 간격(초). 매번 찍으면 로그가 도배된다.
+QUESTION_DUPLICATE_LOG_INTERVAL_SEC = 30.0
 SENSOR_SYNC_TOLERANCE_SEC = 0.30
+# perception job을 못 던지고 대기하는 동안 그 이유를 다시 찍기까지의 간격(초).
+# 진단 전용 - sysnav_node._log_sensor_wait() 참고.
+SENSOR_WAIT_LOG_INTERVAL_SEC = 5.0
+
+# 카메라 파이프라인이 밀려서 image stamp가 scan보다 한참 뒤처질 때의 구제책.
+#
+# 실측(2026-08-24): /camera/image는 압축 스트림을 sim_image_repub이 3.7MB 생이미지로
+# 다시 뿌리는 구조라, 시뮬레이터가 느려지면 image stamp가 scan 버퍼 전체보다 오래돼서
+# ±0.30s 동기화가 **영원히** 실패한다. 그러면 perception job을 한 번도 못 던지고
+# OBSERVE에서 무한 대기한다(로봇이 한 발짝도 안 움직임).
+#
+# 그렇다고 아무 때나 짝지으면 안 된다 - 이미지와 스캔이 다른 시점이면 LiDAR grounding이
+# 엉뚱한 3D 좌표를 만든다. 하지만 **로봇이 그 사이에 사실상 안 움직였다면** 두 센서가
+# 보는 장면이 같으므로 짝지어도 안전하다. 그래서 "얼마나 오래됐나"가 아니라
+# "그 사이 얼마나 움직였나"로 허용 여부를 정한다.
+SENSOR_SYNC_FALLBACK_MAX_SEC = float(os.getenv("SENSOR_SYNC_FALLBACK_MAX_SEC", "5.0"))
+SENSOR_SYNC_FALLBACK_MAX_MOVE_M = 0.15
+SENSOR_SYNC_FALLBACK_MAX_YAW_RAD = 0.15
 SCAN_BUFFER_SIZE = 40
 POSE_BUFFER_SIZE = 100
 # base autonomy(waypointConverter.cpp)의 자체 도착 판정 반경(waypointXYRadius)이 0.3m라

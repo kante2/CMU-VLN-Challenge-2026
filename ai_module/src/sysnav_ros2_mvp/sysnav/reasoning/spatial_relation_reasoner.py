@@ -72,6 +72,9 @@ class SpatialRelationReasoner:
                     task=task, candidates=candidates,
                     records=records, accepted=gemini_edges, method="gemini",
                 )
+                gemini_edges = self._veto_impossible_contacts(
+                    gemini_edges, records, viewpoint_pose
+                )
                 if gemini_edges:
                     return gemini_edges
             except Exception:
@@ -400,6 +403,14 @@ Instruction: {question}
 Visible objects: {json.dumps(object_summary, ensure_ascii=False)}
 Candidate checks (each has its own normalized relation): {json.dumps(candidates, ensure_ascii=False)}
 
+Relation glossary (physical contact relations are strict):
+  - "on"       : the SOURCE object physically rests on the TARGET's top surface.
+  - "supports" : the reverse - the TARGET object physically rests on the SOURCE's
+                 top surface ("the table WITH a vase ON it" -> table supports vase).
+                 Being visible in the same picture, or on a nearby shelf, is NOT
+                 enough - the object must be sitting on that surface, touching it.
+  - "above"/"under" : vertically stacked but not necessarily touching.
+
 The image is annotated with exact object IDs. For every candidate check, decide whether
 its own requested relation is visibly true between its source and target object(s). Return
 only candidates that are true. Preserve the provided source_object_id, target_object_ids,
@@ -477,6 +488,43 @@ ambiguous must be omitted.
                 "reason": str(item.get("reason", "")),
             })
         return output
+
+    # 이미지만으로는 판정이 구조적으로 불가능한 관계들. 360도 파노라마는 원근이
+    # 심하게 왜곡돼서, 몇 미터 떨어진 선반 위 물건과 바닥의 스툴이 "위에 놓인" 것처럼
+    # 보인다(2026-08-24 실측). 반면 "윗면에 얹혀 있다"는 3D bbox로 확실히 반증할 수
+    # 있으므로, 이 관계에 한해 기하 판정에 거부권을 준다. 다른 관계(near/left_of 등)는
+    # 기존대로 Gemini 판단을 그대로 쓴다 - 거기서는 이미지가 더 정확하다.
+    _CONTACT_RELATIONS = ("on", "supports")
+
+    def _veto_impossible_contacts(
+        self,
+        edges: list[dict],
+        records: dict[int, dict],
+        viewpoint_pose: dict,
+    ) -> list[dict]:
+        """Gemini가 통과시킨 edge 중 접촉 관계는 3D bbox로 반증되면 버린다."""
+        kept = []
+        for edge in edges:
+            if edge.get("relation") not in self._CONTACT_RELATIONS:
+                kept.append(edge)
+                continue
+            source = records.get(edge["source_object_id"])
+            targets = [records[i] for i in edge["target_object_ids"] if i in records]
+            if source is None or not targets:
+                kept.append(edge)
+                continue
+            holds, _, reason = self._geometry_check(
+                edge["relation"], source, targets, viewpoint_pose
+            )
+            if holds:
+                kept.append(edge)
+            else:
+                print(
+                    f"[spatial_relation_reasoner] 관계 거부(기하 반증): "
+                    f"{edge['relation']} {edge['source_object_id']}->"
+                    f"{edge['target_object_ids']} - {reason}"
+                )
+        return kept
 
     def _infer_with_geometry(
         self,
@@ -663,6 +711,26 @@ ambiguous must be omitted.
             return self._vertical_relation(
                 gap, source_min, source_max, target_min, target_max
             )
+        if relation == "supports":
+            # "the table WITH a vase ON it" - source(table) 위에 target(vase)이 **놓여
+            # 있다**. under/above와 반드시 구분해야 한다: 그쪽은 "캐비닛 위 0.5~1.2m에
+            # 걸린 그림"을 위한 판정이라 높이차 2.0m/수평 0.60m까지 허용하는데,
+            # 그 느슨함으로 "on"을 판정하면 선반 위 화병과 3m 떨어진 스툴이 짝지어진다
+            # (2026-08-24 실측: vase(2.19,-0.89,1.24) vs table(1.71,1.93,0.24), 수평 2.86m).
+            # 접촉 관계는 "윗면에 얹혀 있다"가 물리적 사실이므로 on과 같은 기준을 쓴다.
+            vertical_gap = float(target_min[2] - source_max[2])
+            horizontal_inside = (
+                source_min[0] - config.SCENE_GRAPH_ON_HORIZONTAL_MARGIN_M
+                <= float(target_position[0])
+                <= source_max[0] + config.SCENE_GRAPH_ON_HORIZONTAL_MARGIN_M
+                and source_min[1] - config.SCENE_GRAPH_ON_HORIZONTAL_MARGIN_M
+                <= float(target_position[1])
+                <= source_max[1] + config.SCENE_GRAPH_ON_HORIZONTAL_MARGIN_M
+            )
+            holds = abs(vertical_gap) <= config.SCENE_GRAPH_ON_VERTICAL_TOLERANCE_M and horizontal_inside
+            confidence = max(0.0, 1.0 - abs(vertical_gap) / max(config.SCENE_GRAPH_ON_VERTICAL_TOLERANCE_M, 1e-6))
+            return holds, confidence, f"vertical_gap={vertical_gap:.3f}m, horizontal_inside={horizontal_inside}"
+
         if relation == "on":
             vertical_gap = float(source_min[2] - target_max[2])
             horizontal_inside = (

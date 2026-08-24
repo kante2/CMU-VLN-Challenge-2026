@@ -70,6 +70,13 @@ _RELATION_ALIASES = {
     "farthest": "farthest",
     "furthest": "farthest",
     "next_to": "beside",
+    # "the table with a vase on it" - 소유/포함 표현도 결국 "vase on table"이라
+    # 표준 관계로 접어준다. 별칭이 없으면 LLM이 "with"를 그대로 내보내고,
+    # scene_graph의 relation 판정이 모르는 관계라 edge가 아예 안 생긴다.
+    "with": "supports",
+    "has": "supports",
+    "holding": "supports",
+    "topped_with": "supports",
 }
 
 _PROMPT_TEMPLATE = """
@@ -83,6 +90,15 @@ Each element of Φ is either:
     it in the target's "attributes".
   - a spatial or comparative relation to another object -> put it in
     "constraints", in the order it appears in the sentence.
+
+IMPORTANT - constraints form a CHAIN, not a flat list about the target:
+constraint[0] relates the TARGET to its reference. constraint[1] relates
+**constraint[0]'s reference** to the next object, constraint[2] relates
+constraint[1]'s reference, and so on. So a clause that describes the reference
+object ("the table WITH A VASE ON IT", "the chair NEXT TO THE WINDOW") is NOT
+dropped and is NOT attached to the target - it becomes the next constraint in
+the chain. Never omit such a clause: every object noun in the instruction must
+appear either as the target or as some constraint's reference.
 
 Instruction: {question}
 
@@ -107,8 +123,26 @@ Rules:
   counted) - never include "how many"/"count"/"the number of" or the verb
   "is"/"are"/"was"/"were" in target.
 - Each constraint has a canonical snake_case relation (near, beside, left_of,
-  right_of, in_front_of, behind, on, under, above, between, nearest, farthest) and concrete
+  right_of, in_front_of, behind, on, supports, under, above, between, nearest,
+  farthest) and concrete
   reference objects.
+- Relations are written FROM THE SOURCE OBJECT'S POINT OF VIEW, so a clause of the
+  form "the X with a Y <somewhere> it" must be INVERTED - the sentence describes
+  where Y is relative to X, and you must state where X stands relative to Y:
+    "the table with a vase ON it"      -> table SUPPORTS vase
+       ("supports" = the reference object physically rests on this object's top
+        surface; use it for "has X on it" / "with X on it")
+    "the cabinet with a picture ABOVE it"  -> cabinet UNDER picture
+    "the shelf with a box UNDER it"        -> shelf ABOVE box
+  Never copy the preposition unchanged into the relation for these clauses.
+- Chain example - "How many chairs are near the table with a vase on it?":
+    target      = {{"category": "chair", "attributes": []}}
+    constraints = [
+      {{"relation": "near",  "references": [{{"category": "table", "attributes": []}}]}},
+      {{"relation": "supports", "references": [{{"category": "vase", "attributes": []}}]}}
+    ]
+  (chair near table, AND that table has the vase resting on it. Two constraints, three objects -
+  emitting only the first one silently answers a different question.)
 - Do not invent objects or constraints that are not stated in the instruction.
 """.strip()
 

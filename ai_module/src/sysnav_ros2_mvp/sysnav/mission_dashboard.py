@@ -151,6 +151,7 @@ _CATEGORY_STYLE = {
     "job":   ("#7c3aed", "작업"),
     "llm":   ("#c2410c", "LLM"),
     "nav":   ("#0f766e", "주행"),
+    "percep": ("#0891b2", "인식"),
     "warn":  ("#b91c1c", "경고"),
 }
 
@@ -179,7 +180,7 @@ def _now_panel() -> str:
     return "".join(blocks)
 
 
-def _activity_panel(limit: int = 40) -> str:
+def _activity_panel(limit: int = 80) -> str:
     events = activity.recent(limit)
     if not events:
         return '<div style="color:#9ca3af;font-size:13px;">아직 기록된 활동이 없습니다.</div>'

@@ -24,6 +24,10 @@ STATE = "state"   # 상태 머신 전이
 JOB = "job"       # 백그라운드 작업(perception/selection/exploration ...)
 LLM = "llm"       # Gemini 등 외부 모델 질의
 NAV = "nav"       # 주행 판단(목표 발행/스냅/포기 등)
+# OBSERVE 한 사이클 안에서 실제로 무슨 일이 일어나는지(검출 -> 재확인 -> 분할 ->
+# 3D 확정 -> 메모리/그래프 반영). 예전에는 "인식 작업 시작/완료 18.1초"만 보여서
+# 그 18초 동안 어디서 시간을 쓰는지, 무엇이 몇 개 잡혔는지 알 수 없었다.
+PERCEPTION = "percep"
 WARN = "warn"     # 문제 상황
 
 _CAPACITY = 300
