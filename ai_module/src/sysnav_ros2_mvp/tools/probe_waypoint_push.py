@@ -19,7 +19,14 @@ poseHandler / waypointAdj 분기를 그대로 옮겨왔다:
 대해 그 조건도 같이 표시한다.
 
 실행 (system 컨테이너 안):
-    python3 /path/to/probe_waypoint_push.py
+    python3 /path/to/probe_waypoint_push.py                # 로봇 주변 링을 훑는다
+    python3 /path/to/probe_waypoint_push.py 2.84 1.43      # 특정 좌표 하나만 본다
+    python3 /path/to/probe_waypoint_push.py 2.84,1.43 3.1,0.8
+
+좌표를 주면 링 스캔 대신 그 좌표들만 조사한다. sysnav 로그의
+`target goal (X, Y) is not commandable`에 찍힌 좌표를 그대로 넣어서, waypointConverter가
+그 좌표로 실제 무엇을 하는지(후보를 찾는가 / 어디로 스냅하는가 / 즉시 "도착" 처리되는가)를
+로봇을 움직이지 않고 확인하는 용도다.
 """
 
 from __future__ import annotations
@@ -129,7 +136,7 @@ class WaypointPushProbe(Node):
 
     # ------------------------------------------------------------------
 
-    def run(self) -> str:
+    def run(self, probes: list[tuple[float, float]] | None = None) -> str:
         vx, vy, _ = self.pose
         lines = ["=" * 96,
                  "waypointConverter가 우리 좌표를 옮기는 정도 (read-only 재현, 로봇 안 움직임)",
@@ -141,27 +148,41 @@ class WaypointPushProbe(Node):
                  "                                 clearance",
                  "-" * 96]
 
+        # 좌표를 명시적으로 받았으면 그것만, 아니면 로봇 주변 링을 훑는다.
+        if probes:
+            targets = [
+                (math.dist((vx, vy), point),
+                 math.degrees(math.atan2(point[1] - vy, point[0] - vx)),
+                 point)
+                for point in probes
+            ]
+        else:
+            targets = [
+                (radius, float(angle),
+                 (vx + radius * math.cos(math.radians(angle)),
+                  vy + radius * math.sin(math.radians(angle))))
+                for radius in PROBE_RADII_M
+                for angle in PROBE_ANGLES_DEG
+            ]
+
         pushes, instant_reached, unusable = [], 0, 0
-        for radius in PROBE_RADII_M:
-            for angle in PROBE_ANGLES_DEG:
-                theta = math.radians(angle)
-                requested = (vx + radius * math.cos(theta), vy + radius * math.sin(theta))
-                clearance = self.clearance_at(requested)
-                result = self.snap(requested)
-                actual = result.get("actual")
-                if actual is None:
-                    unusable += 1
-                    lines.append("%4.1fm %4d°  (%6.2f,%6.2f)   %5.2fm     %-18s   -       -"
-                                 % (radius, angle, *requested, clearance, result["reason"][:18]))
-                    continue
-                push = math.dist(requested, actual)
-                pushes.append(push)
-                # 스냅 지점이 로봇에서 waypointXYRadius 안이면 그 즉시 "도착"으로 처리된다.
-                reached_now = math.dist((vx, vy), actual) < WAYPOINT_XY_RADIUS
-                instant_reached += reached_now
-                lines.append("%4.1fm %4d°  (%6.2f,%6.2f)   %5.2fm     (%6.2f,%6.2f)   %5.2fm   %s"
-                             % (radius, angle, *requested, clearance, *actual, push,
-                                "예 ← 즉시 도착 처리" if reached_now else ""))
+        for radius, angle, requested in targets:
+            clearance = self.clearance_at(requested)
+            result = self.snap(requested)
+            actual = result.get("actual")
+            if actual is None:
+                unusable += 1
+                lines.append("%4.1fm %4.0f°  (%6.2f,%6.2f)   %5.2fm     %-18s   -       -"
+                             % (radius, angle, *requested, clearance, result["reason"][:18]))
+                continue
+            push = math.dist(requested, actual)
+            pushes.append(push)
+            # 스냅 지점이 로봇에서 waypointXYRadius 안이면 그 즉시 "도착"으로 처리된다.
+            reached_now = math.dist((vx, vy), actual) < WAYPOINT_XY_RADIUS
+            instant_reached += reached_now
+            lines.append("%4.1fm %4.0f°  (%6.2f,%6.2f)   %5.2fm     (%6.2f,%6.2f)   %5.2fm   %s"
+                         % (radius, angle, *requested, clearance, *actual, push,
+                            "예 ← 즉시 도착 처리" if reached_now else ""))
 
         total = len(pushes) + unusable
         lines += ["", "요약", "-" * 50]
@@ -204,7 +225,19 @@ class WaypointPushProbe(Node):
         return "\n".join(parts)
 
 
+def parse_probes(argv: list[str]) -> list[tuple[float, float]]:
+    """"2.84 1.43" / "2.84,1.43" / 여러 좌표 섞어쓰기를 전부 받는다."""
+    numbers: list[float] = []
+    for token in argv:
+        for piece in token.replace(",", " ").split():
+            numbers.append(float(piece))
+    if len(numbers) % 2:
+        raise SystemExit("좌표는 x y 쌍으로 주세요 (예: 2.84 1.43)")
+    return [(numbers[i], numbers[i + 1]) for i in range(0, len(numbers), 2)]
+
+
 def main() -> int:
+    probes = parse_probes(sys.argv[1:])
     rclpy.init()
     node = WaypointPushProbe()
     deadline = node.get_clock().now().nanoseconds + int(20e9)
@@ -218,7 +251,7 @@ def main() -> int:
     # 최신 terrain 몇 프레임을 더 받아 안정된 스냅샷을 쓴다.
     for _ in range(10):
         rclpy.spin_once(node, timeout_sec=0.2)
-    print(node.run())
+    print(node.run(probes))
     node.destroy_node()
     rclpy.shutdown()
     return 0

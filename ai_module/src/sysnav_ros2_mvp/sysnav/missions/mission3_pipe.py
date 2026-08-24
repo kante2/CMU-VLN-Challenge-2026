@@ -700,6 +700,11 @@ def _start_navigate_to_point(
     # marker_index를 넘기면 주행 중 목표가 다시 잡힐 때 RViz 마커도 따라 옮겨진다
     # (node.refresh_goal_marker()). 마커를 여기서 직접 그리지 않는 이유도 그것이다 -
     # 그리는 곳이 두 군데면 한쪽만 갱신되어 어긋난다.
+    #
+    # 새 subgoal이므로 재발행 카운터를 0으로 되돌린다. **재발행 경로에서는 절대 리셋하면
+    # 안 된다** - 그러면 카운터가 영원히 0이라 MISSION3_SUBGOAL_MAX_RETRIES 상한이
+    # 무의미해지고, 막으려던 무한루프가 그대로 돈다.
+    node.mission3_subgoal_retries = 0
     node.start_target_navigation(
         pose, (x, y), theta,
         forbidden_mask=node.mission3_forbidden_mask,
@@ -733,6 +738,15 @@ def _navigate_step(node, task: dict, pose: dict) -> None:
     if outcome == "driving":
         return
     if outcome == "unreachable":
+        node.mission3_subgoal_retries += 1
+        if node.mission3_subgoal_retries >= config.MISSION3_SUBGOAL_MAX_RETRIES:
+            # 포기하기 전에 딱 한 번, 물체 접근 상한(0.9m)을 풀고 "base autonomy가
+            # 허용하는 가장 가까운 지점"을 찾아본다. 그 상한은 의미 규칙이라 평소엔
+            # 지켜야 하지만, 여기까지 왔다는 건 지키면 이 step을 통째로 잃는다는 뜻이다.
+            if _retry_with_relaxed_approach(node, pose):
+                return
+            _give_up_step(node, task)
+            return
         # marker까지 만든 확정 subgoal은 탐사 목표로 덮어쓰지 않는다. 예전에는 여기서
         # PLAN_EXPLORATION으로 돌아가 /way_point_with_heading에 전혀 다른 frontier를
         # 발행했기 때문에, RViz에는 goalN이 남아 있는데 로봇은 다른 곳으로 향했다.
@@ -780,5 +794,79 @@ def _navigate_step(node, task: dict, pose: dict) -> None:
     )
     node.clear_target_navigation()
     node.mission3_step_index += 1
+    node.mission3_subgoal_retries = 0
     with node.state_lock:
         node.state = "MISSION3_SELECT_STEP"
+
+
+def _retry_with_relaxed_approach(node, pose: dict) -> bool:
+    """MISSION3_OBJECT_APPROACH_MAX_M을 풀고 접근점을 다시 고른다. 성공하면 True.
+
+    실측 2026-08-24(probe_waypoint_push.py): 이 씬은 travArea의 **7.1%**만 base
+    autonomy가 목적지로 받아준다(clearance >= 0.75m). 그런데 Mission 3의 링 샘플링은
+    0.9m 링 하나 x 7각도 = 후보 7개만 보므로 거의 항상 실패하고, terrain을 안 보는
+    고정 standoff로 폴백해 명령 불가한 좌표를 잡았다. 여기서는 링이 아니라 통과 지점
+    집합을 직접 훑으므로, 갈 수 있는 곳이 있으면 결정론적으로 찾아낸다.
+
+    물체가 아닌 좌표를 향하던 step(between/near point)은 다시 고를 물체가 없으므로
+    False를 돌려 그대로 포기한다.
+    """
+    object_xy = node.target_object_xy
+    if object_xy is None:
+        return False
+    x, y, theta = node.approach_pose_for(
+        pose, (object_xy[0], object_xy[1], 0.0),
+        max_distance_m=config.MISSION3_OBJECT_APPROACH_MAX_M,
+        allow_relaxed=True,
+    )
+    if node.target_goal_xy is not None and math.hypot(
+        x - node.target_goal_xy[0], y - node.target_goal_xy[1]
+    ) < config.GOAL_REACHED_DISTANCE_M:
+        # 같은 자리를 다시 고른 것이면 재시도해봐야 결과가 같다.
+        return False
+    node.start_target_navigation(
+        pose, (x, y), theta,
+        forbidden_mask=node.target_forbidden_mask,
+        object_id=node.target_object_id,
+        object_xy=object_xy,
+        marker_index=node.target_marker_index,
+    )
+    node.mission3_subgoal_retries = 0
+    node.refresh_goal_marker()
+    with node.state_lock:
+        node.state = "MISSION3_NAVIGATE_STEP"
+    node.get_logger().warning(
+        f"🚧 step {node.mission3_step_index + 1}: the {config.MISSION3_OBJECT_APPROACH_MAX_M:.1f}m "
+        f"approach limit is unreachable here - relaxing it and retargeting to "
+        f"({x:.2f}, {y:.2f}) [{node.terrain_monitor.last_selection}]"
+    )
+    return True
+
+
+def _give_up_step(node, task: dict) -> None:
+    """확정된 subgoal을 계속 발행하지 못했다 - 그 step을 포기하고 다음으로 넘어간다.
+
+    mission3는 marker까지 만든 subgoal을 탐사 목표로 덮어쓰지 않는데(채점이 subgoal
+    순서와 궤적을 보므로), 그 정책에 상한이 없어서 목적지가 base autonomy에게 명령
+    불가한 자리이면 "재발행 -> 거부 -> unreachable -> 재발행"을 영원히 돌았다.
+
+    실측 2026-08-24: 변기 접근점의 clearance가 0.42m라 waypointConverter가 후보로
+    안 받았고(기준 0.75m), 스냅하면 로봇에서 0.36m 지점으로 떨어져 갈 거리가 없었다.
+    이 씬은 travArea의 7.1%만 명령 가능해서 그런 자리가 드물지 않다.
+
+    한 step에 갇혀 남은 step을 통째로 버리는 것보다, 여기까지를 최선으로 인정하고
+    다음 step으로 가는 쪽이 부분점수에서 항상 낫다. 다만 그 사실을 로그에 분명히
+    남긴다 - "지나갔다"와 "못 갔지만 넘어갔다"가 구분돼야 한다.
+    """
+    steps = task["steps"]
+    index = node.mission3_step_index
+    node.clear_target_navigation()
+    node.mission3_step_index += 1
+    node.mission3_subgoal_retries = 0
+    with node.state_lock:
+        node.state = "MISSION3_SELECT_STEP"
+    node.get_logger().warning(
+        f"🚧 step {index + 1}/{len(steps)} GIVEN UP - the committed subgoal was not "
+        f"commandable for {config.MISSION3_SUBGOAL_MAX_RETRIES} consecutive attempts "
+        f"({node.terrain_monitor.last_selection}); moving on to keep the remaining steps"
+    )

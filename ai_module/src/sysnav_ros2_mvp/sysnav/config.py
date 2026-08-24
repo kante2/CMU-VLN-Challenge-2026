@@ -99,6 +99,16 @@ MISSION3_OBJECT_APPROACH_MAX_M = 0.9
 # (missions/path_gate.py). 물체 바로 옆을 스치듯 통과하는 경우까지 잡으려고 선분을 양쪽
 # 끝에서 이만큼 연장한 뒤 교차를 판정한다.
 MISSION3_GATE_EXTENSION_M = 0.3
+# 확정된 subgoal을 몇 번 연속 "도달 불가"로 받고도 계속 재발행할 것인가.
+#
+# mission3는 한 번 marker까지 만든 subgoal을 탐사 목표로 덮어쓰지 않는다(채점이 subgoal
+# 순서와 실제 궤적을 보므로 RViz의 goalN과 로봇이 향하는 곳이 달라지면 안 된다). 그런데
+# 그 정책에 상한이 없어서, 목적지가 base autonomy에게 명령 불가한 자리이면 "재발행 ->
+# 발행 거부 -> unreachable -> 재발행"을 영원히 돌았다(실측 2026-08-24: 변기 앞에서 0.5초
+# 주기로 무한 정지). 이 횟수를 넘으면 그 step은 "여기까지가 최선"으로 인정하고 다음
+# step으로 넘어간다 - 한 step에 갇혀 남은 step을 통째로 버리는 것보다 부분점수가 낫다.
+# 0.5초 주기 x 20 = 약 10초.
+MISSION3_SUBGOAL_MAX_RETRIES = int(os.getenv("SYSNAV_MISSION3_SUBGOAL_MAX_RETRIES", "20"))
 
 # Object Reference 답안(/selected_object_marker) 재발행 주기.
 #
@@ -225,6 +235,24 @@ TERRAIN_APPROACH_STEP_M = 0.20
 # 로봇->물체 방향 기준 각도 오프셋(도). 정면 접근이 막혀도 옆에서 되는 경우가 많다.
 TERRAIN_APPROACH_ANGLES_DEG = (0.0, 20.0, -20.0, 40.0, -40.0, 60.0, -60.0)
 
+# 위 링 샘플링이 전부 실패했을 때, commandable set을 **직접** 훑어 물체에 가장 가까운
+# 지점을 고르는 폴백의 상한(물체로부터의 거리).
+#
+# 왜 필요한가 (실측 2026-08-24, probe_waypoint_push.py):
+#   이 씬은 travArea 1066점 중 clearance >= 0.75m를 통과하는 점이 **7.1%(76점)뿐**이다.
+#   그런데 Mission 3의 링 샘플링은 MISSION3_OBJECT_APPROACH_MAX_M(0.9m) 때문에 링 하나 x
+#   7각도 = 후보 7개만 본다. 76/1066 확률에서 링 7점이 걸릴 리가 없어서 거의 항상 실패하고,
+#   terrain을 아예 안 보는 고정 standoff로 폴백했다. 그 좌표(clearance 0.42m)를 발행하려다
+#   막혀서 mission3가 같은 subgoal을 무한 재발행했다(변기 앞에서 로봇이 영원히 정지).
+#   링 반경/각도 운에 맡기는 대신 통과 지점 집합을 직접 훑으면 "base autonomy가 허용하는
+#   가장 가까운 standoff"가 결정론적으로 나온다.
+#
+# 상한을 두는 이유: 무제한이면 벽 너머 다른 방의 점이 기하학적으로 더 가깝다는 이유로
+# 뽑힐 수 있다(travArea는 연결성을 모른다). 이 안에서 못 찾으면 못 가는 게 맞다.
+TERRAIN_APPROACH_FALLBACK_MAX_M = float(
+    os.getenv("SYSNAV_TERRAIN_APPROACH_FALLBACK_MAX_M", "3.0")
+)
+
 # terrain 데이터가 이보다 오래되면 판정하지 않는다(보류).
 TERRAIN_STALE_SEC = 3.0
 
@@ -312,6 +340,39 @@ SAM2_DEVICE = os.getenv("SAM2_DEVICE", "cuda")
 SAM2_MIN_MASK_AREA_PX = 80
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+
+# Numerical 개수 세기(reasoning/vlm_counter.py) 전용 모델. 다른 호출과 분리한 이유:
+# 이 호출은 질문당 1회뿐이라 상위 모델을 써도 예산에 거의 영향이 없는 반면, 파노라마
+# 한 장에서 제약을 만족하는 물체를 빠짐없이 세는 건 이 시스템에서 가장 어려운 추론이다.
+# 반대로 GEMINI_MODEL을 통째로 올리면 perception/detection_verifier.py까지 느려져서
+# 탐사 시간을 깎아먹는다. 이 모델 호출이 실패하면(모델명 오타, 권한/쿼터 없음 등)
+# GEMINI_MODEL로 한 번 더 시도한다.
+#
+# 기본값이 flash인 이유(kante/fix_mission_1 실측): loft viewpoint_000010
+# ("How many black pillows are on the sofa?") 5회 투표에서 flash [2,3,3,3,3] -> 3, 6.6초 /
+# pro [2,3,2,2,2] -> 2, 66.2초. 정확도 이득이 확인되지 않았고, pro는 부하가 걸리면
+# 응답이 극단적으로 느려져(95.9초) MISSION1_FINALIZE_COUNT가 몇 분간 멈춘 적이 있다.
+GEMINI_COUNTING_MODEL = os.getenv("GEMINI_COUNTING_MODEL", "gemini-3.5-flash")
+# VLM 개수 세기 호출 하나의 상한(초). 없으면 모델이 느려졌을 때 finalize가 무한정
+# 매달린다. 끊기면 폴백 모델 -> 그것도 실패하면 기하 기반 개수(fail-quiet).
+GEMINI_COUNTING_TIMEOUT_SEC = float(os.getenv("GEMINI_COUNTING_TIMEOUT_SEC", "45"))
+
+# Numerical 미션의 개수를, 대상 물체를 가장 많이 담은 viewpoint 파노라마 한 장으로
+# VLM에게 직접 세게 한다(reasoning/vlm_counter.py). object_memory 기반 집계는 **탐지
+# 재현율에 갇힌다** - 실측(home_building_1)에서 pillow가 GT 18개인데 메모리엔 7개만
+# 남았다. 베개 4개 중 2개만 탐지되면 병합·필터를 아무리 손봐도 답은 영원히 2다.
+# 뷰를 한 장으로 확정하는 이유는 여러 뷰의 개수를 합치면 같은 물체가 중복 계산되기
+# 때문이다. 실패하면 기존 기하 기반 개수를 그대로 쓴다 - 개수 미션은 0/1 채점이라
+# "답을 못 냄"이 최악이다.
+NUMERICAL_VLM_COUNT_ENABLED = os.getenv(
+    "SYSNAV_NUMERICAL_VLM_COUNT", "1"
+) not in ("0", "false", "False")
+# 같은 이미지를 이 횟수만큼 병렬로 물어보고 최빈 개수를 채택한다(self-consistency).
+# temperature=0.0인데도 API 응답이 결정적이지 않아 1회 호출은 사실상 동전던지기다 -
+# 실측: temp 0.0에서 4회가 [3,3,3,2], temp 0.7에서 [2,2,2,3]. 0/1 채점에서 이 흔들림은
+# 그대로 점수 손실이라 다수결로 고정한다. 병렬이라 지연은 1회와 비슷하고(4회 ~10s),
+# 질문당 한 번뿐이라 예산 영향도 거의 없다. 1로 두면 단일 호출로 동작한다.
+NUMERICAL_VLM_COUNT_SAMPLES = int(os.getenv("SYSNAV_NUMERICAL_VLM_COUNT_SAMPLES", "5"))
 GEMINI_TEMPERATURE = 0.0
 
 # 문장 -> (target, attributes, relation_chain) 파싱을 LLM(Gemini)이 하도록 켤지.
@@ -457,7 +518,7 @@ OCC_OCCUPIED = 100
 # 원래 0.45 -> 0.30으로 낮췄는데도 문 통과가 잘 안 돼서 더 낮춤(최소 통과 폭 0.4m).
 # 실제 로봇 폭을 몰라 정확한 값은 아니니, 나중에 실측되면 갱신할 것 - 로봇이 문틀에
 # 부딪히면 다시 올려야 한다.
-ROBOT_CLEARANCE_M = 0.10 # 0.10 -> 0.0 ? ***
+ROBOT_CLEARANCE_M = 0.0 # 0.10 -> 0.0 ? ***
 
 # frontier anchor(is_near_visited 예외 대상, 문 통과 문제 때문에 도입)가 plan_route()
 # 호출마다 계속 다시 잡히면(=그 옆 unknown 셀이 영영 안 풀림, 예: 유리창이라 LiDAR가

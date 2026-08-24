@@ -226,13 +226,26 @@ class TerrainMonitor:
         return self._supported(trav, obstacle, np.array([x, y], dtype=np.float64))
 
     def choose_approach_point(
-        self, object_xy, robot_xy, max_distance_m: float | None = None
+        self,
+        object_xy,
+        robot_xy,
+        max_distance_m: float | None = None,
+        allow_relaxed: bool = False,
     ) -> tuple[float, float] | None:
         """물체로 접근할 지점을 고른다. 물체에서 가까운 순서로 후보를 훑어 첫 통과점을
         반환한다 - "go near X"이므로 통과하는 것 중 가장 가까운 지점이 좋다.
 
         로봇->물체 방향을 기준으로 각도를 벌려가며 찾는 이유: 정면 접근이 막혀도
         (벽에 붙은 물체, 앞을 막은 가구) 옆에서 접근하면 통과하는 경우가 많다.
+
+        allow_relaxed=True는 **최후의 수단**이다: 링 샘플링이 전부 실패했을 때
+        max_distance_m 상한을 풀고 commandable set을 직접 훑어 물체에 가장 가까운
+        통과 지점을 고른다(TERRAIN_APPROACH_FALLBACK_MAX_M까지).
+
+        기본값이 False인 이유: Mission 3의 MISSION3_OBJECT_APPROACH_MAX_M(0.9m)은 탐색
+        범위가 아니라 **의미 규칙**이다 - 물체에서 2m 떨어져 서 놓고 "go to X를 했다"고
+        할 수 없다. 그래서 평상시에는 그 상한을 반드시 지키고, "여기서 더 버티면 그
+        step을 통째로 잃는다"가 확정된 순간에만 호출 측이 명시적으로 풀어준다.
 
         반환 None = 통과 지점을 못 찾음. 호출 측은 기존 방식(고정 standoff)으로
         폴백해야 한다. terrain 판정 실패가 주행 자체를 막으면 안 된다.
@@ -286,6 +299,20 @@ class TerrainMonitor:
                     best_clearance = clearance
             distance += config.TERRAIN_APPROACH_STEP_M
 
+        # 링 샘플링이 전부 실패했다 - 호출 측이 허락했을 때만, 반경/각도 운에 맡기는
+        # 대신 통과 지점 집합을 직접 훑는다(TERRAIN_APPROACH_FALLBACK_MAX_M 주석 참고).
+        direct = (
+            self._nearest_commandable_to_object(trav, obstacle, object_xy, robot_xy)
+            if allow_relaxed else None
+        )
+        if direct is not None:
+            point, gap = direct
+            self.last_selection = (
+                f"relaxed commandable-set fallback: {gap:.2f}m from object "
+                f"(ring x{tried} all failed, mission limit {max_distance:.2f}m waived)"
+            )
+            return float(point[0]), float(point[1])
+
         if best_clearance is None:
             verdict = f"all {tried} unobserved (no travArea point within " \
                       f"{config.TERRAIN_SUPPORT_RADIUS_M:.2f}m)"
@@ -298,6 +325,60 @@ class TerrainMonitor:
             f"no supported point ({verdict}, trav={len(trav)}, obstacle={len(obstacle)})"
         )
         return None
+
+    @classmethod
+    def _nearest_commandable_to_object(
+        cls, trav: np.ndarray, obstacle: np.ndarray, object_xy, robot_xy
+    ) -> tuple[np.ndarray, float] | None:
+        """waypointConverter가 후보로 인정하는 점들 중 물체에 가장 가까운 것.
+
+        후보 조건은 waypointConverter와 동일하게 맞춘다:
+          - 관측된 travArea 점
+          - 차량에서 searchDisThre 안 (그 밖은 저쪽이 후보로 안 봄)
+          - 모든 obstacleArea 점에서 TERRAIN_CLEARANCE_M 이상
+        여기에 두 가지를 더 건다:
+          - 물체에서 TERRAIN_APPROACH_FALLBACK_MAX_M 안 (벽 너머 오검출 방지)
+          - 지금 로봇보다 물체에 더 가까울 것 (전진이 없는 "접근점"은 의미가 없다)
+
+        반환: (좌표, 물체까지 거리) 또는 None.
+        """
+        if len(trav) == 0:
+            return None
+        object_xy = np.asarray(object_xy, dtype=np.float64)[:2]
+        robot_xy = np.asarray(robot_xy, dtype=np.float64)[:2]
+
+        candidates = trav[
+            np.linalg.norm(trav - robot_xy, axis=1) <= config.TERRAIN_SEARCH_DIS_M
+        ]
+        if len(candidates) == 0:
+            return None
+        to_object = np.linalg.norm(candidates - object_xy, axis=1)
+        robot_gap = float(np.linalg.norm(robot_xy - object_xy))
+        usable = (to_object <= config.TERRAIN_APPROACH_FALLBACK_MAX_M) & (to_object < robot_gap)
+        candidates, to_object = candidates[usable], to_object[usable]
+        if len(candidates) == 0:
+            return None
+        if len(obstacle):
+            clear = cls._min_distance_to_obstacles(candidates, obstacle) >= config.TERRAIN_CLEARANCE_M
+            candidates, to_object = candidates[clear], to_object[clear]
+            if len(candidates) == 0:
+                return None
+        best = int(np.argmin(to_object))
+        return candidates[best], float(to_object[best])
+
+    def commandable_ratio(self) -> tuple[int, int]:
+        """(commandable 점 수, travArea 점 수). "이 씬에서 애초에 목적지로 찍을 수 있는
+        곳이 얼마나 되나"를 대시보드/로그로 보기 위한 진단용 - 7%면 링 샘플링이 거의
+        항상 실패한다는 뜻이다(2026-08-24 실측)."""
+        if not self.ready():
+            return 0, 0
+        trav, obstacle = self.snapshot()
+        if len(trav) == 0:
+            return 0, 0
+        if len(obstacle) == 0:
+            return len(trav), len(trav)
+        clear = self._min_distance_to_obstacles(trav, obstacle) >= config.TERRAIN_CLEARANCE_M
+        return int(clear.sum()), len(trav)
 
     def describe(self) -> str:
         with self._lock:

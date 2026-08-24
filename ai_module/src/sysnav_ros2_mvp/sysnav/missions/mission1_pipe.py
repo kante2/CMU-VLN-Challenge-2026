@@ -12,6 +12,13 @@ state 흐름: OBSERVE/PLAN_EXPLORATION/FOLLOW_EXPLORATION(공용, sysnav_node.py
 탐색 종료 조건: coverage_planner.plan_route()가 빈 route를 반환하는 시점
 (_on_exploration_result 참고) - Object Reference는 같은 상황을 FAILED로 보지만,
 Numerical은 "더 볼 곳이 없다 = 최종 개수를 확정할 시점"으로 정상 종료 처리한다.
+
+개수를 정하는 방법이 두 겹이다:
+  1. 기하 기반 - object_memory 노드를 카테고리/relation/attribute로 걸러 len()을 센다.
+     탐지 재현율이 그대로 상한이 된다(못 본 물체는 못 센다).
+  2. VLM 기반(reasoning/vlm_counter.py, 기본 활성) - 대상 물체를 가장 많이 담은
+     viewpoint 파노라마 한 장을 Gemini에게 보여 직접 세게 한다. 1의 상한을 넘기 위한
+     것이고, 실패하면 조용히 1의 값을 쓴다(fail-quiet).
 """
 
 
@@ -21,6 +28,7 @@ from collections import deque
 
 from std_msgs.msg import Int32
 
+from sysnav import config
 from sysnav.reasoning.attribute_filter import filter_by_attributes
 from sysnav.task.query_parser import effective_relation_chain
 
@@ -84,8 +92,51 @@ def count_job(node, task_id: int, task: dict) -> dict:
         candidates = []
 
     candidates = filter_by_attributes(node, candidates, task.get("attributes"))
+    geometric_count = len(candidates)
 
-    return {"task_id": task_id, "count": len(candidates)}
+    # object_memory 기반 집계는 **탐지 재현율에 갇힌다** - 못 본 물체는 셀 수가 없다
+    # (실측 home_building_1: pillow GT 18개인데 메모리엔 7개). 물체를 가장 많이 담은
+    # viewpoint 한 장을 VLM에게 보여 직접 세게 해서 그 상한을 넘어본다. 실패하면 기하
+    # 기반 개수를 그대로 쓴다(0/1 채점이라 무응답이 최악이다).
+    if config.NUMERICAL_VLM_COUNT_ENABLED:
+        vlm_count = _count_with_vlm(node, task, geometric_count)
+        if vlm_count is not None:
+            return {"task_id": task_id, "count": vlm_count}
+
+    return {"task_id": task_id, "count": geometric_count}
+
+
+def _count_with_vlm(node, task: dict, geometric_count: int) -> int | None:
+    """대상 물체를 가장 많이 담은 viewpoint 이미지로 VLM에게 세게 한다. 실패 시 None.
+
+    뷰 선정은 relation/attribute 필터 **전의** "그 카테고리 전체"로 한다 - 관계 edge가
+    아직 없어서 걸러진 물체도 이미지에는 찍혀 있고, 그게 바로 VLM이 대신 세줘야 하는
+    대상이다. 제약(관계/속성) 판정은 질문 원문을 그대로 넘겨 VLM이 이미지에서 직접 본다.
+    """
+    target = str(task.get("target", "")).strip()
+    question = str(task.get("raw", "")).strip()
+    if not target or not question:
+        return None
+
+    category_ids = [
+        int(item["object_id"]) for item in node.object_memory.find_by_category(target)
+    ]
+    if not category_ids:
+        return None
+    viewpoint = node.scene_graph.best_viewpoint_for_objects(category_ids)
+    if viewpoint is None:
+        node.get_logger().info("VLM count skipped: no viewpoint image observes this category")
+        return None
+
+    count = node.vlm_counter.count(question, target, viewpoint)
+    if count is None:
+        return None
+    node.get_logger().info(
+        f"🔢 COUNT - geometric={geometric_count}, vlm={count} "
+        f"(viewpoint {viewpoint['viewpoint_id']} saw {viewpoint['visible_count']}/"
+        f"{len(category_ids)} of the mapped {target}); using vlm"
+    )
+    return count
 
 
 def _on_count_result(node, result: dict) -> None:

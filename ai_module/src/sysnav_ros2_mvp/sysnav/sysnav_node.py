@@ -37,6 +37,7 @@ from sysnav.reasoning.attribute_filter import filter_by_attributes, reference_al
 from sysnav.reasoning.attribute_verifier import AttributeVerifier
 from sysnav.reasoning.gemini_selector import GeminiSelector
 from sysnav.reasoning.relation_image_verifier import RelationImageVerifier
+from sysnav.reasoning.vlm_counter import VlmCounter
 from sysnav.scene_graph.scene_graph_manager import SceneGraphManager
 from sysnav.scene_graph.scene_graph_rviz import build_object_marker_array
 from sysnav.ros_helpers import (
@@ -108,7 +109,7 @@ _JOB_LABELS = {
     "perception": "인식(YOLO+SAM+LiDAR)",
     "selection": "대상 선택(Gemini)",
     "exploration": "탐색 경로 계획",
-    "count": "개수 확정(Gemini)",
+    "count": "개수 확정(VLM 카운트 + 기하)",
 }
 _NAV_LABELS = {
     "APPROACH": "접근 지점 선정", "GOAL": "목표 확정", "SNAP": "목표 보정(스냅)",
@@ -170,6 +171,9 @@ class SysNavNode(Node):
         self.selector = GeminiSelector()
         self.attribute_verifier = AttributeVerifier()
         self.relation_image_verifier = RelationImageVerifier()
+        # Numerical 전용 - viewpoint 파노라마 한 장을 VLM에게 보여 직접 세게 한다
+        # (reasoning/vlm_counter.py). 다른 미션은 안 쓴다.
+        self.vlm_counter = VlmCounter()
         self.coverage_planner = CoveragePlanner()
         self.viewpoint_memory = ViewpointMemory()
         self.goal_publisher = GoalPublisher(self)
@@ -238,6 +242,9 @@ class SysNavNode(Node):
         self.mission3_gate_crossed = False
         self.mission3_gate_last_xy = None
         self.mission3_gate_last_stamp = 0.0
+        # 확정된 subgoal을 연속 몇 번 "도달 불가"로 받았는가(mission3_pipe._navigate_step).
+        # MISSION3_SUBGOAL_MAX_RETRIES를 넘으면 그 step을 포기하고 다음으로 넘어간다.
+        self.mission3_subgoal_retries = 0
         # Mission 2는 탐사 중 발견 즉시 이동하지 않고, 모든 frontier를 소진한
         # 뒤 누적 Scene Graph에서 한 번만 최종 target을 고른다.
         self.mission2_exploration_complete = False
@@ -368,6 +375,7 @@ class SysNavNode(Node):
             self.mission3_gate_crossed = False
             self.mission3_gate_last_xy = None
             self.mission3_gate_last_stamp = 0.0
+            self.mission3_subgoal_retries = 0
             self.mission2_exploration_complete = False
             self.mission2_exploration_deadline_reached = False
             self.mission2_answer_object_id = None
@@ -1410,7 +1418,11 @@ class SysNavNode(Node):
         return self.distance_to_target(pose) <= config.TARGET_SUCCESS_DISTANCE_M
 
     def approach_pose_for(
-        self, pose: dict, object_position, max_distance_m: float | None = None
+        self,
+        pose: dict,
+        object_position,
+        max_distance_m: float | None = None,
+        allow_relaxed: bool = False,
     ) -> tuple[float, float, float]:
         """물체로 접근할 (x, y, theta)를 정한다. mission2/3가 공용으로 쓴다.
 
@@ -1421,7 +1433,8 @@ class SysNavNode(Node):
         object_xy = (float(object_position[0]), float(object_position[1]))
         robot_xy = (float(pose["x"]), float(pose["y"]))
         chosen = self.terrain_monitor.choose_approach_point(
-            object_xy, robot_xy, max_distance_m=max_distance_m
+            object_xy, robot_xy, max_distance_m=max_distance_m,
+            allow_relaxed=allow_relaxed,
         )
         if chosen is not None:
             theta = math.atan2(object_xy[1] - chosen[1], object_xy[0] - chosen[0])

@@ -141,7 +141,14 @@ Anchor는 `viewpoint_memory.is_near_visited()` 예외 대상(문 통과용)인�
 - 파싱: Object Reference와 동일(`LLMQueryParser`).
 - **후보를 찾아도 절대 멈추지 않음** — `_on_perception_result`가 `origin_state=="OBSERVE"`일 때만 `PLAN_EXPLORATION`으로 보내고, 후보 존재 여부는 무시.
 - `plan_route()`가 빈 route를 반환(=탐색 완전히 소진)하면 `MISSION1_FINALIZE_COUNT`로 전환(FAILED 아님 — "다 봤다"는 정상 종료 신호).
-- `count_job` — `object_memory.find_by_category()` → relation 필터(`scene_graph.find_matching_target_ids`) → attribute 필터(`attribute_verifier`) 순서로 걸러서 개수 확정.
+- `count_job` — 개수를 **두 겹**으로 낸다.
+  1. **기하 기반**: `object_memory.find_by_category()` → relation 필터(`scene_graph.find_matching_target_ids`, 여기선 edge 조회만 하고 추론은 안 돌린다) → attribute 필터(`attribute_verifier`) → `len()`.
+  2. **VLM 기반**(`reasoning/vlm_counter.py`, `NUMERICAL_VLM_COUNT_ENABLED` 기본 on): 대상 카테고리 물체를 **가장 많이 동시에 본 viewpoint 한 장**(`scene_graph.best_viewpoint_for_objects()`)의 파노라마를 Gemini에게 보여 직접 세게 하고, 성공하면 그 값을 쓴다.
+  - 왜 2가 필요한가: 1은 **탐지 재현율이 그대로 상한**이다 — 실측(home_building_1)에서 pillow가 GT 18개인데 메모리엔 7개만 남았다. 못 본 물체는 병합·필터를 아무리 손봐도 셀 수 없다.
+  - 뷰를 **한 장으로 확정**하는 이유: 여러 뷰의 개수를 합치면 같은 물체가 여러 뷰에 찍혀 중복 계산된다. 뷰 선정은 relation/attribute 필터 **전의** 카테고리 전체로 하고(걸러진 물체도 이미지엔 찍혀 있다), 제약 판정은 질문 원문을 그대로 넘겨 VLM이 이미지에서 직접 본다.
+  - 같은 이미지를 `NUMERICAL_VLM_COUNT_SAMPLES`(5)회 **병렬** 질의해 **최빈 개수**를 채택한다(self-consistency) — `temperature=0.0`인데도 응답이 결정적이지 않아 1회 호출은 사실상 동전던지기다. 동률이면 작은 쪽(파노라마 좌우 wrap 중복 계수가 흔한 오류).
+  - 숫자 대신 **항목 목록**(`{"where": ...}`)을 받는다 — VLM은 5~6개를 넘으면 총합을 자주 틀리지만 나열은 비교적 안정적이고, 무엇을 셌는지 로그로 사람이 검증할 수 있다.
+  - **fail-quiet**: 키 없음/에러/이미지 없음이면 조용히 1의 값을 쓴다. 개수 미션은 0/1 채점이라 "답을 못 냄"이 최악이다. 모델은 `GEMINI_COUNTING_MODEL`(기본 flash) → 실패 시 `GEMINI_MODEL` 순으로 시도하고, 호출당 `GEMINI_COUNTING_TIMEOUT_SEC`(45초) 상한을 둔다.
 - `/numerical_response`(Int32) 발행, `SUCCESS`.
 
 ## 7. Mission 2 — Object Reference (`missions/mission2_pipe.py`)
@@ -165,6 +172,10 @@ Anchor는 `viewpoint_memory.is_near_visited()` 예외 대상(문 통과용)인�
 - **pending 시 즉시 확정 (`_resolve_pending_step`, 2026-08-24)**: `selection_job`이 `relation_pending`/`attribute_pending`/`verification_pending`을 돌려줬을 때, **이 step에 필요한 카테고리가 전부 관측돼 있으면 탐사로 돌아가지 않고 기하로 목적지를 정해 바로 goal을 찍는다**(`_best_effort_step_target`: `near`/`beside` 등은 참조 물체와 XY 거리가 최소인 후보, `farthest`는 최대인 후보; 참조가 3D 위치를 못 가졌으면 로봇에서 가장 가까운 후보 + "관계 미적용" 경고 로그). 아직 못 본 물체가 있을 때만 예전처럼 `PLAN_EXPLORATION`으로 간다.
   - 왜: `selection_job`의 유일한 탈출구인 `mission2_exploration_deadline_reached`는 **Mission 2 전용**이라 Mission 3에서는 절대 안 선다. 그래서 관계가 끝내 검증 안 되면(참조가 유리창이라 3D grounding 실패, Gemini `final_verification`이 계속 거절 등) 타겟도 참조도 눈앞에 있는데 탐사가 소진될 때까지 돌다가 FAILED로 끝났다. Mission 3 채점은 subgoal 순서 + 실제 궤적 + 부분점수라, "정확할 때까지 안 움직인다"보다 "지금 아는 것으로 가장 그럴듯한 곳에 바로 간다"가 항상 낫다.
 - 처리 중 매번 `_try_resolve_forbidden` 시도 — `global_forbidden`의 참조 물체 위치가 확보되면 A-B 선분(or 한 점) 주변에 `INSTRUCTION_FORBIDDEN_RADIUS_M` 반경으로 forbidden mask 생성(`node.mission3_forbidden_mask`).
+- **접근점 선정 (2026-08-24 개정)**: `terrain_monitor.choose_approach_point()`가 물체 주변을 링(반경 × 7각도)으로 샘플링해 base autonomy가 받아줄 지점을 찾는다. Mission 3는 `MISSION3_OBJECT_APPROACH_MAX_M`(0.9m) 상한이 있어 링이 하나뿐 = **후보 7개**다. 이 상한은 탐색 범위가 아니라 "물체 0.9m 안에 서야 `go to`를 수행한 것"이라는 **의미 규칙**이라 평상시엔 반드시 지킨다.
+  - 링이 전부 실패하면 예전엔 terrain을 아예 안 보는 고정 standoff로 폴백해 **명령 불가한 좌표**를 잡았고, mission3가 그걸 무한 재발행했다(실측 2026-08-24: 변기 앞 0.5초 주기 정지. `probe_waypoint_push.py` 결과 — 이 씬은 travArea의 **7.1%**만 clearance ≥ 0.75m를 통과, 목표 좌표 자체는 0.42m, 스냅하면 로봇 0.36m 앞으로 떨어져 갈 거리가 없음).
+  - 이제 `_navigate_step`이 `MISSION3_SUBGOAL_MAX_RETRIES`(20회 ≈ 10초) 연속 발행 실패 시 **포기 직전 딱 한 번** `allow_relaxed=True`로 재시도한다. 이 모드는 링 대신 **commandable set을 직접 훑어** 물체에 가장 가까운 통과 지점을 결정론적으로 고른다(상한 `TERRAIN_APPROACH_FALLBACK_MAX_M`=3.0m, 벽 너머 오검출 방지). 완화되는 것은 **물체까지의 거리뿐**이고 0.75m 클리어런스는 base autonomy의 하드 필터라 못 푼다.
+  - 그마저 실패하면 `_give_up_step()`이 그 step을 포기하고 다음으로 넘어간다 — 한 step에 갇혀 남은 step을 통째로 잃는 것보다 부분점수가 낫다. 로그에 `GIVEN UP`으로 명시해 "지나갔다"와 구분한다.
 - 목표 지점이 정해지면 `_start_navigate_to_point`: forbidden mask가 있으면 `coverage_planner.plan_direct_path()`(A*로 우회 경로) 사용, 없으면 단순 접근점 하나 직접 발행. `mission3_leg_queue`에 waypoint 채우고 `MISSION3_NAVIGATE_STEP`으로.
 - 도착하면 `mission3_step_index += 1`, 다음 step 있으면 `MISSION3_SELECT_STEP`으로, 없으면 `SUCCESS`.
 - `/way_point_with_heading`(Pose2D)을 순서대로 여러 번 발행 — 채점은 토픽 값이 아니라 **로봇이 실제로 그 경로를 따라간 궤적**을 봄(README).
