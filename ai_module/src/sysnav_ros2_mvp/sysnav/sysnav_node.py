@@ -284,6 +284,9 @@ class SysNavNode(Node):
         # 질문의 점수는 확보됐다"는 뜻이다 - 이후 주행이 실패해도 답을 취소하지 않는다
         # (README 채점: Object Reference는 marker bbox 겹침만 본다. 궤적 항목 없음).
         self.mission2_answer_object_id: int | None = None
+        # 마지막으로 발행한 답안 marker의 ns(= 물체 라벨). 답이 다른 카테고리로
+        # 바뀌면 옛 ns의 marker를 DELETE해야 해서 기억해둔다(mission2_pipe._publish_answer).
+        self.mission2_answer_namespace: str | None = None
         self._mission2_answer_extent: tuple | None = None
         self._mission2_last_answer_publish: float | None = None
         # 최종 target 주행이 "도달 불가"로 끝난 횟수(mission2_pipe._give_up_target).
@@ -466,6 +469,9 @@ class SysNavNode(Node):
             self.mission2_exploration_complete = False
             self.mission2_exploration_deadline_reached = False
             self.mission2_answer_object_id = None
+            # mission2_answer_namespace는 **일부러** 여기서 안 지운다. 이전 task가
+            # 남긴 marker는 화면(과 평가 노드)에 그대로 살아있으므로, 다음 답이 다른
+            # 라벨이면 그 ns를 DELETE해야 한다 - 여기서 잊으면 지울 대상을 잃는다.
             self._mission2_answer_extent = None
             self._mission2_last_answer_publish = None
             self.mission2_target_retries = 0

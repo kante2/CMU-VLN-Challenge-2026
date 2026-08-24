@@ -10,9 +10,16 @@ stop at the vase between the TV and the door." - avoid 절이 없어 global_forb
 입력에도 안 죽는 것을 고정한다(호출부의 예외 격리는 sysnav_node에 따로 있다).
 """
 
+import pathlib
+import tempfile
 import unittest
 
-from sysnav.mission_dashboard import _mission_detail_rows, _target_panel
+from sysnav import config
+from sysnav.mission_dashboard import (
+    _mission_detail_rows,
+    _target_panel,
+    export_mission_dashboard,
+)
 
 
 def _snapshot(**overrides):
@@ -130,3 +137,32 @@ class TargetDistancePanelTest(unittest.TestCase):
         # 목표만 있고 나머지가 아직 안 채워진 tick에서도 렌더링은 죽으면 안 된다.
         panel = _target_panel({"target_goal_xy": (1.0, 2.0)})
         self.assertIn("(1.00, 2.00)", panel)
+
+
+class AutoRefreshStopsWhenDoneTest(unittest.TestCase):
+    """판정이 끝나면 <meta refresh>를 빼서 페이지가 멈춘다.
+
+    1초마다 다시 로드되면 활동 로그를 스크롤해서 읽을 수가 없다 - 스크롤 위치가
+    매번 맨 위로 돌아간다. 판정이 끝난 뒤에는 더 볼 변화도 없으므로 멈추는 편이 낫다.
+    노드는 계속 파일을 덮어쓰므로 수동 새로고침하면 최신 상태가 나온다.
+    """
+
+    def _html(self, state):
+        with tempfile.TemporaryDirectory() as directory:
+            previous, config.DEBUG_DIR = config.DEBUG_DIR, directory
+            try:
+                path = export_mission_dashboard({"state": state, "task": None})
+                return pathlib.Path(path).read_text()
+            finally:
+                config.DEBUG_DIR = previous
+
+    def test_running_states_keep_refreshing(self):
+        for state in ("IDLE", "OBSERVE", "MISSION3_NAVIGATE_STEP"):
+            self.assertIn("http-equiv=\"refresh\"", self._html(state), state)
+
+    def test_terminal_states_stop_refreshing(self):
+        for state in ("SUCCESS", "FAILED"):
+            html = self._html(state)
+            self.assertNotIn("http-equiv=\"refresh\"", html, state)
+            self.assertIn("자동 새로고침 정지됨", html)
+            self.assertIn("location.reload()", html, "수동 새로고침 수단은 남겨둔다")

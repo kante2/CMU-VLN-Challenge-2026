@@ -31,7 +31,11 @@ import time
 from collections import deque
 
 from sysnav import config
-from sysnav.scene_graph.scene_graph_rviz import build_selected_object_marker
+from sysnav.scene_graph.scene_graph_rviz import (
+    build_selected_object_delete_marker,
+    build_selected_object_marker,
+    selected_object_namespace,
+)
 
 
 def loop(node, state: str, task: dict, task_id: int, pose: dict) -> None:
@@ -195,8 +199,19 @@ def _publish_answer(node, selected: dict) -> None:
     marker는 매번 object_memory의 **현재** 값으로 새로 만든다 - 캐시해두면 가까이
     가서 얻은 정밀한 extent_3d가 반영되지 않아 주행이 점수로 이어지지 않는다.
     """
-    marker = build_selected_object_marker(selected, node.get_clock().now().to_msg())
+    stamp = node.get_clock().now().to_msg()
+    # marker의 ns가 곧 물체 라벨이라(scene_graph_rviz.selected_object_namespace),
+    # 답을 다른 카테고리로 바꾸면 옛 ns의 marker가 화면에 그대로 남는다. 새 답을 내기
+    # 전에 이전 ns를 DELETE로 지운다 - dummy_vlm의 delObjectMarker()와 같은 처리다.
+    namespace = selected_object_namespace(selected)
+    previous = node.mission2_answer_namespace
+    if previous is not None and previous != namespace:
+        node.selected_object_marker_pub.publish(
+            build_selected_object_delete_marker(previous, stamp)
+        )
+    marker = build_selected_object_marker(selected, stamp)
     node.selected_object_marker_pub.publish(marker)
+    node.mission2_answer_namespace = namespace
     node.mission2_answer_object_id = selected["object_id"]
     node._mission2_answer_extent = tuple(selected.get("extent_3d", ()) or ())
     node._mission2_last_answer_publish = time.monotonic()

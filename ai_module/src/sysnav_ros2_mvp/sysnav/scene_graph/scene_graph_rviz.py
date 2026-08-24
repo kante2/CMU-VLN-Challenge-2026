@@ -70,7 +70,39 @@ def build_object_marker_array(
     return array
 
 
-_SELECTED_OBJECT_NAMESPACE = "selected_object"
+_SELECTED_OBJECT_FALLBACK_NAMESPACE = "unknown"
+
+
+def selected_object_namespace(obj: dict) -> str:
+    """채점용 marker의 `ns`에 넣을 물체 라벨.
+
+    README: "Marker message ... containing **object label** and bounding box of the
+    selected object." 그런데 Marker 메시지에서 라벨을 담을 자리는 `ns`와 `text`뿐이고,
+    대회가 준 참조 구현(dummy_vlm/src/dummyVLM.cpp `pubObjectMarker`)은 `ns = objLabel`
+    하나만 채운다(`text`는 아예 안 건드린다). 즉 비공개 평가 노드가 라벨을 읽는다면
+    `ns`에서 읽을 가능성이 가장 크다. 예전에는 여기에 "selected_object"라는 고정
+    문자열이 들어가서, 무엇을 골랐든 라벨이 항상 같았다.
+
+    빈 문자열은 안 된다 - ns가 비면 RViz/구독자 쪽에서 marker 식별이 모호해진다."""
+    category = str(obj.get("category", "") or "").strip()
+    return category or _SELECTED_OBJECT_FALLBACK_NAMESPACE
+
+
+def build_selected_object_delete_marker(namespace: str, stamp: Time) -> Marker:
+    """이전 답안 marker를 지우는 DELETE marker.
+
+    ns에 라벨을 넣으면서 필요해졌다: marker의 정체성은 (ns, id)이므로 답을 다른
+    카테고리로 바꾸면 **새 ns에 새 marker가 생기고 옛 marker는 그대로 남는다**
+    (같은 ns에 다시 쓸 때는 덮어써져서 이런 문제가 없었다). dummy_vlm도 같은 이유로
+    답을 바꿀 때 delObjectMarker()로 이전 ns를 DELETE한다."""
+    marker = Marker()
+    marker.header.frame_id = config.OBJECT_MARKER_FRAME_ID
+    marker.header.stamp = stamp
+    marker.ns = namespace
+    marker.id = 0
+    marker.type = Marker.CUBE
+    marker.action = Marker.DELETE
+    return marker
 
 
 def build_selected_object_marker(obj: dict, stamp: Time) -> Marker:
@@ -84,7 +116,9 @@ def build_selected_object_marker(obj: dict, stamp: Time) -> Marker:
     marker = Marker()
     marker.header.frame_id = config.OBJECT_MARKER_FRAME_ID
     marker.header.stamp = stamp
-    marker.ns = _SELECTED_OBJECT_NAMESPACE
+    # ns/text 둘 다 라벨로 채운다 - 어느 쪽을 읽든 맞도록. CUBE marker에서 text는
+    # 화면에 안 그려지므로 시각적으로 달라지는 것은 없다(selected_object_namespace 주석 참고).
+    marker.ns = selected_object_namespace(obj)
     marker.id = 0
     marker.type = Marker.CUBE
     marker.action = Marker.ADD
@@ -94,5 +128,5 @@ def build_selected_object_marker(obj: dict, stamp: Time) -> Marker:
     marker.pose.orientation.w = 1.0
     marker.scale.x, marker.scale.y, marker.scale.z = (float(value) for value in size)
     marker.color.r, marker.color.g, marker.color.b, marker.color.a = _SELECTED_COLOR
-    marker.text = str(obj.get("category", "?"))
+    marker.text = selected_object_namespace(obj)
     return marker

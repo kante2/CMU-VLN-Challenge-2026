@@ -23,6 +23,13 @@ _previous = sys.modules.get(_module_name)
 _stub = types.ModuleType(_module_name)
 _stub.build_selected_object_marker = lambda obj, stamp: {
     "id": obj["object_id"], "scale": tuple(obj.get("extent_3d", ())),
+    "ns": str(obj.get("category", "")),
+}
+# ns(= 물체 라벨) 관련 심볼도 실제 모듈과 같은 이름으로 채워둔다 - mission2_pipe가
+# import하므로 없으면 collection 자체가 실패한다.
+_stub.selected_object_namespace = lambda obj: str(obj.get("category", "") or "unknown")
+_stub.build_selected_object_delete_marker = lambda namespace, stamp: {
+    "action": "DELETE", "ns": namespace,
 }
 sys.modules[_module_name] = _stub
 from sysnav import config                      # noqa: E402
@@ -71,6 +78,7 @@ class _Node:
         self.exploration_route = deque()
         self.mission2_exploration_complete = True
         self.mission2_answer_object_id = None
+        self.mission2_answer_namespace = None
         self._mission2_answer_extent = None
         self._mission2_last_answer_publish = None
         self.object_memory = _Memory(obj if obj is not None else dict(_VASE))
@@ -151,6 +159,29 @@ class AnswerRepublishTest(unittest.TestCase):
         self.assertEqual(node.selected_object_marker_pub.sent[-1]["scale"],
                          (0.24, 0.23, 0.34))
         self.assertIn("refined", node.logger.messages[-1][1])
+
+    def test_changing_the_answer_deletes_the_previous_label_marker(self):
+        """marker의 ns가 물체 라벨이라, 답이 다른 카테고리로 바뀌면 옛 ns의 marker가
+        화면에 그대로 남는다(같은 ns를 쓰던 시절엔 덮어써져서 없던 문제다).
+        dummy_vlm의 delObjectMarker()와 같이 이전 ns를 DELETE로 지워야 한다."""
+        node = _Node()
+        mission2_pipe._publish_answer(node, dict(_VASE))
+        mission2_pipe._publish_answer(node, dict(_VASE, category="toilet"))
+        sent = node.selected_object_marker_pub.sent
+        self.assertEqual(sent[0]["ns"], "vase")
+        self.assertEqual(sent[1], {"action": "DELETE", "ns": "vase"})
+        self.assertEqual(sent[2]["ns"], "toilet")
+        self.assertEqual(node.mission2_answer_namespace, "toilet")
+
+    def test_same_label_is_republished_without_a_delete(self):
+        """같은 ns에 다시 쓰면 덮어써진다 - 지웠다 쓰면 그 사이 순간적으로 답이 없는
+        상태가 생기고, 재발행은 유실 대비라 오히려 자주 일어난다."""
+        node = _Node()
+        mission2_pipe._publish_answer(node, dict(_VASE))
+        node._mission2_last_answer_publish = None
+        mission2_pipe._refresh_answer(node)
+        actions = [m.get("action") for m in node.selected_object_marker_pub.sent]
+        self.assertNotIn("DELETE", actions)
 
     def test_arrival_publishes_the_closest_observation(self):
         node = _Node()

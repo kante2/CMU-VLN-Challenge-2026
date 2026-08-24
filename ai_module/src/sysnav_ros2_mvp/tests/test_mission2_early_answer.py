@@ -19,6 +19,12 @@ _module_name = "sysnav.scene_graph.scene_graph_rviz"
 _previous = sys.modules.get(_module_name)
 _stub = types.ModuleType(_module_name)
 _stub.build_selected_object_marker = lambda obj, stamp: None
+# ns(= 물체 라벨) 관련 심볼도 실제 모듈과 같은 이름으로 채워둔다 - mission2_pipe가
+# import하므로 없으면 collection 자체가 실패한다.
+_stub.selected_object_namespace = lambda obj: str(obj.get("category", "") or "unknown")
+_stub.build_selected_object_delete_marker = lambda namespace, stamp: {
+    "action": "DELETE", "ns": namespace,
+}
 sys.modules[_module_name] = _stub
 from sysnav.missions import mission2_pipe      # noqa: E402
 if _previous is None:

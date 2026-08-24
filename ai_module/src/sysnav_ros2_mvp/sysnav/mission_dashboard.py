@@ -28,6 +28,12 @@ _STATE_COLORS = {
 }
 _DEFAULT_STATE_COLOR = "#2563eb"
 
+# 판정이 끝난 상태. 여기서는 <meta refresh>를 빼서 페이지가 그 자리에 멈춘다 -
+# 1초마다 다시 로드되면 활동 로그를 스크롤해서 읽는 것이 불가능하기 때문이다
+# (스크롤 위치가 매번 맨 위로 돌아간다). 노드는 계속 파일을 덮어쓰므로, 수동으로
+# 새로고침하면 최신 상태가 그대로 나온다.
+_TERMINAL_STATES = ("SUCCESS", "FAILED")
+
 _MISSION_LABELS = {
     "numerical": "Mission 1 - Numerical",
     "object_reference": "Mission 2 - Object Reference",
@@ -533,11 +539,33 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
             f" &rarr; actual=({actual[0]:.2f}, {actual[1]:.2f})",
         ))
 
+    # 판정이 끝났으면 자동 새로고침을 멈춘다. 로그를 내려서 읽으려는데 페이지가
+    # 1초마다 다시 로드되면 스크롤이 계속 맨 위로 돌아가 확인 자체가 안 된다.
+    stopped = state in _TERMINAL_STATES
+    refresh_tag = "" if stopped else (
+        f'<meta http-equiv="refresh" content="{config.MISSION_DASHBOARD_REFRESH_SEC:.0f}">'
+    )
+    footer_note = (
+        f"{_esc(state)} - 자동 새로고침을 멈췄습니다. 로그를 그대로 읽을 수 있습니다 "
+        "(다음 질문이 시작돼도 이 페이지는 멈춰 있으니, 새 상태를 보려면 새로고침하세요)."
+        if stopped else
+        f"auto-refreshes every {config.MISSION_DASHBOARD_REFRESH_SEC:.0f}s"
+        " - open this file directly in a browser"
+    )
+    stopped_banner = (
+        '<div class="card" style="border-left:4px solid #15803d;">'
+        f'<b>{_esc(state)}</b> - 자동 새로고침 정지됨. '
+        '<button onclick="location.reload()" style="margin-left:10px;padding:4px 12px;'
+        'border:1px solid #d1d5db;border-radius:6px;background:#f9fafb;cursor:pointer;">'
+        '지금 새로고침</button></div>'
+        if stopped else ""
+    )
+
     doc = f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="{config.MISSION_DASHBOARD_REFRESH_SEC:.0f}">
+{refresh_tag}
 <title>SysNav Mission Status</title>
 <style>
   body {{ font-family: -apple-system, "Segoe UI", Arial, sans-serif; background: #f9fafb; margin: 0; padding: 24px; color: #111827; }}
@@ -551,6 +579,7 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
 </style>
 </head>
 <body>
+  {stopped_banner}
   <div class="card">
     <h1>SysNav Mission Status {_state_badge(state)}</h1>
     <table>
@@ -578,7 +607,7 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
     <h2>활동 로그 <span style="font-weight:400;color:#9ca3af;font-size:12px;">(최신순)</span></h2>
     {_activity_panel()}
   </div>
-  <div class="footer">auto-refreshes every {config.MISSION_DASHBOARD_REFRESH_SEC:.0f}s - open this file directly in a browser</div>
+  <div class="footer">{footer_note}</div>
 </body>
 </html>
 """
