@@ -64,6 +64,12 @@ class ObjectMemory:
             "representative_image": observation.get("crop_image").copy() if isinstance(observation.get("crop_image"), np.ndarray) else None,
             "context_image": observation.get("context_image").copy() if isinstance(observation.get("context_image"), np.ndarray) else None,
             "representative_confidence": float(observation.get("confidence", 0.0)),
+            # 위 두 사진이 교체될 때마다 1씩 오르는 버전 번호. VLM 판정 캐시의 무효화
+            # 신호로 쓴다 - 사진이 그대로면 같은 질문에 같은 답이 나올 수밖에 없으므로
+            # 다시 물을 이유가 없고, 더 좋은 사진이 들어왔을 때만 다시 묻는다.
+            # confidence를 대신 쓰면 안 된다: 교체 조건이 `>=`라 confidence가 같은 채로
+            # 사진만 바뀌는 경우를 못 잡는다.
+            "image_version": 0,
             # 대표 이미지의 confidence
             "confidence": float(observation.get("confidence", 0.0)),
             "observation_count": 1,
@@ -75,6 +81,10 @@ class ObjectMemory:
             # 추론하고 node에 append"한다는 설계 그대로, 처음엔 비어있다가 task가 실제로
             # 속성을 요구할 때만 VLM으로 채워지고 계속 캐싱된다 (reasoning/attribute_verifier.py).
             "self_attributes": {},
+            # 이미지 기반 relation 판정(reasoning/relation_image_verifier.py) 결과 캐시.
+            # self_attributes와 같은 on-demand 캐싱 패턴이고, 키에 image_version이
+            # 들어있어 사진이 바뀌면 자동으로 다시 묻게 된다.
+            "relation_checks": {},
         }
 
     # 기존 객체의 pointcloud와, 새 observation의 pointcloud를 합치는 함수
@@ -138,12 +148,18 @@ class ObjectMemory:
         # 기존 대표 이미지보다 detection confidence가 높거나 같으면
         #         ↓
         # 새 crop 이미지를 대표 이미지로 교체
+        replaced_image = False
         if isinstance(crop, np.ndarray) and crop.size and confidence >= node["representative_confidence"]:
             node["representative_image"] = crop.copy()
             node["representative_confidence"] = confidence
+            replaced_image = True
         context = observation.get("context_image")
         if isinstance(context, np.ndarray) and context.size and confidence >= node["representative_confidence"]:
             node["context_image"] = context.copy()
+            replaced_image = True
+        if replaced_image:
+            # 사진이 바뀌었으니 이 사진으로 내렸던 VLM 판정 캐시는 다시 물어봐야 한다.
+            node["image_version"] = int(node.get("image_version", 0)) + 1
 
     def update(self, observations: list[dict], timestamp: float | None = None) -> list[int]:
         timestamp = time.time() if timestamp is None else float(timestamp)
@@ -184,6 +200,16 @@ class ObjectMemory:
             if node is None:
                 return
             node["self_attributes"] = {**node.get("self_attributes", {}), **attributes}
+
+    # 이미지 기반 relation 판정 결과를 node에 캐싱한다 (relation_image_verifier.py가
+    # 호출) - update_self_attributes와 완전히 같은 패턴이다. 키에 image_version이 들어
+    # 있으므로, 사진이 갱신되면 옛 키는 그냥 안 쓰이고 새 키로 다시 묻게 된다.
+    def update_relation_checks(self, object_id: int, checks: dict[str, bool]) -> None:
+        with self._lock:
+            node = self._nodes.get(int(object_id))
+            if node is None:
+                return
+            node["relation_checks"] = {**node.get("relation_checks", {}), **checks}
     # 저장된 모든 객체를 리스트로 반환
     def count(self) -> int:
         """개수만 필요할 때 쓴다. all_nodes()는 대표 이미지까지 복사하므로 대시보드

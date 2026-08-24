@@ -422,9 +422,7 @@ MAP_MAX_RAYS_PER_SCAN = 1200
 MAP_MIN_RANGE_M = 0.40
 MAP_MAX_RANGE_M = 25.0
 # 지도에 반영할 point의 z 범위(센서 기준). 센서는 바닥 위 약 0.75m에 있으므로 바닥
-# point(z 약 -0.75)는 여기서 제외된다. 이 범위의 point가 max_height에 기록되고,
-# max_height는 RoomSegmenter가 "진짜 벽"을 가릴 때 쓴다(ROOM_WALL_MIN_HEIGHT_M=1.30).
-# 그래서 이 상한을 낮추면 벽이 하나도 안 잡혀 방 분할이 통째로 깨진다.
+# point(z 약 -0.75)는 여기서 제외된다.
 MAP_OBSTACLE_Z_MIN_M = -0.40
 MAP_OBSTACLE_Z_MAX_M = 1.60
 
@@ -459,81 +457,31 @@ OCC_OCCUPIED = 100
 # 원래 0.45 -> 0.30으로 낮췄는데도 문 통과가 잘 안 돼서 더 낮춤(최소 통과 폭 0.4m).
 # 실제 로봇 폭을 몰라 정확한 값은 아니니, 나중에 실측되면 갱신할 것 - 로봇이 문틀에
 # 부딪히면 다시 올려야 한다.
-ROBOT_CLEARANCE_M = 0.10
-
-# Room Node segmentation (SysNav paper Sec. IV-A-1, "Scene Representation Building").
-# 논문은 3D point cloud에서 벽 평면을 피팅해서 방을 나누지만, 우리는 이미 2D top-down
-# occupancy grid(OCC_OCCUPIED = 벽의 2D 투영)가 있어서 그걸로 대신한다: 벽에서
-# ROOM_SEGMENTATION_MIN_CLEARANCE_M 이상 떨어진 "넓은" 영역을 방의 core로 잡고,
-# distance-transform 기반 watershed로 거기서부터 채워나간다 - 문처럼 좁은 통로는
-# 이 값보다 거리가 짧아서 자연스럽게 두 방 사이의 경계(ridge)가 된다. 문 폭의
-# 절반보다는 크고, 가장 좁은 방의 절반 폭보다는 작아야 한다.
-ROOM_SEGMENTATION_MIN_CLEARANCE_M = 0.75
-ROOM_SEGMENTATION_MIN_ROOM_CELLS = 40
-# OCC_OCCUPIED은 벽/가구를 구분 안 하므로, room 경계로는 "충분히 높이까지 닿은" 셀만
-# 진짜 벽으로 본다 (소파/테이블/의자 등은 보통 이 아래, 실제 벽은 MAP_OBSTACLE_Z_MAX_M
-# 안에서도 이 위까지 계속 point가 찍힘). CoveragePlanner.max_height 기준.
-ROOM_WALL_MIN_HEIGHT_M = 1.30
-# 벽(위 기준으로 판정된 것) 주변에 이만큼 더 두껍게 padding을 줘서 distance-transform을
-# 계산한다 - 문처럼 좁은 통로가 코어 임계값보다 확실히 더 낮게 나오도록 여유를 더 준다.
-# (room segmentation 전용 값이라 실제 주행 가능 여부(ROBOT_CLEARANCE_M)에는 영향 없음 -
-# 방을 나누는 그림/판정만 더 정확해질 뿐, 원래도 두꺼워서 문 통과가 막힌 원인은 아니었지만
-# 요청대로 줄여둠.)
-ROOM_SEGMENTATION_WALL_PADDING_M = 0.05
-
-# Watershed는 unknown/벽을 배경 marker로 잡기 때문에, 경계 주변에 "어느 방에도 속하지
-# 않는 띠"가 남는다(실측 0.3~1.1m). frontier는 정의상 free/unknown 경계 = 바로 그 띠
-# 한복판에 있어서, room mask를 그대로 쓰면 방 안 frontier가 0개가 되어 탐색이 "이 방
-# 다 봤다"로 조기 종료된다(CoveragePlanner._active_room_mask 참고). 이 반경 안에 있고
-# 다른 어떤 방보다 이 방에 더 가까운 미라벨 셀은 이 방에 속한 것으로 본다.
-ROOM_FRONTIER_ASSIGN_RADIUS_M = float(
-    os.getenv("SYSNAV_ROOM_FRONTIER_ASSIGN_RADIUS_M", "1.5")
-)
-
-# Watershed가 만든 room ridge 중 실제로 두 room을 잇는 짧은 구간을 doorway로
-# 등록한다. ridge 주변 이 반경 안에서 정확히 두 room label이 보여야 하며, ridge의
-# 길이가 MAX_WIDTH보다 길면 넓은 공간을 잘못 둘로 나눈 경계로 보고 버린다.
-ROOM_DOOR_NEIGHBOR_RADIUS_M = float(os.getenv("SYSNAV_ROOM_DOOR_NEIGHBOR_RADIUS_M", "0.60"))
-ROOM_DOOR_MIN_CELLS = int(os.getenv("SYSNAV_ROOM_DOOR_MIN_CELLS", "1"))
-ROOM_DOOR_MAX_WIDTH_M = float(os.getenv("SYSNAV_ROOM_DOOR_MAX_WIDTH_M", "2.40"))
-
-# 방 identity는 centroid만으로 이어붙이면 인접 방의 크기가 바뀔 때 ID가 서로
-# 뒤바뀔 수 있다. 직전 mask와의 IoU가 이 값 이상이면 overlap을 우선 사용하고,
-# overlap이 부족한 신규/초기 room만 centroid 반경으로 폴백한다.
-ROOM_REGISTRY_MIN_IOU = float(os.getenv("SYSNAV_ROOM_REGISTRY_MIN_IOU", "0.12"))
-
-# Room Node identity persistence (rooms/room_registry.py). RoomSegmenter.segment()는
-# 매 mapping cycle마다 watershed를 처음부터 다시 돌려 room_id를 1..N으로 새로 매기므로
-# (사이클 간 정체성이 없음), RoomRegistry가 centroid 근접 매칭으로 "같은 물리적 방"을
-# 안정적인 room_id에 이어붙인다. 이 반경(m)보다 centroid가 더 멀어지면 다른 방으로
-# 취급해 새 id를 발급한다.
-ROOM_REGISTRY_MATCH_RADIUS_M = 2.0
-
-# 빈 in-room route가 한 번 나온 것만으로 room 완료를 선언하면 stochastic sampling의
-# 일시 실패에도 다음 방으로 넘어간다. 연속 N번 비어야 covered로 확정한다.
-ROOM_COMPLETION_CONFIRMATIONS = int(os.getenv("SYSNAV_ROOM_COMPLETION_CONFIRMATIONS", "2"))
-# 방 안에 남은 surface cell이 이 값 이하이면 다음 방 선택을 worker에서 미리 계산한다.
-# VLM이 현재 방을 더 유망하다고 고르면 기존 in-room route를 그대로 계속 수행한다.
-ROOM_EARLY_STOP_SURFACE_CELLS = int(os.getenv("SYSNAV_ROOM_EARLY_STOP_SURFACE_CELLS", "18"))
-ROOM_EARLY_STOP_ENABLED = os.getenv("SYSNAV_ROOM_EARLY_STOP_ENABLED", "1") not in ("0", "false", "False")
-# doorway를 지난 뒤 다음 room 쪽으로 이 거리만큼 들어간 점을 room-entry waypoint로
-# 사용한다. 문 중심에만 도착하면 room label 0 경계에 계속 남는 문제를 막는다.
-ROOM_ENTRY_DEPTH_M = float(os.getenv("SYSNAV_ROOM_ENTRY_DEPTH_M", "1.20"))
-
-# Room category 추론(VLM) - SysNav paper Sec. IV-A-1의 room attribute c_i. Object
-# self-attribute와 같은 on-demand 패턴: room의 "best view"(가장 coverage_voxel_count가
-# 큰 viewpoint, 논문 각주의 "visible voxels 최대화")가 바뀔 때만 재추론하고, 그 외엔
-# 캐시를 재사용한다.
-ROOM_CLASSIFICATION_ENABLED = os.getenv("SYSNAV_ROOM_CLASSIFICATION_ENABLED", "1") not in ("0", "false", "False")
-# VLM 호출이 실패(키 없음 등)했을 때 매 mapping cycle(0.35초 간격)마다 재시도하면 로그가
-# 스팸이 되므로, 실패한 room은 이 시간(초)만큼 재시도를 쉰다.
-ROOM_CLASSIFICATION_RETRY_COOLDOWN_SEC = 15.0
+ROBOT_CLEARANCE_M = 0.10 # 0.10 -> 0.0 ? ***
 
 # frontier anchor(is_near_visited 예외 대상, 문 통과 문제 때문에 도입)가 plan_route()
 # 호출마다 계속 다시 잡히면(=그 옆 unknown 셀이 영영 안 풀림, 예: 유리창이라 LiDAR가
 # 못 뚫는 경우) 이 횟수를 넘는 순간부터 예외 자격을 박탈해서 결국 후보에서 빠지게 한다.
 # 안 그러면 "도착 -> 같은 지점 재선택 -> 도착 -> ..." 무한 루프에 걸린다(실측으로 확인됨).
 EXPLORATION_ANCHOR_MAX_REVISITS = 5
+
+# base autonomy(waypointConverter)가 받아줄 지점이 없어서 **발행조차 못 한** 좌표의
+# 셀이 이 횟수만큼 거부되면 후보 풀에서 뺀다(CoveragePlanner.mark_unpublishable).
+# A*로는 도달 가능해서 planner 혼자서는 절대 못 걸러내는 좌표들이라, 이게 없으면
+# "계획 -> 전 hop 발행 거부 -> OBSERVE -> 로봇이 안 움직여 지도 동일 -> 같은 계획"의
+# 무한루프가 된다(실측 2026-08-24, 1.2초 주기).
+# 1이 아니라 2인 이유: terrain_map은 로봇 주변 롤링 윈도우(decayTime 1.0s /
+# noDecayDis 1.75m)라 지금 멀어서 못 받는 지점도 가까이 가면 받아줄 수 있다.
+EXPLORATION_UNPUBLISHABLE_MAX_STRIKES = int(
+    os.getenv("SYSNAV_EXPLORATION_UNPUBLISHABLE_MAX_STRIKES", "2")
+)
+# 위 blacklist가 후보 풀을 비우기 전에도 라이브락이 길어질 수 있으므로(발행 거부가
+# 매번 다른 셀에서 나는 경우), "route는 나왔는데 전 hop이 발행 거부"가 이 횟수만큼
+# 연속되면 탐사 소진으로 승격해 미션별 종료 처리로 넘긴다. Mission 2는
+# MISSION2_EXPLORATION_TIME_LIMIT_SEC이 결국 구해주지만 Mission 1/3은 탈출구가 없다.
+EXPLORATION_UNPUBLISHABLE_ROUTE_LIMIT = int(
+    os.getenv("SYSNAV_EXPLORATION_UNPUBLISHABLE_ROUTE_LIMIT", "5")
+)
 
 FRONTIER_MIN_CLUSTER_CELLS = 5
 FRONTIER_COVERAGE_RADIUS_M = 3.0  # 논문의 d_cover
@@ -555,12 +503,12 @@ FRONTIER_COVERAGE_RADIUS_M = 3.0  # 논문의 d_cover
 # 남지만, "가서 봤더니 생각보다 덜 보였다" 정도라 탐색이 통째로 멈추는 것보다 훨씬 낫다.
 FRONTIER_LOS_WALL_MARGIN_M = float(os.getenv("SYSNAV_FRONTIER_LOS_WALL_MARGIN_M", "0.0"))
 
-# In-room exploration policy (SysNav paper Sec. IV-B-1): stochastic candidate selection
+# Exploration policy (SysNav paper Sec. IV-B-1): stochastic candidate selection
 EXPLORATION_CANDIDATE_SAMPLES = 60  # |H|, 한 사이클에 샘플링할 pose 후보 수
 EXPLORATION_MIN_SCORE_DELTA = 3     # δ, wcov가 이 밑으로 떨어지면 후보 뽑기를 멈춤
 EXPLORATION_STOCHASTIC_TRIALS = 4   # K, stochastic sampling을 반복해서 TSP 비용 최소인 것을 채택
 # 한 plan_route() 사이클에서 최대 몇 개의 candidate를 한 번에 뽑아 TSP로 묶을지. frontier
-# anchor(모든 남은 frontier마다 보장되는 후보)까지 생기면서, 방 양쪽 끝처럼 서로 먼 두 곳이
+# anchor(모든 남은 frontier마다 보장되는 후보)까지 생기면서, 맵 양쪽 끝처럼 서로 먼 두 곳이
 # 한 번에 다 뽑혀서 "이쪽 찍고 저쪽 찍고" 왔다갔다 하는 경로가 나오는 문제가 있었다. 1로
 # 두면 매 사이클 가장 좋은 후보 하나만 골라서 그리로 갔다가, 도착하면 최신 지도로 다시
 # 고른다 - 논문의 "batch로 여러 개 묶어서 효율화"보다는 덜 효율적일 수 있지만 왔다갔다
@@ -578,8 +526,7 @@ EXPLORATION_DISTANCE_PENALTY_HALFLIFE_M = 3.0
 # (원래 1.5m라 waypoint(보라색 점)가 너무 자주/가깝게 찍혀서 3.0m로 늘림 - 뚫린 직선
 # 구간에서는 여전히 한 번에 더 길게 건너뛴다, string-pulling이라 코너/문에서는 자동으로
 # 촘촘해짐 - _simplify_path_indices 참고.)
-# 탐색 경로를 hop으로 자르는 간격. cross_room_navigator(방 사이 이동 경로)와
-# coverage_planner의 leg waypoint 생성이 쓴다.
+# 탐색 경로를 hop으로 자르는 간격. coverage_planner의 leg waypoint 생성이 쓴다.
 #
 # terrain_map은 decayTime=1.0s / noDecayDis=1.75m 롤링이라 로봇에서 1.75m 밖은 1초면
 # 사라진다. hop 간격이 그보다 크면 다음 목표가 "travArea 점이 없는" 구간에 떨어져

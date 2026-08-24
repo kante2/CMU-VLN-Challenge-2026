@@ -1,6 +1,6 @@
 """Mission 2 - Object Reference (MISSION_2object_reference_CLAUDE.txt).
 
-먼저 모든 room/frontier를 탐사하며 Scene Graph를 누적한다. 탐사가 완전히 끝난 뒤
+먼저 모든 frontier를 탐사하며 Scene Graph를 누적한다. 탐사가 완전히 끝난 뒤
 Graph의 object/relation/viewpoint 정보를 사용해 문장이 가리키는 유일한 물체를 고르고,
 bbox marker(`/selected_object_marker`)와 navigation waypoint를 발행한다.
 

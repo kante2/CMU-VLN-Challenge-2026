@@ -16,7 +16,7 @@ question_callback ──▶ mission_classifier로 미션 타입 결정 ──▶
 ┌─────────────────────────────────────────────────────────────┐
 │  공용 상태머신 (control_loop, 0.2초 주기)                      │
 │  OBSERVE → PLAN_EXPLORATION → FOLLOW_EXPLORATION → (반복)     │
-│           └─ 빈 route면 cross-room 시도 후 미션별 종료 처리로   │
+│           └─ 빈 route면 미션별 종료 처리로                    │
 └─────────────────────────────────────────────────────────────┘
         │
         ▼ (미션마다 갈라짐, missions/mission{1,2,3}_pipe.py)
@@ -71,7 +71,7 @@ ROS 타이머(`config.CONTROL_PERIOD_SEC=0.2초`)마다 `control_loop()` 호출.
 `control_loop`은 공용 state까지는 직접 처리하고, 그 외 state는 `task["mission_type"]`으로 해당 `missionN_pipe.loop()`에 위임(`sysnav_node.py`의 `_MISSION_PIPES` dict). `consume_future`도 마찬가지로 job 결과를 `missionN_pipe.on_job_result()`에 위임 — 단 `perception` 결과의 공용 부분(스탬프 갱신, scene graph 로그, marker publish)은 위임 전에 먼저 처리.
 
 ### PLAN_EXPLORATION이 빈 route를 반환했을 때 (`consume_future`)
-바로 미션별 종료 처리로 넘기지 않고 **cross-room navigation**을 먼저 시도한다 (5장 참고). 안 가본 방이 없거나 갈 수 없으면 그제서야 `missionN_pipe.on_job_result(kind="exploration", route=[])`로 넘어가 미션별 최종 처리(카운트 확정 / FAILED)를 함.
+지도 원점/로봇 cell이 아직 준비 안 된 일시적 실패(`origin_not_ready` 등)면 `PLAN_EXPLORATION`으로 되돌린다. 그 외에는 탐색이 완전히 소진된 것으로 보고 `missionN_pipe.on_job_result(kind="exploration", route=[])`로 넘어가 미션별 최종 처리(카운트 확정 / FAILED)를 함.
 
 ---
 
@@ -93,9 +93,9 @@ ROS 타이머(`config.CONTROL_PERIOD_SEC=0.2초`)마다 `control_loop()` 호출.
 ## 4. Scene Graph & 물체 간 관계 (`scene_graph/scene_graph_manager.py`)
 
 ### 노드/엣지 구조 (SysNav 논문 Sec IV-A-1)
-- **Object Node**: `object_memory`의 각 물체. `self_attributes`(color 등, on-demand VLM 추론) 캐시 포함.
+- **Object Node**: `object_memory`의 각 물체. VLM 판정 캐시 두 종류를 들고 있다 — `self_attributes`(color 등, `attribute_verifier`)와 `relation_checks`(이미지 기반 관계 판정, `relation_image_verifier`). 2D bbox 크롭도 두 장 보관: `representative_image`(배경 제거, 속성 판정용)와 `context_image`(배경 유지 + 여유, 관계 판정용). 사진이 교체되면 `image_version`이 올라가고, 그게 `relation_checks` 캐시의 무효화 신호다.
 - **Viewpoint Node**: LiDAR coverage가 기존 대비 `VIEWPOINT_NOVEL_VOXEL_THRESHOLD` 이상 새로울 때만 생성(논문의 novelty 기준). 대표 이미지 저장(`scene_graph_viewpoints/`).
-- **Room Node**: 5장 참고.
+- **Room Node**: 호환성용 고정 노드 `Room_0` 하나(`SCENE_GRAPH_SINGLE_ROOM_ID`). 모든 Viewpoint/Object가 여기에 매달린다.
 
 ### 속성(attribute) 검증 — `reasoning/attribute_verifier.py`
 문장에 색상 등 속성 제약이 있으면, 후보가 1개뿐이어도 반드시 VLM으로 확인(예전엔 "후보 1개면 그냥 확정"하던 지름길이 색을 안 보고 넘어가는 버그였음). Fail-**closed**(확인 안 되면 불통과 — attribute 확인이 핵심인데 실패를 통과로 치면 안 됨).
@@ -105,7 +105,8 @@ ROS 타이머(`config.CONTROL_PERIOD_SEC=0.2초`)마다 `control_loop()` 호출.
 
 1. **같은 프레임 동시 관측 + Gemini** (`_infer_task_relations_from_common_viewpoints`, `reasoning/spatial_relation_reasoner.py::infer()`) — 기존 경로. 두 물체가 같은 viewpoint에서 함께 관측된 적 있어야 시도됨. 이미지를 Gemini에게 보여주고 관계가 맞는지 확인, 실패 시 순수 기하 계산(`_infer_with_geometry`)으로 폴백.
 2. **전역 위치 기반 순수 기하** (`_infer_task_relations_globally`, `spatial_relation_reasoner.py::infer_global()`) — **같은 프레임일 필요 없음**. object_memory에 있는 전역 3D 위치만으로 관계 판정(Lang2LTL-2 논문의 Spatial Predicate Grounding 방식: figure/ground를 독립적으로 grounding한 뒤 벡터 기하로 relation 판정). `near`/`nearest`/`between`/`on`/`above`/`under`/`beside`는 로봇 pose도 불필요. 두 물체가 각각 언제든 한 번이라도(precise든 approximate든) grounding만 됐으면 성립.
-3. **후보 자신의 이미지로 VLM 직접 확인** (`reasoning/relation_image_verifier.py::verify()`, `sysnav_node.py::selection_job`) — 참조 물체가 3D로 **아예** 안 잡혀도(0 point) 됨. 후보(예: bedside table)의 대표 이미지를 Gemini에게 보여주고 "이 사진에 [참조 물체]가 [관계]로 보이는가?"를 직접 확인. `attribute_verifier`와 같은 on-demand 패턴을 관계형 predicate로 확장한 것. Fail-closed.
+3. **후보 자신의 이미지로 VLM 직접 확인** (`reasoning/relation_image_verifier.py::verify()`, `sysnav_node.py::selection_job`) — 참조 물체가 3D로 **아예** 안 잡혀도(0 point) 됨. 후보(예: bedside table)의 `context_image`를 Gemini에게 보여주고 "이 사진에 [참조 물체]가 [관계]로 보이는가?"를 직접 확인. 최상급(`nearest`/`farthest`)은 후보마다 독립 yes/no를 물으면 둘 다 통과할 수 있어서, `rank_superlative()`가 후보 전부를 한 번에 놓고 비교시킨다. `attribute_verifier`와 같은 on-demand 패턴을 관계형 predicate로 확장한 것. Fail-closed.
+   - **캐싱(2026-08-24 추가)**: 판정 결과는 object node의 `relation_checks`에 적립되고 키에 `image_version`이 들어간다 — **사진이 교체될 때만** 다시 묻는다. 이게 없을 때는, 참조 물체가 끝내 grounding 안 되는 경우(이 폴백이 존재하는 바로 그 상황) `relation_pending` → `PLAN_EXPLORATION` → `OBSERVE` → `SELECT_TARGET` 사이클마다 같은 사진을 같은 질문으로 계속 올렸다(mission3는 step마다 새로 시작해서 더 심함). 최상급은 집합 전체를 놓고 내린 판정이라 키에 참가자 전원의 `(id, image_version)`이 들어가고, 참가한 모든 노드에 같은 키로 적립된다.
 
 1번이 안 되면 2번, 2번도 안 되면(참조 물체가 전역 위치조차 없으면) 3번까지 자동으로 넘어간다. 셋 다 실패하면 `relation_pending: True`로 확정을 미루고 계속 탐색.
 
@@ -114,53 +115,42 @@ ROS 타이머(`config.CONTROL_PERIOD_SEC=0.2초`)마다 `control_loop()` 호출.
 
 ---
 
-## 5. Room 구조 & Cross-room Navigation (SysNav 논문 Sec IV-A-1, IV-B-2)
-
-### Room 분할 + 분류
-- `rooms/room_segmenter.py::RoomSegmenter.segment()` — occupancy grid에서 distance-transform+watershed로 방을 분할. 매 mapping cycle마다 **처음부터 다시 계산**(room_id가 사이클마다 바뀔 수 있음).
-- `rooms/room_registry.py::RoomRegistry` — 위 결과를 centroid 매칭으로 **안정적인 persistent room_id**에 이어붙임. 각 방에 배정된 viewpoint 중 `coverage_voxel_count`가 가장 큰 것을 대표 이미지로 추적.
-- `reasoning/room_classifier.py::RoomClassifier` — 방의 대표 이미지로 카테고리(kitchen/bedroom 등) on-demand VLM 추론, 캐싱. Fail-open 아님(실패하면 미분류 상태 유지, 다음 사이클 재시도).
-- `rooms/room_visualizer.py` — `room_segmentation_latest.png`에 분할+카테고리 시각화.
-
-### Cross-room navigation (`sysnav_node.py::_try_start_cross_room_navigation` / `_on_cross_room_select_result`)
-`PLAN_EXPLORATION`이 빈 route를 반환하면(현재 알려진 영역에 더 볼 게 없음):
-1. `RoomRegistry.unvisited_rooms()` — 기하학적으로는 분할됐지만 viewpoint가 하나도 없는(=로봇이 실제로 들어간 적 없는) 방 목록.
-2. 이번 task에서 이미 시도해본 방(`self._cross_room_attempted_ids`)은 제외.
-3. 있으면 `rooms/cross_room_navigator.py::select_job` 제출(worker thread) — 카테고리를 아는 방은 `reasoning/room_relevance_selector.py::RoomRelevanceSelector.rank()`(VLM, task 문장 기반 관련도 순위, fail-open→거리순)로 우선순위, 모르는 방은 거리순. 순서대로 `coverage_planner.plan_direct_path()`가 실제로 되는 첫 방을 선택.
-4. 성공하면 그 방까지 가는 waypoint를 `exploration_route`에 넣고 기존 `FOLLOW_EXPLORATION`으로 이동 → 도착하면 그 방 기준으로 `PLAN_EXPLORATION` 재개.
-5. 안 가본 방이 없거나 전부 실패하면 원래 "빈 route" 상황으로 되돌려 미션별 종료 처리.
-
----
-
-## 6. 탐색 알고리즘 (`exploration/coverage_planner.py::plan_route()`, 논문 Sec IV-B-1)
+## 5. 탐색 알고리즘 (`exploration/coverage_planner.py::plan_route()`, 논문 Sec IV-B-1)
 
 1. Occupancy grid에서 로봇 clearance(`ROBOT_CLEARANCE_M`)만큼 벽을 부풀린 `traversable` 계산.
 2. 논문의 surface point set **S**(free/non-free 경계, frontier) 추출.
-3. 현재 **방** 안에서 무작위 pose 후보 샘플링(`EXPLORATION_CANDIDATE_SAMPLES`개) + 아직 안 풀린 frontier 컴포넌트마다 보장되는 **anchor** 후보(방 제한 없이 전체 맵에서 탐색 — 문 통과 문제 대응).
+3. 알려진 맵 전체의 traversable cell에서 무작위 pose 후보 샘플링(`EXPLORATION_CANDIDATE_SAMPLES`개) + 아직 안 풀린 frontier 컴포넌트마다 보장되는 **anchor** 후보(작고 먼 frontier를 샘플링 운으로 놓치지 않게).
 4. 각 후보의 **wcov**(반경 내 + line-of-sight로 보이는 아직-안-덮인 surface point 수) 계산.
 5. Stochastic sampling(`EXPLORATION_STOCHASTIC_TRIALS`번 반복) + TSP로 비용 최소 경로 선택.
 6. A* 경로를 `EXPLORATION_PATH_WAYPOINT_SPACING_M` 간격으로 잘라 중간 waypoint 생성.
+
+### 발행 거부 라이브락(수정됨, 2026-08-24)
+`plan_route()`가 route를 반환해도 `goal_publisher.publish()`가 그 hop을 **하나도 발행 못 하는** 경우가 있다(base autonomy의 `waypointConverter`가 받아줄 travArea 점이 그 좌표 근처에 없음 → `SNAP_FAIL` / `SNAP_NO_PROGRESS`). 그러면 `publish_next_exploration_goal()`이 `OBSERVE`로 되돌리는데, 로봇이 안 움직이니 지도가 그대로고 → 다음 사이클에 **완전히 동일한 route**가 다시 나온다. `plan_route()`는 빈 route를 반환하지 않으므로 미션별 종료 처리가 영원히 안 불린다(실측: 1.2초 주기 무한루프. Mission 2는 `MISSION2_EXPLORATION_TIME_LIMIT_SEC`이 결국 구해주지만 Mission 1/3은 탈출구가 없음).
+
+방어선 두 개:
+1. **planner blacklist** — 발행 거부된 좌표마다 `CoveragePlanner.mark_unpublishable()`로 셀에 strike를 적립하고, `EXPLORATION_UNPUBLISHABLE_MAX_STRIKES`(2)를 넘긴 셀은 후보 풀에서 뺀다(anchor도 예외 없음). 1이 아니라 2인 이유는 terrain_map이 롤링 윈도우라 지금 멀어서 못 받는 지점도 가까이 가면 받아줄 수 있기 때문. `reset()`(새 질문)에서 초기화.
+2. **streak 승격** — "route는 나왔는데 전 hop 발행 거부"가 `EXPLORATION_UNPUBLISHABLE_ROUTE_LIMIT`(5회) 연속되면 `_finish_exploration_as_exhausted()`가 빈 route와 동일하게 미션별 종료 처리로 넘긴다. 넓은 공간에서는 매 사이클 후보를 새로 무작위 샘플링해서 1번만으로는 안 마르기 때문에 필요하다.
 
 ### Anchor 무한루프 버그(수정됨)
 Anchor는 `viewpoint_memory.is_near_visited()` 예외 대상(문 통과용)인데, 그 옆 unknown 셀이 **영영 안 풀리면**(예: 유리창이라 LiDAR가 못 뚫음) 매 사이클 같은 anchor가 다시 잡혀서 무한 루프에 빠졌음. `_anchor_visit_counts`로 같은 anchor가 몇 번 연속 잡히는지 세서, `EXPLORATION_ANCHOR_MAX_REVISITS`(5회) 넘으면 예외 자격을 박탈 → 결국 후보에서 빠져서 정상적으로 "더 볼 곳 없음"에 수렴하도록 수정.
 
 ---
 
-## 7. Mission 1 — Numerical (`missions/mission1_pipe.py`)
+## 6. Mission 1 — Numerical (`missions/mission1_pipe.py`)
 
 - 파싱: Object Reference와 동일(`LLMQueryParser`).
 - **후보를 찾아도 절대 멈추지 않음** — `_on_perception_result`가 `origin_state=="OBSERVE"`일 때만 `PLAN_EXPLORATION`으로 보내고, 후보 존재 여부는 무시.
-- `plan_route()`가 빈 route를 반환(=탐색 완전히 소진, cross-room까지 다 시도한 뒤)하면 `MISSION1_FINALIZE_COUNT`로 전환(FAILED 아님 — "다 봤다"는 정상 종료 신호).
+- `plan_route()`가 빈 route를 반환(=탐색 완전히 소진)하면 `MISSION1_FINALIZE_COUNT`로 전환(FAILED 아님 — "다 봤다"는 정상 종료 신호).
 - `count_job` — `object_memory.find_by_category()` → relation 필터(`scene_graph.find_matching_target_ids`) → attribute 필터(`attribute_verifier`) 순서로 걸러서 개수 확정.
 - `/numerical_response`(Int32) 발행, `SUCCESS`.
 
-## 8. Mission 2 — Object Reference (`missions/mission2_pipe.py`)
+## 7. Mission 2 — Object Reference (`missions/mission2_pipe.py`)
 
 - `SELECT_TARGET` → `selection_job`(위 4장의 attribute/relation 검증 전체 + `GeminiSelector.select()`로 최종 하나 확정) → 확정되면 `object_approach_pose()`로 접근 지점 계산, `goal_publisher.publish()` + **`/selected_object_marker`(Marker, 단수) 발행** → `NAVIGATE_TARGET`.
 - `NAVIGATE_TARGET`에서 `goal_reached()`면 `SUCCESS`.
 - README의 "marker 중심점이 곧 navigation waypoint" 요구사항대로 marker와 waypoint를 같은 시점(확정 시점)에 함께 발행.
 
-## 9. Mission 3 — Instruction-Following (`missions/mission3_pipe.py`)
+## 8. Mission 3 — Instruction-Following (`missions/mission3_pipe.py`)
 
 ### 문장 → 절 분해 (`parse_instruction`)
 1. `_split_clauses()` — 정규식 기반. 트리거: `go to/near/between`, `stop at/by`, `take the path`, `avoid(ing) the path`, `pass by`, 생략형 `and then to`/`and finally, to`. `questions.json` 30문장 전수 검증(생략된 동사, "go between A and B", "the two X" 집합형까지 포함).
@@ -171,7 +161,9 @@ Anchor는 `viewpoint_memory.is_near_visited()` 예외 대상(문 통과용)인�
    - **negative_path**: `task["global_forbidden"]`에 별도 저장 — 문장 어디에 있든 **남은 경로 전체에 적용되는 전역 제약**으로 취급(README의 "전체 궤적이 금지구역을 지나갔는지" 채점 기준에 맞춤).
 
 ### 실행 (`MISSION3_SELECT_STEP` ↔ `MISSION3_NAVIGATE_STEP`)
-- `_select_step`: 현재 `steps[step_index]` 처리. `resolve="category"`면 `selection_job` 제출(4장 3단계 relation 검증 전체 재사용). `resolve="point"`면 `object_memory`에서 참조 카테고리 후보의 위치를 직접 가져와(VLM 없이, 가장 가까운 것) 기하 계산.
+- `_select_step`: 현재 `steps[step_index]` 처리. `resolve="category"`면 `selection_job` 제출(4장 3단계 relation 검증 전체 재사용). `resolve="point"`면 `object_memory`에서 참조 카테고리 후보의 위치를 직접 가져와(VLM 없이, 가장 가까운 것) 기하 계산. 단, 이 step이 필요로 하는 카테고리(target + 관계 참조)를 아직 못 봤으면(`_missing_categories`) 판정을 시도하지 않고 먼저 탐사한다 — 안 그러면 selection_job의 이미지 폴백이 "아직 안 가봐서 못 본" 것까지 성급히 확정해버린다.
+- **pending 시 즉시 확정 (`_resolve_pending_step`, 2026-08-24)**: `selection_job`이 `relation_pending`/`attribute_pending`/`verification_pending`을 돌려줬을 때, **이 step에 필요한 카테고리가 전부 관측돼 있으면 탐사로 돌아가지 않고 기하로 목적지를 정해 바로 goal을 찍는다**(`_best_effort_step_target`: `near`/`beside` 등은 참조 물체와 XY 거리가 최소인 후보, `farthest`는 최대인 후보; 참조가 3D 위치를 못 가졌으면 로봇에서 가장 가까운 후보 + "관계 미적용" 경고 로그). 아직 못 본 물체가 있을 때만 예전처럼 `PLAN_EXPLORATION`으로 간다.
+  - 왜: `selection_job`의 유일한 탈출구인 `mission2_exploration_deadline_reached`는 **Mission 2 전용**이라 Mission 3에서는 절대 안 선다. 그래서 관계가 끝내 검증 안 되면(참조가 유리창이라 3D grounding 실패, Gemini `final_verification`이 계속 거절 등) 타겟도 참조도 눈앞에 있는데 탐사가 소진될 때까지 돌다가 FAILED로 끝났다. Mission 3 채점은 subgoal 순서 + 실제 궤적 + 부분점수라, "정확할 때까지 안 움직인다"보다 "지금 아는 것으로 가장 그럴듯한 곳에 바로 간다"가 항상 낫다.
 - 처리 중 매번 `_try_resolve_forbidden` 시도 — `global_forbidden`의 참조 물체 위치가 확보되면 A-B 선분(or 한 점) 주변에 `INSTRUCTION_FORBIDDEN_RADIUS_M` 반경으로 forbidden mask 생성(`node.mission3_forbidden_mask`).
 - 목표 지점이 정해지면 `_start_navigate_to_point`: forbidden mask가 있으면 `coverage_planner.plan_direct_path()`(A*로 우회 경로) 사용, 없으면 단순 접근점 하나 직접 발행. `mission3_leg_queue`에 waypoint 채우고 `MISSION3_NAVIGATE_STEP`으로.
 - 도착하면 `mission3_step_index += 1`, 다음 step 있으면 `MISSION3_SELECT_STEP`으로, 없으면 `SUCCESS`.
@@ -179,7 +171,7 @@ Anchor는 `viewpoint_memory.is_near_visited()` 예외 대상(문 통과용)인�
 
 ---
 
-## 10. 출력 토픽 요약
+## 9. 출력 토픽 요약
 
 | 토픽 | 타입 | 미션 | 채점 기준 |
 |---|---|---|---|
@@ -191,20 +183,18 @@ Anchor는 `viewpoint_memory.is_near_visited()` 예외 대상(문 통과용)인�
 
 ---
 
-## 11. 디버깅 도구
+## 10. 디버깅 도구
 
 - **`ai_module/debug/mission_status_latest.html`** — 실시간 대시보드(`mission_dashboard.py`, 1초 갱신). 현재 미션/state, 10분 타임리밋 진행바, 미션별 상세(Numerical: 후보 수, Object Reference: 선택된 물체, Instruction-Following: 전체 plan + 진행 상태 + parser 종류), 마지막 발행값. `./docker/ui_checker.sh`로 열기.
-- **`ai_module/debug/room_segmentation_latest.png`** — 방 분할 + 카테고리.
-- **`ai_module/debug/scene_graph_latest.png/.json/.dot`** — Room/Viewpoint/Object 그래프.
+- **`ai_module/debug/scene_graph_latest.png/.json/.dot`** — Viewpoint/Object 그래프.
 - **`ai_module/debug/exploration_debug_latest.png`** — surface point(frontier) + 로봇 위치.
 - **`ai_module/debug/sysnav_relation_check.txt`** — 관계 검증 시도 전부(통과/실패 포함) 기록.
 - **`ai_module/debug/sysnav_detect_*.jpg`** — 매 perception마다 bbox+mask+3D 위치 오버레이.
 
 ---
 
-## 12. 알려진 한계 / 다음 단계 후보
+## 11. 알려진 한계 / 다음 단계 후보
 
 - `find_matching_target_ids`가 relation_chain을 hop 단위로 따라가는데, 다단계 체인(A closest to B near C)에서 각 hop이 서로 다른 시점/경로(co-observation/전역기하/이미지폴백)로 검증될 수 있어 조합 시 신뢰도가 균일하지 않음.
 - `relation_image_verifier`는 "nearest" 같은 최상급을 후보별 독립 boolean으로만 판정(여러 후보가 동시에 "yes"일 수 있음) — 최종 선택은 `GeminiSelector`의 문장 전체 맥락 판단에 위임.
-- Cross-room navigation은 문이 닫혀서 LiDAR가 아예 못 본 방은 애초에 `RoomRegistry`에 등록조차 안 되므로 여전히 못 찾음(물리적 한계).
 - Mission 3의 `_split_clauses` 트리거 목록 밖의 표현은 LLM 폴백에 의존 — 폴백 자체가 검증 데이터셋(30문장) 밖이라 실전 정확도 미검증.

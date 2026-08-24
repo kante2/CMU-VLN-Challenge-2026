@@ -341,8 +341,8 @@ class SceneGraphManager:
             return None
 
     def list_viewpoints(self) -> list[dict]:
-        """RoomRegistry가 mapping cycle(0.35초)마다 부르는 가벼운 조회 - object/edge
-        전체를 deepcopy하는 snapshot()과 달리 room 배정에 필요한 필드만 뽑는다."""
+        """viewpoint 목록만 뽑는 가벼운 조회 - object/edge 전체를 deepcopy하는
+        snapshot()과 달리 필요한 필드만 뽑는다."""
         with self._lock:
             return [
                 {

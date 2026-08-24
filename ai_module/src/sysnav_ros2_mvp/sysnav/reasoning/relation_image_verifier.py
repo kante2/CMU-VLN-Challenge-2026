@@ -13,6 +13,16 @@ object_memory에 3D 위치로 존재해야 성립한다. 근데 유리창처럼 
 
 attribute_verifier.py와 같은 이유로 fail-closed: 실패하면 통과시키지 않는다("확인
 안 했는데 확정"이 애초에 고치려던 문제이므로).
+
+캐싱도 attribute_verifier와 같은 패턴이다: 판정 결과는 object_memory 노드의
+`relation_checks`에 적립되고(저장은 호출 쪽 책임 - 이 클래스는 object_memory를 모른다),
+캐시 키에 노드의 `image_version`이 들어가서 **사진이 바뀔 때만** 다시 묻는다.
+
+왜 필요했나: 이 폴백은 참조 물체가 끝내 grounding 안 되는 경우(유리창 등)를 위한
+것인데, 그런 경우 selection_job이 relation_pending을 반환 -> PLAN_EXPLORATION ->
+OBSERVE -> 다시 SELECT_TARGET으로 되돌아온다. 캐시가 없으면 같은 후보의 같은 사진을
+같은 질문으로 이 사이클마다 계속 Gemini에 올린다(mission3는 step마다 새로 시작해서
+더 심하다). 사진이 그대로면 답도 같을 수밖에 없으므로 순수 낭비다.
 """
 
 from __future__ import annotations
@@ -51,24 +61,78 @@ class RelationImageVerifier:
             raise RuntimeError("Relation-image verification JPEG encoding failed")
         return encoded.tobytes()
 
-    def verify(self, candidates: list[dict], relation: str, reference_category: str) -> set[int]:
-        """candidates: object_memory 노드 리스트(representative_image 포함).
-        relation/reference_category(예: "nearest"/"window")가 각 후보 자신의 대표
-        이미지에서 시각적으로 참인지 VLM에게 직접 확인받는다 - reference 물체를 3D로
-        grounding할 필요가 아예 없다. 반환: 통과한 object_id 집합(실패하면 빈 set).
+    @staticmethod
+    def _usable(candidates: list[dict]) -> list[dict]:
+        """context_image가 실제로 있는 후보만. representative_image는 배경을 지운
+        물체 단독 사진이라 참조 물체가 애초에 안 찍혀서 못 쓴다."""
+        return [
+            candidate for candidate in candidates
+            if isinstance(candidate.get("context_image"), np.ndarray)
+            and candidate["context_image"].size
+        ]
+
+    @staticmethod
+    def _version(candidate: dict) -> int:
+        return int(candidate.get("image_version", 0))
+
+    @classmethod
+    def _verify_key(cls, candidate: dict, relation: str, reference_category: str) -> str:
+        """후보 하나짜리 판정의 캐시 키. 그 후보의 사진이 바뀌면 키가 바뀐다."""
+        return f"verify|{relation}|{reference_category}|v{cls._version(candidate)}"
+
+    @classmethod
+    def _rank_key(cls, usable: list[dict], relation: str, reference_category: str) -> str:
+        """최상급 비교는 후보 **집합 전체**를 놓고 내린 판정이라, 집합이나 그중 한 장의
+        사진이 바뀌면 결과가 달라질 수 있다. 그래서 참가자 전원의 (id, 사진버전)을
+        키에 넣고, 참가한 모든 노드에 같은 키로 적립한다."""
+        signature = ",".join(
+            f"{int(candidate['object_id'])}:{cls._version(candidate)}"
+            for candidate in sorted(usable, key=lambda item: int(item["object_id"]))
+        )
+        return f"rank|{relation}|{reference_category}|{signature}"
+
+    @staticmethod
+    def _cached(candidate: dict, key: str) -> bool | None:
+        return (candidate.get("relation_checks") or {}).get(key)
+
+    def verify(
+        self, candidates: list[dict], relation: str, reference_category: str
+    ) -> dict[int, dict[str, bool]]:
+        """candidates: object_memory 노드 리스트(context_image 포함).
+        relation/reference_category(예: "nearest"/"window")가 각 후보 자신의 사진에서
+        시각적으로 참인지 VLM에게 직접 확인받는다 - reference 물체를 3D로 grounding할
+        필요가 아예 없다.
+
+        반환: `{object_id: {cache_key: bool}}` - attribute_verifier.verify()와 같은
+        모양이다. 캐시에 이미 있던 판정은 VLM을 안 거치고 그대로 되돌려주고, 없던
+        후보만 새로 묻는다. 호출 쪽은 값이 True인 후보를 통과시키고, 반환된 dict를
+        object_memory.update_relation_checks()로 적립한다. VLM 호출이 통째로 실패하면
+        새로 물어본 후보는 아예 빠진 채 돌아온다(fail-closed - 다음 기회에 재시도).
 
         반드시 context_image를 써야 한다 - representative_image(attribute_verifier가
         쓰는 것)는 배경을 회색으로 지운 물체 단독 사진이라 애초에 참조 물체가 그
         사진 안에 나타날 수가 없다(항상 확인 불가로 실패하게 됨). context_image는
         같은 detection에서 배경을 안 지우고 여유를 두고 자른 사진이라 주변 맥락이
         보인다."""
-        usable = [
-            candidate for candidate in candidates
-            if isinstance(candidate.get("context_image"), np.ndarray)
-            and candidate["context_image"].size
-        ]
-        if not usable:
-            return set()
+        results: dict[int, dict[str, bool]] = {}
+        pending: list[dict] = []
+        for candidate in self._usable(candidates):
+            key = self._verify_key(candidate, relation, reference_category)
+            cached = self._cached(candidate, key)
+            if cached is None:
+                pending.append(candidate)
+            else:
+                results[int(candidate["object_id"])] = {key: bool(cached)}
+        if not pending:
+            if results:
+                self._logger.info(
+                    f"Relation image verification ({relation} {reference_category}): "
+                    f"all {len(results)} candidate(s) served from cache"
+                )
+            return results
+
+        cached_count = len(results)
+        usable = pending
         try:
             self._load()
             from google.genai import types
@@ -119,34 +183,58 @@ class RelationImageVerifier:
             if not response.text:
                 raise RuntimeError("Gemini가 빈 응답을 반환함")
             allowed = {int(candidate["object_id"]) for candidate in usable}
-            verified = {
-                int(entry["object_id"])
+            holds = {
+                int(entry["object_id"]): bool(entry["holds"])
                 for entry in json.loads(response.text).get("results", [])
-                if int(entry["object_id"]) in allowed and bool(entry["holds"])
+                if int(entry["object_id"]) in allowed
             }
-            self._logger.info(f"Relation image verification ({relation} {reference_category}): {verified}")
-            return verified
+            for candidate in usable:
+                object_id = int(candidate["object_id"])
+                if object_id not in holds:
+                    # 응답에 빠진 후보는 "확인 안 됨"으로 남긴다 - 캐시에도 안 넣어서
+                    # 다음 기회에 다시 물어본다.
+                    continue
+                key = self._verify_key(candidate, relation, reference_category)
+                results[object_id] = {key: holds[object_id]}
+            passed = sorted(object_id for object_id, value in holds.items() if value)
+            self._logger.info(
+                f"Relation image verification ({relation} {reference_category}): "
+                f"passed={passed} (asked {len(usable)}, from cache {cached_count})"
+            )
+            return results
         except Exception as error:
             self._logger.warning(f"Relation image verification skipped (unverified, not fail-open): {error}")
-            return set()
+            return results
 
     def rank_superlative(
         self, candidates: list[dict], reference_category: str, relation: str = "nearest"
-    ) -> int | None:
+    ) -> dict[int, dict[str, bool]]:
         """"nearest"/"closest"는 최상급(비교) relation이라 verify()처럼 후보마다
         독립적으로 yes/no만 물어보면 안 된다 - 예를 들어 bedside table이 2개 있고
         둘 다 사진에 창문이 보이면 둘 다 "yes"가 나와서 어느 게 진짜 더 가까운지
         구분이 안 된다. 이 메서드는 후보 전부를 한 번에 보여주고 VLM에게 직접
         비교시켜서 가장 가까운 후보 하나만 고른다. reference_category가 참조 물체를
         3D로 grounding 못 해서(0 point) 거리 계산 자체가 불가능할 때(즉 verify()와
-        같은 상황)만 쓴다. 반환: 승자 object_id, 실패/불확실하면 None."""
-        usable = [
-            candidate for candidate in candidates
-            if isinstance(candidate.get("context_image"), np.ndarray)
-            and candidate["context_image"].size
-        ]
+        같은 상황)만 쓴다.
+
+        반환: verify()와 같은 `{object_id: {cache_key: bool}}` - 승자만 True다.
+        참가자 전원이 **같은 키**를 공유하므로, 다음 호출에서 후보 집합과 사진이
+        그대로면 전원이 캐시에 걸려 VLM을 다시 안 부른다. "어느 후보 사진에도 참조
+        물체가 안 보인다"는 결론도 전원 False로 캐싱한다 - 그것도 돈 주고 얻은
+        판정이라 같은 사진으로 다시 물어볼 이유가 없다."""
+        usable = self._usable(candidates)
         if len(usable) < 2:
-            return None
+            return {}
+        key = self._rank_key(usable, relation, reference_category)
+        cached = [self._cached(candidate, key) for candidate in usable]
+        if all(value is not None for value in cached):
+            self._logger.info(
+                f"Relation image nearest-ranking ({reference_category}): served from cache"
+            )
+            return {
+                int(candidate["object_id"]): {key: bool(value)}
+                for candidate, value in zip(usable, cached)
+            }
         try:
             self._load()
             from google.genai import types
@@ -195,13 +283,16 @@ class RelationImageVerifier:
                     f"Relation image nearest-ranking ({reference_category}): "
                     "reference not visible in any candidate"
                 )
-                return None
+                return {int(candidate["object_id"]): {key: False} for candidate in usable}
             allowed = {int(candidate["object_id"]) for candidate in usable}
             winner = int(result["object_id"])
             if winner not in allowed:
                 raise RuntimeError(f"Gemini가 후보 밖의 object_id를 반환함: {winner}")
             self._logger.info(f"Relation image nearest-ranking ({reference_category}): winner={winner}")
-            return winner
+            return {
+                int(candidate["object_id"]): {key: int(candidate["object_id"]) == winner}
+                for candidate in usable
+            }
         except Exception as error:
             self._logger.warning(f"Relation image nearest-ranking skipped (not fail-open): {error}")
-            return None
+            return {}

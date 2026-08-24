@@ -1,6 +1,6 @@
 """탐색 상태(surface point / frontier)를 top-down PNG로 시각화.
 
-room_visualizer.py와 같은 패턴 - 매번 현재 상태 전체를 새로 그려서 atomic하게
+scene_graph_visualizer.py와 같은 패턴 - 매번 현재 상태 전체를 새로 그려서 atomic하게
 덮어쓴다 (append 아님, 재시작하면 다음 갱신 때 바로 최신 상태로 교체됨).
 
 논문의 surface point set S(free/non-free 경계, coverage_planner.plan_route()가

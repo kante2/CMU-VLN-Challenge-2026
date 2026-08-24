@@ -1,6 +1,6 @@
 """디버깅용 미션 상태 대시보드.
 
-room_segmentation_latest.png/scene_graph_latest.png와 같은 패턴 - 매 사이클
+exploration_debug_latest.png/scene_graph_latest.png와 같은 패턴 - 매 사이클
 현재 상태 전체를 새로 그려서 ai_module/debug/mission_status_latest.html을
 통째로 덮어쓴다. 서버 없이 그냥 브라우저(또는 VSCode Simple Browser)로 그
 파일을 열어두면 <meta refresh>가 자동으로 새로고침한다.
@@ -225,8 +225,7 @@ def _stat(label: str, value: str, hint: str = "") -> str:
 _MAP_IMAGES = [
     ("exploration_debug_latest.png", "탐색 지도",
      "회색=탐사 완료, 검정=벽/미탐사, 노랑=frontier, 파랑=로봇"),
-    ("room_segmentation_latest.png", "방 분할", "색=방 라벨, 회색=미분류 영역"),
-    ("scene_graph_latest.png", "Scene Graph", "room / viewpoint / object 노드"),
+    ("scene_graph_latest.png", "Scene Graph", "viewpoint / object 노드"),
 ]
 
 
@@ -271,7 +270,6 @@ def _map_panel(snapshot: dict) -> str:
     보는데 base autonomy는 모르는 구역"이 드러난다."""
     stats = snapshot.get("map_stats") or {}
     graph = snapshot.get("graph_counts") or {}
-    room = snapshot.get("room_summary") or {}
     if not stats:
         return '<div style="color:#9ca3af;font-size:13px;">아직 지도가 없습니다.</div>'
 
@@ -282,8 +280,6 @@ def _map_panel(snapshot: dict) -> str:
               f'free {stats.get("free_area_m2", 0):.1f} m² / '
               f'{stats.get("mapped_cells", 0)}셀 @ {stats.get("resolution_m", 0):.2f}m'),
         _stat("frontier", f'{frontier} 셀', frontier_hint),
-        _stat("방 / 문", f'{room.get("rooms", 0)} / {room.get("doorways", 0)}',
-              f'현재 방 R{room["active_room_id"]}' if room.get("active_room_id") else "현재 방 미분류"),
         _stat("viewpoint", str(graph.get("viewpoints", 0)),
               f'방문 기록 {snapshot.get("viewpoint_memory_count", 0)}'),
         _stat("물체", str(graph.get("objects", 0)),

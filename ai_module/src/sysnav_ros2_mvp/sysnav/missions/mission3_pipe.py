@@ -33,6 +33,7 @@ import numpy as np
 from sysnav import config
 from sysnav.missions import path_gate
 from sysnav.reasoning.attribute_filter import filter_by_attributes
+from sysnav.task.query_parser import effective_relation_chain
 
 # ---------------------------------------------------------------------------
 # 문장 -> 절(clause) 분리. questions.json의 instruction_following 30문장 전수
@@ -326,6 +327,61 @@ def _step_categories(step: dict) -> list[str]:
     return prompts
 
 
+# 기하로 근사할 때 "가장 먼 것"을 골라야 하는 relation. 나머지는 전부 "가장 가까운
+# 것"으로 근사한다 - near/nearest/beside는 그게 정확히 맞고, on/under/above도 XY로는
+# 가장 가까운 후보가 정답인 경우가 대부분이다. left_of/behind처럼 방향이 있는 relation은
+# 근사가 약하지만, mission3는 "아무 데도 안 가는 것"보다 "대충 맞는 데로 가는 것"이
+# 항상 낫다(부분점수 + 궤적 채점).
+_FARTHEST_RELATIONS = {"farthest"}
+
+
+def _xy_gap2(position_a, position_b) -> float:
+    return (position_a[0] - position_b[0]) ** 2 + (position_a[1] - position_b[1]) ** 2
+
+
+def _best_effort_step_target(node, step: dict, pose: dict) -> tuple[tuple | None, str]:
+    """VLM 확정이 안 될 때, 지금 관측된 것만으로 이 step의 목적지를 기하로 정한다.
+
+    반환: (position 또는 None, 무슨 근거로 골랐는지 설명하는 문자열).
+
+    참조 물체에는 속성 필터를 걸지 않는다 - filter_by_attributes는 fail-closed라
+    아직 검증 안 된 참조를 통째로 날려버려서, 정작 여기(폴백)에서는 참조가 하나도
+    안 남게 된다. target 후보에만 건다.
+    """
+    parsed = step["parsed"]
+    candidates = _category_candidates(node, parsed)
+    if not candidates:
+        candidates = node.object_memory.find_by_category(parsed["target"])
+    if not candidates:
+        return None, f"no {parsed['target']} observed yet"
+
+    chain = effective_relation_chain(parsed)
+    if not chain:
+        nearest = min(candidates, key=lambda c: _dist2(c["position"], pose))
+        return nearest["position"], "nearest candidate to the robot (no relation in this step)"
+
+    _, relation, reference_category = chain[0]
+    references = node.object_memory.find_by_category(reference_category)
+    reference_positions = [reference["position"] for reference in references]
+    if not reference_positions:
+        nearest = min(candidates, key=lambda c: _dist2(c["position"], pose))
+        return (
+            nearest["position"],
+            f"nearest candidate to the robot - '{relation} {reference_category}' NOT applied "
+            f"({reference_category} has no 3D position)",
+        )
+
+    def gap(candidate) -> float:
+        return min(_xy_gap2(candidate["position"], position) for position in reference_positions)
+
+    picked = (max if relation in _FARTHEST_RELATIONS else min)(candidates, key=gap)
+    return (
+        picked["position"],
+        f"geometric '{relation} {reference_category}' over {len(candidates)} candidate(s) "
+        f"and {len(reference_positions)} reference(s), gap={math.sqrt(gap(picked)):.2f}m",
+    )
+
+
 def _missing_categories(node, step: dict) -> list[str]:
     return [
         category for category in _step_categories(step)
@@ -393,8 +449,7 @@ def _on_selection_result(node, result: dict) -> None:
         or result.get("attribute_pending")
         or result.get("verification_pending")
     ):
-        with node.state_lock:
-            node.state = "PLAN_EXPLORATION"
+        _resolve_pending_step(node, result)
         return
     selected = node.object_memory.get(result["selected_id"])
     with node.sensor_lock:
@@ -404,6 +459,64 @@ def _on_selection_result(node, result: dict) -> None:
             node.state = "PLAN_EXPLORATION"
         return
     _start_navigate_to_point(node, pose, selected["position"], is_object_target=True)
+
+
+def _resolve_pending_step(node, result: dict) -> None:
+    """selection_job이 "아직 확정 못 하겠다"(relation/attribute/verification pending)고
+    돌려줬을 때 무엇을 할지 정한다.
+
+    예전에는 무조건 PLAN_EXPLORATION으로 되돌렸다. 그런데 selection_job의 유일한
+    탈출구는 `mission2_exploration_deadline_reached`인데 그 플래그는 Mission 2 전용이라
+    Mission 3에서는 절대 서지 않는다 - 즉 관계가 끝내 검증 안 되면(참조 물체가 유리창
+    이라 3D grounding이 안 되거나, Gemini final_verification이 계속 거절하거나)
+    SELECT_STEP -> selection -> pending -> PLAN_EXPLORATION 을 탐사가 소진될 때까지
+    돌다가 결국 FAILED로 끝났다. **타겟도 참조 물체도 이미 눈앞에 있는데도** 그랬다.
+
+    Mission 3의 채점은 subgoal 순서와 실제 주행 궤적이고 부분점수가 있다. "정확히
+    맞을 때까지 안 움직인다"보다 "지금 아는 것으로 가장 그럴듯한 곳에 바로 간다"가
+    항상 낫다. 그래서 이 step에 필요한 카테고리가 **전부 관측돼 있으면** 더 기다리지
+    않고 기하로 목적지를 정해 바로 goal을 찍는다. 아직 못 본 물체가 있을 때만
+    예전처럼 탐사로 돌아간다.
+    """
+    with node.state_lock:
+        task = None if node.task is None else dict(node.task)
+    with node.sensor_lock:
+        pose = None if node.latest_pose is None else dict(node.latest_pose)
+    steps = (task or {}).get("steps") or []
+    if pose is None or node.mission3_step_index >= len(steps):
+        with node.state_lock:
+            node.state = "PLAN_EXPLORATION"
+        return
+    step = steps[node.mission3_step_index]
+
+    missing = _missing_categories(node, step)
+    if missing and not node.mission3_exploration_exhausted:
+        with node.state_lock:
+            node.state = "PLAN_EXPLORATION"
+        node.get_logger().info(
+            f"🔍 step {node.mission3_step_index + 1}: selection deferred, still looking for "
+            f"{', '.join(missing)}"
+        )
+        return
+
+    position, basis = _best_effort_step_target(node, step, pose)
+    if position is None:
+        with node.state_lock:
+            node.state = "PLAN_EXPLORATION"
+        node.get_logger().info(
+            f"🔍 step {node.mission3_step_index + 1}: selection deferred ({basis})"
+        )
+        return
+
+    reason = next(
+        key for key in ("relation_pending", "attribute_pending", "verification_pending")
+        if result.get(key)
+    )
+    node.get_logger().warning(
+        f"🎯 step {node.mission3_step_index + 1}: VLM could not confirm ({reason}) but every "
+        f"referenced object is already observed - committing now by {basis}"
+    )
+    _start_navigate_to_point(node, pose, position, is_object_target=True)
 
 
 def _on_exploration_result(node, result: dict) -> None:

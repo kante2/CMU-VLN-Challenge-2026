@@ -3,14 +3,9 @@
 센서는 바닥 위 약 0.75m라 소파(0.8m)·테이블(0.75m) 같은 가구와 거의 같은 높이다.
 z 범위를 하나만 쓰면 가구 **위로** 스쳐 지나간 거의 수평인 광선까지 free 판정에 쓰여,
 가구 뒤 가려진 바닥이 free로 칠해진다. 그러면 거기에 frontier가 안 생겨 탐색이
-"이 방 다 봤다"로 조기 종료된다.
+"다 봤다"로 조기 종료된다.
 
-이 파일은 두 가지를 같이 고정한다:
-  1. 가구 뒤가 UNKNOWN으로 남는가 (폐색)
-  2. 그러면서도 max_height가 살아 있어 방 분할이 깨지지 않는가
-
-2번이 특히 중요하다 - 예전에 폐색만 고쳤다가 max_height가 방위각 최단 point에서만
-갱신되는 바람에 벽이 하나도 안 잡히고 방 분할이 통째로 죽은 적이 있다.
+이 파일은 가구 뒤가 UNKNOWN으로 남는지(폐색)를 고정한다.
 """
 
 import math
@@ -20,7 +15,6 @@ import numpy as np
 
 from sysnav import config
 from sysnav.exploration.coverage_planner import CoveragePlanner
-from sysnav.rooms.room_segmenter import RoomSegmenter
 
 SENSOR_H = 0.75          # 바닥 위 센서 높이 (state_estimation z)
 
@@ -93,56 +87,10 @@ class OcclusionTest(unittest.TestCase):
         self.assertGreater(self.planner.map_stats()["frontier_cells"], 0)
 
 
-class RoomSegmentationNotBrokenTest(unittest.TestCase):
-    """폐색 처리가 max_height를 망가뜨리지 않는지 - 방 분할 회귀 방지.
-
-    max_height를 방위각 최단 point로만 갱신하면 늘 벽의 가장 낮은 부분만 기록돼
-    ROOM_WALL_MIN_HEIGHT_M(1.30)을 절대 못 넘고, 벽 셀이 0개가 되어 방 분할이 죽는다.
-    """
-
-    WALLS = [(0, 0, 10, 0.1), (0, 7.9, 10, 8), (0, 0, 0.1, 8), (9.9, 0, 10, 8),
-             (4.9, 0, 5.1, 3.4), (4.9, 4.6, 5.1, 8)]          # 가운데 칸막이 + 문
-    FURNITURE = [(1.5, 1.0, 3.5, 1.8, 0.80), (6.0, 5.0, 8.0, 6.5, 0.50)]
-
-    def setUp(self):
-        self.planner = _planner()
-        for robot in [(2.5, 4.0), (7.0, 2.0), (7.0, 6.0)]:
-            self.planner.update_from_scan(
-                _scan(robot, self.WALLS, self.FURNITURE),
-                {"x": robot[0], "y": robot[1], "yaw": 0.0},
-            )
-
-    def test_max_height_still_reaches_wall_threshold(self):
-        max_height = self.planner.snapshot_max_height()
-        finite = max_height[np.isfinite(max_height)]
-        self.assertGreaterEqual(float(finite.max()), config.ROOM_WALL_MIN_HEIGHT_M)
-
-    def test_walls_are_still_detected(self):
-        grid = self.planner.snapshot_grid()
-        max_height = self.planner.snapshot_max_height()
-        wall_cells = int(((grid == config.OCC_OCCUPIED)
-                          & (max_height >= config.ROOM_WALL_MIN_HEIGHT_M)).sum())
-        self.assertGreater(wall_cells, 50)
-
-    def test_both_rooms_are_still_segmented(self):
-        """칸막이로 나뉜 두 방이 각각 잡히는지. 정확한 개수를 고정하지 않는 이유:
-        이 픽스처는 폐색 처리 전(z상한 1.60)에도 3개가 나왔다 - 가구 그림자로 생긴
-        작은 조각이 하나 더 잡히는 건 이 변경과 무관한 기존 동작이다. 여기서 지켜야
-        할 것은 "두 개의 진짜 방이 살아 있는가"다."""
-        result = RoomSegmenter().segment(
-            self.planner.snapshot_grid(),
-            max_height=self.planner.snapshot_max_height(),
-        )
-        areas = sorted((room["area_m2"] for room in result["rooms"]), reverse=True)
-        self.assertGreaterEqual(len(areas), 2)
-        self.assertGreater(areas[0], 15.0)
-        self.assertGreater(areas[1], 10.0)
-
-
 class ScanCostTest(unittest.TestCase):
     def test_single_scan_stays_well_under_the_update_budget(self):
-        """max_height를 파이썬 루프로 돌면 스캔 3회에 17초가 걸렸다. 벡터화가
-        풀리면 이 테스트가 잡는다 (MAP_UPDATE_INTERVAL_SEC = 0.35s)."""
+        """스캔 한 번의 갱신 비용이 매핑 주기 안에 들어오는지
+        (MAP_UPDATE_INTERVAL_SEC = 0.35s)."""
         import time
         planner = _planner()
         scan = _scan((3.0, 2.5), OcclusionTest.WALLS, [OcclusionTest.SOFA])

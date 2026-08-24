@@ -23,7 +23,6 @@ def _corridor_planner():
     planner.grid[27, 19:81] = config.OCC_OCCUPIED
     planner.grid[36, 19:81] = config.OCC_OCCUPIED
     planner.grid[27:37, 19] = config.OCC_OCCUPIED
-    planner.max_height[planner.grid == config.OCC_OCCUPIED] = 2.0
     return planner
 
 
@@ -39,7 +38,7 @@ class ForbiddenExplorationTest(unittest.TestCase):
 
     def _route(self, mask):
         return self.planner.plan_route(
-            self.pose, ViewpointMemory(), room_segmentation=None, forbidden_mask=mask
+            self.pose, ViewpointMemory(), forbidden_mask=mask
         )
 
     def test_route_exists_without_the_constraint(self):
