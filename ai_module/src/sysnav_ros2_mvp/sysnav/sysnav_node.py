@@ -37,6 +37,7 @@ from sysnav.memory.object_memory import ObjectMemory
 from sysnav.navigation.goal_publisher import GoalPublisher
 from sysnav.navigation.terrain_monitor import TerrainMonitor
 from sysnav.perception.perception_pipeline import PerceptionPipeline
+from sysnav.reasoning.attribute_filter import filter_by_attributes, reference_allowed_ids
 from sysnav.reasoning.attribute_verifier import AttributeVerifier
 from sysnav.reasoning.gemini_selector import GeminiSelector
 from sysnav.reasoning.relation_image_verifier import RelationImageVerifier
@@ -240,6 +241,13 @@ class SysNavNode(Node):
         # 물체들"을 찾을 때까지 탐사를 먼저 하는데, 영원히 기다릴 수는 없으므로 이
         # 플래그가 서면 증거가 부족해도 진행한다 - mission3_pipe._select_step 주석 참고.
         self.mission3_exploration_exhausted = False
+        # "take the path between A and B"의 게이트(A-B 선분). 중점 반경 도달과 별개로
+        # 로봇이 실제로 그 사이를 가로질렀는지 판정한다 - missions/path_gate.py.
+        # step이 바뀔 때마다 arm_gate()가 다시 세운다(이전 step 궤적은 안 센다).
+        self.mission3_gate_segment = None
+        self.mission3_gate_crossed = False
+        self.mission3_gate_last_xy = None
+        self.mission3_gate_last_stamp = 0.0
         # Mission 2는 탐사 중 발견 즉시 이동하지 않고, 모든 room/frontier를 소진한
         # 뒤 누적 Scene Graph에서 한 번만 최종 target을 고른다.
         self.mission2_exploration_complete = False
@@ -371,6 +379,10 @@ class SysNavNode(Node):
             self.mission3_step_index = 0
             self.mission3_forbidden_mask = None
             self.mission3_exploration_exhausted = False
+            self.mission3_gate_segment = None
+            self.mission3_gate_crossed = False
+            self.mission3_gate_last_xy = None
+            self.mission3_gate_last_stamp = 0.0
             self.mission2_exploration_complete = False
             self.mission2_exploration_deadline_reached = False
             self.mission2_answer_object_id = None
@@ -738,6 +750,11 @@ class SysNavNode(Node):
         # (mission1/2는 이미 add_observation이 같은 task로 채워놨을 것이므로 대부분
         # _relation_checks 캐시에 걸려 사실상 공짜다).
         if effective_relation_chain(task):
+            # 참조 물체에 속성 제약이 붙어 있으면("closest to the black chair") 관계
+            # 판정 전에 그 카테고리 후보를 먼저 걸러 둔다 - 안 그러면 nearest의 argmin이
+            # 검은 의자가 아닌 의자까지 포함해서 돌아 엉뚱한 lamp가 답이 된다.
+            # 화이트리스트는 task에 실어 spatial_relation_reasoner가 읽는다.
+            task["reference_allowed_ids"] = reference_allowed_ids(self, task)
             self.scene_graph.infer_relations_for_task(task, pose)
         relation_candidate_ids = set(self.scene_graph.find_matching_target_ids(task))
         if relation_candidate_ids:
@@ -797,18 +814,7 @@ class SysNavNode(Node):
         # 확정"하던 예전 GeminiSelector 지름길이 색을 전혀 안 보고 넘어가버리는 원인이었다.
         attributes = list(task.get("attributes") or [])
         if attributes and config.ATTRIBUTE_VERIFICATION_ENABLED and candidates:
-            attribute_results = self.attribute_verifier.verify(candidates, attributes)
-            for candidate in candidates:
-                newly_checked = attribute_results.get(int(candidate["object_id"]), {})
-                if newly_checked:
-                    self.object_memory.update_self_attributes(int(candidate["object_id"]), newly_checked)
-            candidates = [
-                candidate for candidate in candidates
-                if all(
-                    attribute_results.get(int(candidate["object_id"]), {}).get(attribute, False)
-                    for attribute in attributes
-                )
-            ]
+            candidates = filter_by_attributes(self, candidates, attributes)
             if not candidates:
                 # 속성이 확인된 후보가 하나도 없다(전부 불일치했거나 아직 검증 자체가
                 # 안 됨) - 확정하지 않고 계속 탐색해서 진짜 맞는 물체를 더 찾아본다.
@@ -1803,6 +1809,11 @@ class SysNavNode(Node):
             self.target_goal_xy[0],
             self.target_goal_xy[1],
             label=f"goal{self.target_marker_index + 1}",
+            # "take the path between A and B"의 게이트 선분도 같은 토픽에 그린다 -
+            # 통과 전 노랑/통과 후 초록이라 "정말 그 사이로 지나갔나"를 RViz에서 바로
+            # 본다. 그리는 곳을 여기 한 곳으로 모아둔 이유는 위 docstring 참고.
+            gate_segment=self.mission3_gate_segment,
+            gate_crossed=self.mission3_gate_crossed,
         )
 
     def _publish_map_topics(self) -> None:

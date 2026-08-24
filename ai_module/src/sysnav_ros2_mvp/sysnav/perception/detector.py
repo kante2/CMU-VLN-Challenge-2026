@@ -41,6 +41,26 @@ _COCO_ALIASES = {
 }
 
 
+# YOLO-World(CLIP text encoder)가 같은 물체를 훨씬 잘 잡는 **동의 명사구**들.
+# 카테고리 하나를 프롬프트 여러 개로 넓혀 쏘고, 결과는 원래 카테고리로 되돌린다.
+#
+# 왜 필요한가(2026-08-24 실측, viewpoint 42프레임): "the round tables"를 파서가
+# category="table" + attributes=["round"]로 쪼개 "table"만 프롬프트로 줬더니 거실
+# 원형 테이블을 42프레임 중 5프레임에서만 잡았다(best conf 0.55). 같은 물체에
+# "coffee table"을 주면 22/42(best 0.91), "side table"은 median 0.49로 잘 잡는다.
+# "table"이 CLIP 임베딩에서 너무 넓은 단어라 특정 가구에 잘 안 붙는 것이다.
+#
+# 주의: 형용사를 붙이는 것과는 정반대의 이야기다. "round table"은 3/42로 "table"보다
+# **더 나빴다** - open-vocab 검출기는 형용사를 구분 못 하므로 색/모양은 여전히
+# reasoning/attribute_verifier.py가 판정해야 한다. 여기 넣는 것은 형용사가 아니라
+# 물체 종류가 같은 별개의 명사구여야 한다.
+#
+# 실측으로 확인한 것만 넣는다(다른 카테고리도 같은 방식으로 재보고 추가할 것).
+_PROMPT_ALIASES = {
+    "table": ("coffee table", "dining table", "side table"),
+}
+
+
 def _bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     x1, y1 = max(a[0], b[0]), max(a[1], b[1])
     x2, y2 = min(a[2], b[2]), min(a[3], b[3])
@@ -102,6 +122,22 @@ class YoloWorldDetector:
         self._yolo12_model.to(select_device(self.device))
 
     @staticmethod
+    def _expand_prompts(prompt_list: list[str]) -> tuple[list[str], dict[str, str]]:
+        """(실제로 쏠 프롬프트 목록, 별칭 -> 원래 카테고리) 반환.
+
+        이미 질문에 나온 프롬프트는 절대 다른 카테고리로 접지 않는다 - "coffee table을
+        찾아줘"라고 물었으면 그건 그 자체로 카테고리이지 table의 별칭이 아니다."""
+        expanded = list(prompt_list)
+        alias_to_category: dict[str, str] = {}
+        for prompt in prompt_list:
+            for alias in _PROMPT_ALIASES.get(prompt, ()):
+                if alias in prompt_list or alias in alias_to_category:
+                    continue
+                expanded.append(alias)
+                alias_to_category[alias] = prompt
+        return expanded, alias_to_category
+
+    @staticmethod
     def _coco_prompts(prompt_list: list[str]) -> dict[str, str]:
         output: dict[str, str] = {}
         for prompt in prompt_list:
@@ -120,11 +156,15 @@ class YoloWorldDetector:
             return []
 
         coco_prompts = self._coco_prompts(prompt_list)
+        # 별칭까지 넓혀서 쏘고(_PROMPT_ALIASES), 결과 라벨은 원래 카테고리로 되돌린다.
+        # 되돌린 뒤 _merge_detections()가 카테고리 단위 NMS를 하므로, 같은 테이블이
+        # "coffee table"과 "side table"로 두 번 잡혀도 하나로 합쳐진다.
+        query_list, alias_to_category = self._expand_prompts(prompt_list)
         with self._lock:
             self._load()
-            if tuple(prompt_list) != self._classes:
-                self._model.set_classes(prompt_list)
-                self._classes = tuple(prompt_list)
+            if tuple(query_list) != self._classes:
+                self._model.set_classes(query_list)
+                self._classes = tuple(query_list)
             results = self._model.predict(
                 source=image_rgb,
                 conf=config.YOLO_CONFIDENCE,
@@ -182,7 +222,7 @@ class YoloWorldDetector:
                     if float(confidence) < threshold:
                         continue
                 else:
-                    category = model_category
+                    category = alias_to_category.get(model_category, model_category)
                 x1, y1, x2, y2 = box.tolist()
                 bbox = (
                     int(max(0, min(width - 1, round(x1)))),

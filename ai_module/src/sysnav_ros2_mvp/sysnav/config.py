@@ -93,6 +93,12 @@ MISSION3_TARGET_SUCCESS_DISTANCE_M = 1.0
 # 수행했다고 보기 어려우므로, 모든 Mission 3 물체 접근점과 실제-waypoint 동기화에
 # 동일한 최대 거리를 적용한다.
 MISSION3_OBJECT_APPROACH_MAX_M = 0.9
+# "take the path between A and B"의 성공 조건은 두 물체 사이를 실제로 **가로지르는**
+# 것이다(중점 근처에 도달하는 것과 다르다 - 중점 옆에 서 있다가 돌아가도 반경 판정은
+# 통과해버린다). 그래서 A-B 선분을 게이트로 두고 로봇 궤적이 그 선분과 교차했는지 본다
+# (missions/path_gate.py). 물체 바로 옆을 스치듯 통과하는 경우까지 잡으려고 선분을 양쪽
+# 끝에서 이만큼 연장한 뒤 교차를 판정한다.
+MISSION3_GATE_EXTENSION_M = 0.3
 
 # Object Reference 답안(/selected_object_marker) 재발행 주기.
 #

@@ -55,7 +55,7 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _singularize(word: str) -> str:
+def singularize(word: str) -> str:
     lower = word.lower()
     if lower in _IRREGULAR:
         return _IRREGULAR[lower]
@@ -73,7 +73,7 @@ def _split_attributes(phrase: str) -> tuple[str, list[str]]:
     if not object_tokens and tokens:
         object_tokens = tokens[-1:]
     if object_tokens:
-        object_tokens[-1] = _singularize(object_tokens[-1])
+        object_tokens[-1] = singularize(object_tokens[-1])
     return " ".join(object_tokens).strip(), attributes
 
 
@@ -140,6 +140,29 @@ def _extract_relation_chain(phrase: str) -> list[dict]:
     return chain
 
 
+def merge_reference_attributes(pairs: list[tuple[str, list[str]]]) -> dict[str, list[str]]:
+    """(category, attributes) 쌍들을 category -> attributes 맵으로 합친다.
+
+    같은 category가 문장에 두 번 나오면(예: "the black chair ... the wooden chair")
+    합집합으로 병합한다 - 카테고리 단위로만 후보를 거를 수 있으므로 둘 다 요구하는
+    쪽이 안전하다(모자라게 거르면 엉뚱한 물체가 통과한다).
+
+    llm_query_parser도 같은 함수를 쓴다 - 두 파서의 출력 스키마가 갈리면 LLM 실패
+    폴백에서 조용히 동작이 달라진다.
+    """
+    merged: dict[str, list[str]] = {}
+    for category, attributes in pairs:
+        category = str(category or "").strip().lower()
+        if not category:
+            continue
+        for attribute in attributes or []:
+            attribute = str(attribute).strip().lower()
+            bucket = merged.setdefault(category, [])
+            if attribute and attribute not in bucket:
+                bucket.append(attribute)
+    return merged
+
+
 def extract_target(question: str) -> dict:
     raw = question.strip()
     normalized = _LEADING_COMMAND.sub("", raw).strip()
@@ -174,6 +197,12 @@ def extract_target(question: str) -> dict:
         "reference_objects": reference_objects,
         "relation_chain": relation_chain,
         "detection_prompts": prompts,
+        # 참조 물체("...the black chair")의 속성. target의 attributes와 달리 예전엔
+        # 아무 데서도 안 쓰이고 버려졌는데, reasoning/attribute_filter.py가 이걸 읽어
+        # 관계 판정 대상 후보를 실제로 좁힌다.
+        "reference_attributes": merge_reference_attributes(
+            [(node["object"], node["attributes"]) for node in chain[1:] if node["object"]]
+        ),
     }
 
 

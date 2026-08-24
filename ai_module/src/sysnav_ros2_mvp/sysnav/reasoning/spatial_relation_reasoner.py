@@ -257,6 +257,21 @@ class SpatialRelationReasoner:
         return records
 
     @staticmethod
+    def _records_of_category(task: dict, records: dict[int, dict], category: str) -> list[dict]:
+        """해당 카테고리의 record 중, 참조 속성 제약("the **black** chair")을 통과한
+        것만 남긴다.
+
+        task["reference_allowed_ids"]는 sysnav_node.selection_job이
+        reasoning/attribute_filter.reference_allowed_ids()로 채워 넣는다. 키가 없는
+        카테고리는 "속성 제약 없음"이라 전부 통과 - 이 필드가 아예 없는 task(mission3의
+        placeholder, 손으로 만든 테스트 task)도 예전과 똑같이 동작한다."""
+        matched = [record for record in records.values() if record["category"] == category]
+        allowed = (task.get("reference_allowed_ids") or {}).get(category)
+        if allowed is None:
+            return matched
+        return [record for record in matched if int(record["object_id"]) in allowed]
+
+    @staticmethod
     def _candidate_relations(task: dict, records: dict[int, dict]) -> list[dict]:
         """문장이 "A relation1 B relation2 C"처럼 relation을 연쇄로 담고 있으면
         (effective_relation_chain), 매 hop(source_category, relation, target_category)
@@ -273,8 +288,12 @@ class SpatialRelationReasoner:
             if len(reference_categories) < 2:
                 return []
             sources = [record for record in records.values() if record["category"] == source_category]
-            first_refs = [record for record in records.values() if record["category"] == reference_categories[0]]
-            second_refs = [record for record in records.values() if record["category"] == reference_categories[1]]
+            first_refs = SpatialRelationReasoner._records_of_category(
+                task, records, reference_categories[0]
+            )
+            second_refs = SpatialRelationReasoner._records_of_category(
+                task, records, reference_categories[1]
+            )
             output = []
             for source, first_ref, second_ref in product(sources, first_refs, second_refs):
                 ids = {source["object_id"], first_ref["object_id"], second_ref["object_id"]}
@@ -290,7 +309,7 @@ class SpatialRelationReasoner:
         output = []
         for source_category, relation, target_category in chain:
             sources = [record for record in records.values() if record["category"] == source_category]
-            targets = [record for record in records.values() if record["category"] == target_category]
+            targets = SpatialRelationReasoner._records_of_category(task, records, target_category)
             for source, target in product(sources, targets):
                 if source["object_id"] == target["object_id"]:
                     continue

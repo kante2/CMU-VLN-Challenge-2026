@@ -12,6 +12,12 @@ from sysnav import config
 
 _MISSION3_GOAL_NAMESPACE = "mission3_goals"
 _MISSION3_GOAL_COLOR = (1.0, 0.55, 0.0, 0.9)  # 주황 - object/scene graph marker와 구분됨
+# "take the path between A and B"의 게이트 선분. goal 구(주황)와 헷갈리지 않게 노랑을
+# 쓰고, 실제로 통과한 순간 초록으로 바뀐다.
+_MISSION3_GATE_COLOR = (1.0, 0.95, 0.2, 0.9)
+_MISSION3_GATE_CROSSED_COLOR = (0.1, 0.9, 0.2, 0.9)
+# step 하나가 쓰는 마커 id 칸 수: goal sphere / goal text / gate line / gate endpoints.
+_MARKERS_PER_STEP = 4
 
 _REQUESTED_NAMESPACE = "requested_waypoint"
 _REQUESTED_COLOR = (0.0, 0.9, 1.0, 0.9)  # 청록 - base autonomy의 /way_point와 구분됨
@@ -279,18 +285,30 @@ class GoalPublisher:
         clear.action = Marker.DELETEALL
         self.goal_marker_pub.publish(MarkerArray(markers=[clear]))
 
-    def add_step_goal_marker(self, step_index: int, x: float, y: float, label: str) -> None:
+    def add_step_goal_marker(
+        self,
+        step_index: int,
+        x: float,
+        y: float,
+        label: str,
+        gate_segment=None,
+        gate_crossed: bool = False,
+    ) -> None:
         """mission3 step(0-based index)이 실제로 향하는 최종 goal 좌표를 goal{N} 라벨로
         추가한다 - "success는 떴는데 실제로는 물체 앞까지 안 갔다"를 RViz에서 눈으로 바로
         비교하기 위함(로봇 실제 이동 경로 vs 여기 찍힌 goal 위치). 이전 step의 마커는
-        지우지 않고 계속 쌓아서 한 task의 goal1/2/3을 한눈에 같이 볼 수 있게 한다."""
+        지우지 않고 계속 쌓아서 한 task의 goal1/2/3을 한눈에 같이 볼 수 있게 한다.
+
+        gate_segment("take the path between A and B"의 A-B 선분)가 있으면 같이 그린다.
+        통과 전은 노랑, 통과 후는 초록이라 제약을 실제로 만족했는지가 한눈에 보인다.
+        마커 id는 step당 4칸(sphere/text/gate line/gate endpoints)을 쓴다."""
         stamp = self._node.get_clock().now().to_msg()
 
         sphere = Marker()
         sphere.header.frame_id = config.OBJECT_MARKER_FRAME_ID
         sphere.header.stamp = stamp
         sphere.ns = _MISSION3_GOAL_NAMESPACE
-        sphere.id = step_index * 2
+        sphere.id = step_index * _MARKERS_PER_STEP
         sphere.type = Marker.SPHERE
         sphere.action = Marker.ADD
         sphere.pose.position.x = float(x)
@@ -304,7 +322,7 @@ class GoalPublisher:
         text.header.frame_id = config.OBJECT_MARKER_FRAME_ID
         text.header.stamp = stamp
         text.ns = _MISSION3_GOAL_NAMESPACE
-        text.id = step_index * 2 + 1
+        text.id = step_index * _MARKERS_PER_STEP + 1
         text.type = Marker.TEXT_VIEW_FACING
         text.action = Marker.ADD
         text.pose.position.x = float(x)
@@ -315,12 +333,55 @@ class GoalPublisher:
         text.color.r, text.color.g, text.color.b, text.color.a = (1.0, 1.0, 1.0, 1.0)
         text.text = label
 
+        markers = [sphere, text]
+        if gate_segment is not None:
+            markers.extend(self._gate_markers(step_index, gate_segment, gate_crossed, stamp))
+
+        replaced = {marker.id for marker in markers}
         self._goal_markers = [
-            marker for marker in self._goal_markers
-            if marker.id not in (sphere.id, text.id)
+            marker for marker in self._goal_markers if marker.id not in replaced
         ]
-        self._goal_markers.extend([sphere, text])
+        self._goal_markers.extend(markers)
         self.goal_marker_pub.publish(MarkerArray(markers=list(self._goal_markers)))
+
+    @staticmethod
+    def _gate_markers(step_index: int, segment, crossed: bool, stamp) -> list[Marker]:
+        """A-B 게이트 선분 + 양 끝점. "이 사이를 지나가야 한다"를 RViz에 그대로 그린다."""
+        color = _MISSION3_GATE_CROSSED_COLOR if crossed else _MISSION3_GATE_COLOR
+        (ax, ay), (bx, by) = segment
+
+        def endpoint(px: float, py: float) -> Point:
+            point = Point()
+            point.x, point.y, point.z = float(px), float(py), 0.2
+            return point
+
+        line = Marker()
+        line.header.frame_id = config.OBJECT_MARKER_FRAME_ID
+        line.header.stamp = stamp
+        line.ns = _MISSION3_GOAL_NAMESPACE
+        line.id = step_index * _MARKERS_PER_STEP + 2
+        line.type = Marker.LINE_LIST
+        line.action = Marker.ADD
+        line.pose.orientation.w = 1.0
+        line.scale.x = 0.08
+        line.color.r, line.color.g, line.color.b, line.color.a = color
+        line.points = [endpoint(ax, ay), endpoint(bx, by)]
+
+        # 선분 끝이 어느 물체였는지 보이도록 양 끝에 작은 구를 찍는다(SPHERE_LIST라
+        # 마커 하나로 두 점을 그린다 - id 소비를 늘리지 않으려고).
+        ends = Marker()
+        ends.header.frame_id = config.OBJECT_MARKER_FRAME_ID
+        ends.header.stamp = stamp
+        ends.ns = _MISSION3_GOAL_NAMESPACE
+        ends.id = step_index * _MARKERS_PER_STEP + 3
+        ends.type = Marker.SPHERE_LIST
+        ends.action = Marker.ADD
+        ends.pose.orientation.w = 1.0
+        ends.scale.x = ends.scale.y = ends.scale.z = 0.2
+        ends.color.r, ends.color.g, ends.color.b, ends.color.a = color
+        ends.points = [endpoint(ax, ay), endpoint(bx, by)]
+
+        return [line, ends]
 
     @staticmethod
     def object_approach_pose(robot_pose: dict, object_position, standoff: float = config.TARGET_STANDOFF_DISTANCE_M) -> tuple[float, float, float]:

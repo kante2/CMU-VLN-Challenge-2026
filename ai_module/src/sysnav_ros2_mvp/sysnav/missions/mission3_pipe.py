@@ -31,6 +31,8 @@ from collections import deque
 import numpy as np
 
 from sysnav import config
+from sysnav.missions import path_gate
+from sysnav.reasoning.attribute_filter import filter_by_attributes
 
 # ---------------------------------------------------------------------------
 # 문장 -> 절(clause) 분리. questions.json의 instruction_following 30문장 전수
@@ -228,8 +230,20 @@ def _dist2(position, pose: dict) -> float:
     return (position[0] - pose["x"]) ** 2 + (position[1] - pose["y"]) ** 2
 
 
-def _resolve_single_category_point(node, ref_parsed: dict, pose: dict):
+def _category_candidates(node, ref_parsed: dict) -> list[dict]:
+    """참조 카테고리 후보 중 속성 제약("the **round** tables")까지 만족하는 것만.
+
+    파서가 "round tables"를 category="table" + attributes=["round"]로 쪼개주므로
+    (task/llm_query_parser.py), 검출은 table 전부를 잡고 round 여부는 여기서 VLM으로
+    가린다. 예전엔 find_by_category만 써서 형용사가 좌표 선택에 전혀 반영되지 않았다."""
     candidates = node.object_memory.find_by_category(ref_parsed["target"])
+    if not candidates:
+        return []
+    return filter_by_attributes(node, candidates, ref_parsed.get("attributes"))
+
+
+def _resolve_single_category_point(node, ref_parsed: dict, pose: dict):
+    candidates = _category_candidates(node, ref_parsed)
     if not candidates:
         return None
     nearest = min(candidates, key=lambda c: _dist2(c["position"], pose))
@@ -246,7 +260,7 @@ def _resolve_forbidden_segment(node, point_mode: str, point_refs: list[dict], po
         pb = _resolve_single_category_point(node, point_refs[1], pose)
         return (pa, pb) if pa is not None and pb is not None else None
     if point_mode == "between_collective":
-        candidates = node.object_memory.find_by_category(point_refs[0]["target"])
+        candidates = _category_candidates(node, point_refs[0])
         if len(candidates) < 2:
             return None
         nearest_two = sorted(candidates, key=lambda c: _dist2(c["position"], pose))[:2]
@@ -255,11 +269,27 @@ def _resolve_forbidden_segment(node, point_mode: str, point_refs: list[dict], po
 
 
 def _resolve_point_ref(node, point_mode: str, point_refs: list[dict], pose: dict):
+    """(waypoint, segment) 반환. waypoint는 두 참조 물체의 중점(near면 그 물체 자체),
+    segment는 게이트 판정/시각화에 쓰는 A-B 선분 원본이다 - 예전엔 중점만 돌려주고
+    선분을 버려서 "실제로 그 사이를 지나갔는가"를 아무도 확인할 수 없었다."""
     segment = _resolve_forbidden_segment(node, point_mode, point_refs, pose)
     if segment is None:
-        return None
+        return None, None
     pa, pb = segment
-    return tuple((a + b) / 2.0 for a, b in zip(pa, pb))
+    return tuple((a + b) / 2.0 for a, b in zip(pa, pb)), segment
+
+
+def _gate_segment(step: dict, segment):
+    """이 step에서 게이트 통과 판정을 쓸 것인가.
+
+    "take the path between A and B"/"pass by"(is_stop=False)만 대상이다.
+    "go between A and B"(is_stop=True)는 그 사이에 **정지**하는 것이 요구사항이라
+    가로지르기만 해서는 안 되므로 기존 반경 판정을 그대로 쓴다(선분은 시각화만 된다)."""
+    if segment is None or step.get("is_stop"):
+        return None
+    if step.get("point_mode") not in ("between", "between_collective"):
+        return None
+    return segment
 
 
 def _uses_object_approach(point_mode: str) -> bool:
@@ -487,7 +517,7 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
         )
         return
 
-    point = _resolve_point_ref(node, step["point_mode"], step["point_refs"], pose)
+    point, segment = _resolve_point_ref(node, step["point_mode"], step["point_refs"], pose)
     if point is None:
         # 참조 카테고리를 아직 못 봤다 - 계속 탐색한다.
         with node.state_lock:
@@ -497,11 +527,15 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
     # /terrain_map에서 동적으로 고른 접근 가능 지점으로 가야 한다. 반면 between(A,B)는
     # 두 물체 사이 좌표를 통과하는 것이 제약의 의미이므로 그 좌표를 유지한다.
     _start_navigate_to_point(
-        node, pose, point, is_object_target=_uses_object_approach(step["point_mode"])
+        node, pose, point,
+        is_object_target=_uses_object_approach(step["point_mode"]),
+        gate_segment=_gate_segment(step, segment),
     )
 
 
-def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) -> None:
+def _start_navigate_to_point(
+    node, pose: dict, point, is_object_target: bool, gate_segment=None
+) -> None:
     """mission2와 동일하게 node.start_target_navigation()으로 이동한다 - 목적지 좌표
     하나를 던지고 마는 대신, 현재 지도로 A* 경로를 만들어 hop 단위로 가면서 hop에
     도착할 때마다(그리고 주행 중 hop이 막히면 즉시) 경로를 다시 계산한다.
@@ -536,8 +570,15 @@ def _start_navigate_to_point(node, pose: dict, point, is_object_target: bool) ->
     # 바라보라고 강제할 이유가 없다.
     theta = math.atan2(y - pose["y"], x - pose["x"])
 
+    # 게이트는 goal 발행 **전에** 세운다 - 판정 시작 시점을 "이 step이 시작한 순간"으로
+    # 고정해서, 직전 step을 주행하다 우연히 지나간 궤적이 통과로 잡히지 않게 한다.
+    path_gate.arm_gate(node, gate_segment, pose)
+
     node.get_logger().info(
         f"🧭 mission3 step {node.mission3_step_index + 1} -> goal=({x:.2f}, {y:.2f}, {theta:.2f})"
+        + ("" if gate_segment is None else
+           f", gate=({gate_segment[0][0]:.2f},{gate_segment[0][1]:.2f})-"
+           f"({gate_segment[1][0]:.2f},{gate_segment[1][1]:.2f})")
     )
     # goal을 실제로 발행한 뒤에 state를 옮긴다(mission2와 같은 순서) - 먼저 옮기면
     # start_target_navigation()이 예외로 죽었을 때 goal 없이 NAVIGATE_STEP에 들어가서
@@ -561,13 +602,20 @@ def _navigate_step(node, task: dict, pose: dict) -> None:
     # Mission 3 전용 1m 도착 반경. 공용 step_target_navigation()은 Mission 2도 쓰므로
     # 그 안의 0.5m 기준을 바꾸지 않고 여기서만 먼저 판정한다.
     goal_xy = node.target_goal_xy
-    mission3_reached = (
+    within_radius = (
         goal_xy is not None
         and math.hypot(
             float(goal_xy[0]) - float(pose["x"]),
             float(goal_xy[1]) - float(pose["y"]),
         ) <= config.MISSION3_TARGET_SUCCESS_DISTANCE_M
     )
+    # "take the path between A and B"는 두 물체 사이를 실제로 가로지르는 것이 제약이다.
+    # 중점 반경 판정과 OR로 묶는다 - 두 물체가 거의 붙어 있어 게이트가 짧으면 교차
+    # 판정이 예민해지므로, 그때는 기존 반경 판정이 백업이 된다.
+    gate_crossed = path_gate.update_gate_crossing(node, pose)
+    if gate_crossed:
+        node.refresh_goal_marker()  # 통과한 게이트는 RViz에서 초록으로 바뀐다
+    mission3_reached = gate_crossed or within_radius
     outcome = "arrived" if mission3_reached else node.step_target_navigation(pose)
     if outcome == "driving":
         return
@@ -614,6 +662,7 @@ def _navigate_step(node, task: dict, pose: dict) -> None:
     node.get_logger().info(
         f"🚩 ARRIVED - mission3 step {node.mission3_step_index + 1}/{len(steps)} "
         f"({'stop' if step['is_stop'] else 'waypoint'}), "
+        f"via={'gate' if gate_crossed else 'radius'}, "
         f"robot_pose=({pose['x']:.2f}, {pose['y']:.2f})"
     )
     node.clear_target_navigation()

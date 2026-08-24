@@ -27,26 +27,39 @@ from rclpy.logging import get_logger
 
 from sysnav import config
 from sysnav.activity_log import LLM, activity
-from sysnav.task.query_parser import extract_target
+from sysnav.task.query_parser import extract_target, merge_reference_attributes, singularize
+
+# 모든 object reference는 {category, attributes}다 - 예전엔 그냥 문자열이라
+# "the black chair"가 통째로 카테고리가 됐고, 그 문자열이 그대로 YOLO-World 프롬프트로
+# 들어갔다. open-vocab 검출기는 색 형용사를 구분 못 해서 흰 식탁의자를 0.79로 잡았고,
+# object_memory 카테고리 이름까지 "black chair"가 되어 scene graph도 오염됐다.
+# 이제 검출은 category("chair")만 쓰고, 색/모양 판정은 reasoning/attribute_verifier.py가 한다.
+_OBJECT_REF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category": {"type": "string"},
+        "attributes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["category", "attributes"],
+}
 
 _RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "target": {"type": "string"},
-        "attributes": {"type": "array", "items": {"type": "string"}},
+        "target": _OBJECT_REF_SCHEMA,
         "constraints": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
                     "relation": {"type": "string"},
-                    "references": {"type": "array", "items": {"type": "string"}},
+                    "references": {"type": "array", "items": _OBJECT_REF_SCHEMA},
                 },
                 "required": ["relation", "references"],
             },
         },
     },
-    "required": ["target", "attributes", "constraints"],
+    "required": ["target", "constraints"],
 }
 
 _RELATION_ALIASES = {
@@ -67,23 +80,35 @@ constraints the target object instance must satisfy: {{c(o) = target}} AND
 
 Each element of Φ is either:
   - a visual attribute of the target itself (color, material, size, state) -> put
-    it in "attributes".
-  - a spatial or comparative relation to another object category -> put it in
+    it in the target's "attributes".
+  - a spatial or comparative relation to another object -> put it in
     "constraints", in the order it appears in the sentence.
 
 Instruction: {question}
 
 Rules:
-- target is only the object category to find (a short noun phrase), never a full
-  relation clause.
+- Every object reference (the target and every constraint reference) is an object
+  {{"category": ..., "attributes": [...]}}.
+- "category" is the bare noun phrase with EVERY adjective removed. Colors,
+  materials, sizes, shapes and states (black, white, wooden, metal, round,
+  square, tall, small, open, closed, ...) always go into "attributes", never
+  into "category". An open-vocabulary detector cannot tell colors apart, so a
+  category that still carries an adjective silently matches the wrong object.
+- Do NOT split multiword nouns: "trash can", "knife rack", "coffee table" are
+  single categories. Only adjectives are separated, never the noun phrase itself.
+- Write "category" in the singular ("tables" -> "table").
+- Examples:
+    "the black chair"   -> {{"category": "chair", "attributes": ["black"]}}
+    "the round tables"  -> {{"category": "table", "attributes": ["round"]}}
+    "the trash can"     -> {{"category": "trash can", "attributes": []}}
+- target is only the object to find, never a full relation clause.
 - If the instruction is a counting question ("How many X are Y?", "Count the
   number of X that Y."), target is still just X (the object category being
   counted) - never include "how many"/"count"/"the number of" or the verb
   "is"/"are"/"was"/"were" in target.
 - Each constraint has a canonical snake_case relation (near, beside, left_of,
   right_of, in_front_of, behind, on, under, above, between, nearest, farthest) and concrete
-  reference object categories.
-- Keep multiword categories intact (e.g. "trash can", "knife rack").
+  reference objects.
 - Do not invent objects or constraints that are not stated in the instruction.
 """.strip()
 
@@ -106,24 +131,61 @@ def _normalize_relation(value: Any) -> str:
     return _RELATION_ALIASES.get(relation, relation)
 
 
+def _category(value: Any) -> str:
+    """카테고리 표기를 규칙 파서와 통일한다 - 마지막 토큰만 단수화("round tables"의
+    "tables" -> "table"). object_memory/scene_graph는 카테고리 문자열을 그대로 키로
+    쓰므로, 두 파서가 다른 표기를 내면 같은 물체가 두 카테고리로 갈라진다."""
+    tokens = _clean(value).split()
+    if not tokens:
+        return ""
+    tokens[-1] = singularize(tokens[-1])
+    return " ".join(tokens)
+
+
+def _object_ref(value: Any) -> dict:
+    """{category, attributes} 하나를 정규화한다.
+
+    문자열도 받아준다 - 스키마를 바꾸기 전 형식으로 답하는 모델/캐시가 있어도
+    조용히 깨지지 않게 하려는 것이다(그 경우 attributes는 비고, 카테고리에 형용사가
+    남을 수 있지만 최소한 파이프라인은 돈다)."""
+    if isinstance(value, dict):
+        return {
+            "category": _category(value.get("category")),
+            "attributes": _unique(list(value.get("attributes") or [])),
+        }
+    return {"category": _category(value), "attributes": []}
+
+
 def normalize_llm_result(question: str, payload: dict[str, Any]) -> dict:
     """Gemini 응답을 검증하고, 기존 파이프라인이 기대하는 필드를 채워서
     query_parser.extract_target()과 동일한 스키마의 dict로 반환한다 - 하위 코드
     (scene_graph, selection_job 등)가 어느 파서를 썼는지 몰라도 그대로 동작한다."""
-    target = _clean(payload.get("target"))
+    target_ref = _object_ref(payload.get("target"))
+    target = target_ref["category"]
     if not target:
         raise ValueError("target이 비어있음")
 
-    attributes = _unique(list(payload.get("attributes") or []))
+    # 스키마 변경 전에는 attributes가 top-level이었다 - 옛 형식 응답도 살려준다.
+    attributes = target_ref["attributes"] or _unique(list(payload.get("attributes") or []))
 
     constraints: list[dict] = []
     for item in list(payload.get("constraints") or []):
         if not isinstance(item, dict):
             continue
         relation = _normalize_relation(item.get("relation"))
-        references = _unique(list(item.get("references") or []))
-        if relation and references:
-            constraints.append({"relation": relation, "references": references})
+        reference_refs: list[dict] = []
+        for reference in list(item.get("references") or []):
+            normalized = _object_ref(reference)
+            if normalized["category"] and normalized["category"] not in [
+                existing["category"] for existing in reference_refs
+            ]:
+                reference_refs.append(normalized)
+        if relation and reference_refs:
+            constraints.append({
+                "relation": relation,
+                "references": [reference["category"] for reference in reference_refs],
+                "reference_refs": reference_refs,
+            })
 
     # 논문의 Φ = {φ_1, ..., φ_K} 중 공간관계류를 문장에 나온 순서대로 체인으로 잇는다:
     # 첫 constraint의 source는 target, 그 다음부터는 이전 constraint의 첫 reference가
@@ -152,7 +214,16 @@ def normalize_llm_result(question: str, payload: dict[str, Any]) -> dict:
         "relation": None if primary is None else primary["relation"],
         "reference_objects": [] if primary is None else list(primary["references"]),
         "relation_chain": relation_chain,
+        # 형용사가 제거된 순수 카테고리만 나간다 - 이게 그대로 YOLO-World set_classes()로
+        # 들어간다(perception/perception_pipeline.py).
         "detection_prompts": _unique([target, *all_references]),
+        # 참조 물체의 속성. reasoning/attribute_filter.py가 이걸 읽어 관계 판정/좌표
+        # 선택 대상을 실제로 좁힌다(예: "closest to the black chair"의 chair 후보).
+        "reference_attributes": merge_reference_attributes([
+            (reference["category"], reference["attributes"])
+            for constraint in constraints
+            for reference in constraint["reference_refs"]
+        ]),
         "parser": "llm",
     }
 

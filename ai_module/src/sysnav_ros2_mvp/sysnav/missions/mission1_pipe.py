@@ -21,7 +21,7 @@ from collections import deque
 
 from std_msgs.msg import Int32
 
-from sysnav import config
+from sysnav.reasoning.attribute_filter import filter_by_attributes
 from sysnav.task.query_parser import effective_relation_chain
 
 
@@ -83,20 +83,7 @@ def count_job(node, task_id: int, task: dict) -> dict:
         # 곳이 없으므로) 0으로 확정한다.
         candidates = []
 
-    attributes = list(task.get("attributes") or [])
-    if attributes and config.ATTRIBUTE_VERIFICATION_ENABLED and candidates:
-        attribute_results = node.attribute_verifier.verify(candidates, attributes)
-        for candidate in candidates:
-            newly_checked = attribute_results.get(int(candidate["object_id"]), {})
-            if newly_checked:
-                node.object_memory.update_self_attributes(int(candidate["object_id"]), newly_checked)
-        candidates = [
-            candidate for candidate in candidates
-            if all(
-                attribute_results.get(int(candidate["object_id"]), {}).get(attribute, False)
-                for attribute in attributes
-            )
-        ]
+    candidates = filter_by_attributes(node, candidates, task.get("attributes"))
 
     return {"task_id": task_id, "count": len(candidates)}
 
