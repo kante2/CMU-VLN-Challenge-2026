@@ -1,4 +1,4 @@
-# SysNav Run Guide (Based on the Docker Hub Submission Image)
+# SysNav Run Guide
 
 CMU VLN Challenge 2026 — Run the setup in three terminal windows: Terminal A (simulator), Terminal B (sysnav node), and Terminal C (queries).
 This document only covers the procedure for using the submitted image directly from Docker Hub without additional build steps.
