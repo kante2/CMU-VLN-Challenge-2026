@@ -40,26 +40,6 @@ services:
               count: all
               capabilities: [gpu]
 
-  # Tmah 팀이 사용하는 docker-compose 파일 (0706 생성)
-  tmah_module:
-    build:
-      context: ../ai_module
-      dockerfile: docker/Dockerfile.tmah
-    container_name: iros2026_tmah_module
-    network_mode: host
-    stdin_open: true
-    tty: true
-    volumes:
-      - ../ai_module/debug:/home/docker/ai_module/debug
-      - ../ai_module/src:/home/docker/ai_module/src
-    deploy:
-        resources:
-          reservations:
-            devices:
-              - driver: nvidia
-                count: all
-                capabilities: [gpu]
-
   # sysnav MVP (YOLO-World + SAM2 + Gemini) - tmah_vlm과 별개 의존성 스택이라 독립 컨테이너로 분리 (0720 생성)
   sysnav_module:
     build:
