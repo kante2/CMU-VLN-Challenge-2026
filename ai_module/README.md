@@ -1,4 +1,4 @@
-# SysNav Run Guide (Docker Hub Submission Image)
+# Run Guide (Docker Hub Submission Image)
 
 CMU VLN Challenge 2026 — run the setup in three terminals: **A** (simulator),
 **B** (sysnav node), **C** (queries).
@@ -102,7 +102,7 @@ On startup you should see:
 ```bash
 docker exec -it iros2026_ai_module bash
 source /opt/ros/jazzy/setup.bash
-ros2 topic pub --once /challenge_question std_msgs/msg/String "{data: 'Find the toilet'}"
+ros2 topic pub /challenge_question std_msgs/msg/String "{data: 'Find the toilet'}"
 ```
 
 The mission type is inferred from the sentence (`sysnav/task/mission_classifier.py`).
@@ -121,19 +121,3 @@ Ultralytics 8.4.118 🚀 Python-3.12.3 torch-2.13.0+cu130 CUDA:0
 
 ---
 
-## Notes
-
-- **Debug output.** The node writes visualisations to `/home/docker/ai_module/debug`
-  inside the container and creates the directory itself. Nothing needs to be mounted;
-  the files are optional diagnostics.
-- **DDS.** The image pins `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`, matching the base
-  image's own default. Both containers run with `network_mode: host` but private IPC
-  namespaces, so their `/dev/shm` are separate; under Fast DDS the two sides discover
-  each other but no data is ever delivered — topics appear in `ros2 topic list` while
-  the module receives zero messages. If the system container is started in a way that
-  leaves it on Fast DDS, launch our module with `-e RMW_IMPLEMENTATION=rmw_fastrtps_cpp`
-  so both sides match. To check which one it is using:
-
-  ```bash
-  docker exec iros2026_system bash -c 'ls /dev/shm | grep -c fastrtps'   # 0 => CycloneDDS
-  ```
