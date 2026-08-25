@@ -44,15 +44,14 @@ Run this from the repository root.
 ```bash
 cd ~/CMU-VLN-Challenge-2026/docker
 xhost +
-docker compose -f compose_gpu.yml up --build -d system sysnav_module
+docker compose -f compose_gpu.yml up -d system sysnav_module
+#docker compose -f compose_gpu.yml up --build -d system sysnav_module
 ```
 
 ---
 
 ## 3. Terminal A — Simulator
-Use the official method provided by the organizers if available.
-
-This is the method we use.
+Start the simulator using the following commands:
 
 ```bash
 cd ~/CMU-VLN-Challenge-2026
