@@ -1,0 +1,39 @@
+# CMU VLN Challenge 2026 - 팀 제출 AI 모듈(sysnav) 런타임 의존성 전체 목록
+#
+# 이 목록은 Docker Hub 이미지에 이미 설치되어 있다.
+#   https://hub.docker.com/r/kante2/cmu-vln-2026-sysnav
+# ai_module/docker/Dockerfile 이 그 이미지를 베이스로 쓰므로 평가 시 별도 설치가 필요 없다.
+# 아래는 재현/검수용 기록이다.
+#
+# 설치 시 주의: 베이스 이미지의 numpy 는 apt(deb)로 깔려 있어 pip 메타데이터가 없다.
+# pip 로 덮어쓰려면 --ignore-installed --break-system-packages 가 필요하다.
+
+# --- 딥러닝 백본 (YOLO-World, SAM2 공통) ---
+torch
+torchvision
+
+# --- 인식 파이프라인 ---
+numpy>=1.26
+opencv-python-headless>=4.9
+ultralytics>=8.3          # YOLO-World / YOLO12
+Pillow>=10.0
+
+# --- LLM/VLM 추론 (Gemini) ---
+google-genai>=1.0
+
+# --- colcon(ament_python) 빌드 호환 ---
+# colcon-core 가 setuptools<80 을 요구한다. 위 pip install 들이 최신(83.x)으로 올려놓으면
+# `setup.py develop --editable` 이 "option --editable not recognized" 로 깨진다.
+setuptools<80
+
+# --- pip 로 설치되지 않는 의존성 (Dockerfile.sysnav 참고) ---
+# CLIP  : pip install "git+https://github.com/ultralytics/CLIP.git"
+#         (YOLO-World 의 open-vocabulary 텍스트 임베딩에 필요. ultralytics 가 런타임에
+#          자동설치를 시도하지만 PEP668 환경이라 실패하므로 빌드 시점에 미리 깐다.)
+# SAM2  : git clone https://github.com/facebookresearch/sam2.git /opt/sam2
+#         pip install --no-build-isolation -e /opt/sam2
+#
+# --- 모델 가중치 (이미지에 사전 다운로드됨, 런타임 네트워크 불필요) ---
+# /home/docker/ai_module/weights/sam2.1_hiera_tiny.pt
+# /home/docker/ai_module/weights/yolov8x-worldv2.pt
+# /home/docker/ai_module/weights/yolo12s.pt

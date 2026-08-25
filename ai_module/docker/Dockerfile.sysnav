@@ -29,21 +29,39 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages "git+https://g
 RUN git clone --depth 1 https://github.com/facebookresearch/sam2.git /opt/sam2 && \
     python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation -e /opt/sam2
 
-# 모델 가중치 빌드 시점에 미리 받기 (test-time 네트워크 불필요)
-#  1) SAM2.1 hiera-tiny checkpoint  2) YOLOv8x-WorldV2 weights
+# 모델 가중치를 빌드 시점에 미리 받는다 (평가 시 런타임 다운로드 없이 바로 추론).
+#
+# 예전에는 YOLO 가중치를 `YOLOWorld('/home/docker/.../yolov8x-worldv2.pt')` 처럼 절대경로를
+# 넘겨서 받으려 했는데, ultralytics 는 **모델 이름**으로만 자동 다운로드하고 존재하지 않는
+# 절대경로를 주면 그 자리에 받아주지 않는다. 게다가 `|| echo "WARN: ... skipped"` 로 감싸둬서
+# 실패해도 빌드가 그냥 성공했고, 결국 가중치 없는 이미지가 나갔다. 그러면 런타임에 ultralytics
+# 가 인터넷에서 받아오는데, 평가 환경이 오프라인이면 인식이 통째로 죽는다.
+# → SAM2 와 똑같이 릴리스 URL 에서 직접 받고, 실패하면 빌드를 세운다(`-f`, `|| echo` 제거).
 RUN mkdir -p /home/docker/ai_module/weights && \
-    curl -L -o /home/docker/ai_module/weights/sam2.1_hiera_tiny.pt \
-      https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt
+    curl -fL -o /home/docker/ai_module/weights/sam2.1_hiera_tiny.pt \
+      https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt && \
+    curl -fL -o /home/docker/ai_module/weights/yolov8x-worldv2.pt \
+      https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8x-worldv2.pt && \
+    curl -fL -o /home/docker/ai_module/weights/yolo12s.pt \
+      https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo12s.pt
 
-RUN python3 -c "\
-from ultralytics import YOLOWorld; \
-YOLOWorld('/home/docker/ai_module/weights/yolov8x-worldv2.pt'); \
-print('YOLO-World weights cached.')" || echo "WARN: yolo-world pre-download skipped"
+# YOLO-World 의 open-vocabulary 텍스트 임베딩에 쓰는 CLIP 모델(ViT-B/32).
+# pip 로 깐 건 CLIP 코드일 뿐이고 모델 가중치는 별개다. 안 받아두면 런타임에
+# ultralytics 가 CWD 기준 weights/clip/ 로 338MB 를 받는다 - 오프라인이면 그대로 죽는다.
+RUN mkdir -p /home/docker/ai_module/weights/clip && \
+    curl -fL -o /home/docker/ai_module/weights/clip/ViT-B-32.pt \
+      https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt
 
-RUN python3 -c "\
-from ultralytics import YOLO; \
-YOLO('/home/docker/ai_module/weights/yolo12s.pt'); \
-print('YOLO12s weights cached.')" || echo "WARN: yolo12s pre-download skipped"
+# 모델 파일이 실제로 있고 크기가 정상인지 확인한다. 위 curl 이 조용히 HTML 오류 페이지를
+# 받아오는 경우까지 여기서 걸러서, 가중치 없는 이미지가 다시는 배포되지 않게 한다.
+RUN set -e; \
+    for f in sam2.1_hiera_tiny.pt:100000000 yolov8x-worldv2.pt:100000000 yolo12s.pt:10000000 clip/ViT-B-32.pt:300000000; do \
+      name=${f%:*}; min=${f#*:}; path=/home/docker/ai_module/weights/$name; \
+      [ -f "$path" ] || { echo "MISSING: $path"; exit 1; }; \
+      sz=$(stat -c%s "$path"); \
+      [ "$sz" -ge "$min" ] || { echo "TOO SMALL: $path ($sz bytes)"; exit 1; }; \
+      echo "OK $name $sz bytes"; \
+    done
 
 # sysnav 소스 복사
 COPY src/sysnav_ros2_mvp /home/docker/ai_module/src/sysnav_ros2_mvp
