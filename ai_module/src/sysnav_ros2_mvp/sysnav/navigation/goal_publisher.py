@@ -106,6 +106,29 @@ class GoalPublisher:
                     return None
             return snapped, snapped
 
+        # clearance가 **아깝게** 모자란 경우는 "갈 수 없는 자리"가 아니라 우리 추정이
+        # 저쪽과 cm 단위로 안 맞는 것에 가깝다. TERRAIN_CLEARANCE_M은 waypointConverter의
+        # obstacleDisThre 복제본이지만 /terrain_map을 우리 방식으로 다시 계산하기 때문이다.
+        #
+        # 실측 2026-08-25: 후보 1164개의 최선이 0.74m(기준 0.75m)라 전멸 -> 아무것도
+        # 발행 못 함 -> 로봇이 한 발짝도 못 움직임 -> 지도가 그대로라 다음 사이클에 완전히
+        # 같은 route -> 5회 반복 후 탐사 소진 -> 0:40에 FAILED(9분 20초 남음).
+        # 안 보내면 확실히 0m다. 보내면 저쪽이 자기 기준으로 판단해서 최소한 움직이고,
+        # 움직이면 새 LiDAR가 들어와 0.74m가 0.76m가 될 수도 있다.
+        best_clearance = monitor.last_best_clearance_m
+        if (
+            best_clearance is not None
+            and best_clearance
+            >= config.TERRAIN_CLEARANCE_M - config.TERRAIN_CLEARANCE_NEAR_MISS_M
+        ):
+            if trace is not None:
+                trace("PASSTHRU_NEAR_MISS",
+                      f"goal=({requested[0]:.2f},{requested[1]:.2f}) label={label} "
+                      f"best clearance {best_clearance:.2f}m vs "
+                      f"{config.TERRAIN_CLEARANCE_M:.2f}m - within "
+                      f"{config.TERRAIN_CLEARANCE_NEAR_MISS_M:.2f}m, sending as-is")
+            return requested, None
+
         # waypointConverter는 통과 후보가 하나도 없으면 목표를 갈아끼우지 않고 우리
         # 좌표를 그대로 쓴다(`if (minInd >= 0)`). 좁아서 아무것도 통과 못 하는 방이
         # 정확히 그 경우라 발행을 막으면 안 된다. 후보가 "있는데 목표 근처에만 없는"

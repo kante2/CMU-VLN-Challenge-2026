@@ -233,6 +233,8 @@ class SysNavNode(Node):
         # 나와서 PLAN_EXPLORATION <-> OBSERVE를 무한히 돈다 - publish_next_exploration_goal()
         # 주석 참고. 하나라도 발행되면 0으로 리셋한다.
         self._unpublishable_route_streak = 0
+        # 그 스트릭이 처음 1이 된 시각. 소진 판정은 횟수와 시간을 둘 다 본다.
+        self._unpublishable_streak_started: float | None = None
         self._exploration_goal_best_distance_m: float | None = None
         self._exploration_goal_last_progress_time: float | None = None
 
@@ -443,6 +445,7 @@ class SysNavNode(Node):
             self.current_goal = None
             self.exploration_route.clear()
             self._unpublishable_route_streak = 0
+            self._unpublishable_streak_started = None
             self.clear_target_navigation()
             self.last_processed_image_stamp = -1.0
             self.mission3_step_index = 0
@@ -1223,6 +1226,7 @@ class SysNavNode(Node):
             task = None if self.task is None else dict(self.task)
             task_id = self.task_id
         self._unpublishable_route_streak = 0
+        self._unpublishable_streak_started = None
         self.exploration_route.clear()
         if task is None:
             # 처리 중인 질문이 없다 - 넘길 곳이 없으므로 그냥 대기 상태로 둔다.
@@ -1268,19 +1272,32 @@ class SysNavNode(Node):
             self.current_goal = None
             if skipped:
                 self._unpublishable_route_streak += 1
+                if self._unpublishable_streak_started is None:
+                    self._unpublishable_streak_started = time.monotonic()
+                stuck_for = time.monotonic() - self._unpublishable_streak_started
                 self.get_logger().info(
                     f"🧭 exploration route exhausted - {skipped} hop(s) had no point "
                     f"base autonomy would accept "
                     f"(streak {self._unpublishable_route_streak}/"
-                    f"{config.EXPLORATION_UNPUBLISHABLE_ROUTE_LIMIT}); re-observing"
+                    f"{config.EXPLORATION_UNPUBLISHABLE_ROUTE_LIMIT}, "
+                    f"{stuck_for:.0f}s/{config.EXPLORATION_UNPUBLISHABLE_MIN_SEC:.0f}s); re-observing"
                 )
-                if self._unpublishable_route_streak >= config.EXPLORATION_UNPUBLISHABLE_ROUTE_LIMIT:
+                # 횟수와 시간을 **둘 다** 넘겨야 소진으로 본다. 경로 계획이 0.2초라
+                # 횟수만 보면 1~2초 만에 소진되는데, 그 사이 로봇은 한 번도 안 움직였고
+                # 지도도 그대로라 같은 결과가 나오는 게 당연하다 - 라이브락을 감지한 게
+                # 아니라 같은 계산을 5번 반복한 것뿐이다 (config 주석의 실측 참고).
+                if (
+                    self._unpublishable_route_streak
+                    >= config.EXPLORATION_UNPUBLISHABLE_ROUTE_LIMIT
+                    and stuck_for >= config.EXPLORATION_UNPUBLISHABLE_MIN_SEC
+                ):
                     self._finish_exploration_as_exhausted()
                     return
             with self.state_lock:
                 self.state = "OBSERVE"
             return
         self._unpublishable_route_streak = 0
+        self._unpublishable_streak_started = None
         if skipped:
             self.get_logger().info(
                 f"🧭 skipped {skipped} unreachable exploration hop(s) before this goal"

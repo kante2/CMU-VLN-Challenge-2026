@@ -240,6 +240,18 @@ TERRAIN_OBSTACLE_INTENSITY = 0.05
 # 실제 목표에 도착했지만 Mission 3 marker까지 1.4m가 남아 무한 재발행했다. 따라서
 # 기본값을 base autonomy와 동일한 0.75m로 유지한다.
 TERRAIN_CLEARANCE_M = float(os.getenv("SYSNAV_TERRAIN_CLEARANCE_M", "0.75"))
+# clearance가 이 값 안쪽으로 **아깝게** 모자랄 때는 "발행 불가"로 보지 않고 원본을
+# 그대로 내보낸다 (navigation/goal_publisher.py의 near-miss PASSTHRU).
+#
+# 왜: TERRAIN_CLEARANCE_M은 waypointConverter의 obstacleDisThre 복제본이지만, 우리는
+# /terrain_map을 우리 방식으로 다시 계산하므로 저쪽과 cm 단위로 일치하지 않는다.
+# 실측 2026-08-25: 후보 1164개의 최선이 0.74m라 전멸 -> 아무것도 발행 못 함 -> 로봇이
+# 한 발짝도 못 움직임 -> 지도가 그대로라 다음 사이클에 완전히 같은 route -> 0:40에
+# FAILED(9분 20초 남음). 안 보내면 확실히 0m지만, 보내면 저쪽이 자기 기준으로 판단해서
+# 최소한 움직인다. 크게 모자란 경우(0.20m 등)는 여전히 발행하지 않는다.
+TERRAIN_CLEARANCE_NEAR_MISS_M = float(
+    os.getenv("SYSNAV_TERRAIN_CLEARANCE_NEAR_MISS_M", "0.10")
+)
 
 # waypointConverter 파라미터의 복제본 (waypoint_converter.launch, 2026-08-21 확인).
 #   adjDisThre    = 5.0 -> TERRAIN_ADJ_DIS_M
@@ -524,19 +536,28 @@ DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD = float(
 )
 # 같은 물체를 매 프레임 다시 Gemini에 묻지 않기 위한 캐시.
 #
-# 검증 대상은 이미 질문 관련 카테고리로 좁혀져 있다(detection_prompts = target +
-# reference_objects). 그런데도 비용이 큰 이유는 **같은 박스를 반복해서 묻기** 때문이다.
-# 실측(2026-08-23 06:31:24~06:32:09): 45초 중 Gemini 검출 재확인 7회에 약 30초.
-# perception이 주행 중 PERCEPTION_WHILE_MOVING_INTERVAL_SEC(1.5초)마다 도는데, 로봇이
-# 느리거나 멈춰 있으면 연속 프레임의 박스가 거의 같다.
+# 검증 대상은 이미 질문 관련 카테고리로 좁혀져 있다(mission3는 현재 step까지). 그런데도
+# 비용이 큰 이유는 **같은 물체를 반복해서 묻기** 때문이다. perception이 주행 중
+# PERCEPTION_WHILE_MOVING_INTERVAL_SEC(1.5초)마다 도는데, 같은 물체가 계속 보인다.
+# 실측(2026-08-23): 45초 중 Gemini 재확인 7회에 약 30초.
 #
-# 캐시 키는 (카테고리, 양자화한 2D bbox)다. 같은 입력이면 같은 답이므로 품질 손실이
-# 없다. 로봇이 빠르게 움직이면 박스가 어긋나 적중률이 떨어진다 - 그때는 원래대로
-# 매번 묻는다.
+# 캐시 키는 (카테고리, 양자화한 **3D 위치**)다. 예전엔 2D bbox였는데, 파노라마에서
+# 박스는 로봇이 조금만 움직여도 양자화 폭을 넘게 밀려서 사실상 매번 miss였다
+# (실측 2026-08-25: 33초 동안 같은 picture를 5번 질의, TTL 30초 안인데도 전부 재질의).
+# 3D 위치는 로봇 위치와 무관하므로 물체당 한 번으로 수렴한다. 같은 물체면 같은 답이라
+# 품질 손실도 없다.
 DETECTION_VERIFICATION_CACHE_TTL_SEC = float(
     os.getenv("DETECTION_VERIFICATION_CACHE_TTL_SEC", "30.0")
 )
-# bbox 양자화 폭(px). 파노라마가 1920px이라 48px는 가로 2.5% 수준이다.
+# 캐시 키의 3D 위치 양자화 폭(m). 검증은 LiDAR grounding **뒤에** 돌기 때문에 map
+# 프레임 좌표를 키로 쓸 수 있고, 그래서 로봇이 움직여도 같은 물체는 한 번만 묻는다.
+# 0.5m인 이유: 같은 물체의 위치 추정은 관측마다 이 정도 흔들리고(EMA로 수렴하기 전),
+# 서로 다른 가구가 0.5m 안에 겹쳐 잡히는 일은 드물다.
+DETECTION_VERIFICATION_CACHE_POSITION_QUANT_M = float(
+    os.getenv("DETECTION_VERIFICATION_CACHE_POSITION_QUANT_M", "0.5")
+)
+# 3D 위치가 아직 없는 detection에 쓰는 예전 키의 bbox 양자화 폭(px). 파노라마가
+# 1920px이라 48px는 가로 2.5% 수준이다.
 DETECTION_VERIFICATION_CACHE_BBOX_QUANT_PX = 48
 
 # SysNav paper Sec. IV-A-1 (Object Node self-attribute): 문장이 속성 제약(예: "black"
@@ -671,6 +692,15 @@ EXPLORATION_UNPUBLISHABLE_MAX_STRIKES = int(
 EXPLORATION_UNPUBLISHABLE_ROUTE_LIMIT = int(
     os.getenv("SYSNAV_EXPLORATION_UNPUBLISHABLE_ROUTE_LIMIT", "5")
 )
+# 위 횟수 상한과 **함께** 걸리는 시간 하한. 둘 다 넘겨야 소진으로 본다.
+#
+# 왜: 경로 계획이 0.2초라 5회가 1~2초 만에 소진된다. 그 사이 로봇은 한 번도 안 움직였고
+# 지도도 그대로니 5번 다 같은 결과가 나오는 게 당연하다 - 라이브락을 감지한 게 아니라
+# 같은 계산을 5번 반복한 것뿐이다(실측 2026-08-25: 0:40에 FAILED, 9분 20초 남음).
+# 시간을 같이 걸면 그동안 terrain이 갱신되거나 로봇이 조금이라도 움직일 기회가 생긴다.
+EXPLORATION_UNPUBLISHABLE_MIN_SEC = float(
+    os.getenv("SYSNAV_EXPLORATION_UNPUBLISHABLE_MIN_SEC", "20.0")
+)
 
 FRONTIER_MIN_CLUSTER_CELLS = 5
 FRONTIER_COVERAGE_RADIUS_M = 3.0  # 논문의 d_cover
@@ -741,6 +771,18 @@ SCENE_GRAPH_USE_GEMINI_RELATIONS = os.getenv("SYSNAV_SCENE_GRAPH_USE_GEMINI", "1
 SCENE_GRAPH_SINGLE_ROOM_ID = int(os.getenv("SYSNAV_SINGLE_ROOM_ID", "0"))
 SCENE_GRAPH_SINGLE_ROOM_NAME = os.getenv("SYSNAV_SINGLE_ROOM_NAME", "Room_0")
 SCENE_GRAPH_RELATION_MIN_CONFIDENCE = float(os.getenv("SYSNAV_RELATION_MIN_CONFIDENCE", "0.55"))
+
+# 참조 물체를 3D로 못 잡았을 때 이미지로 관계를 판정하는 후보 수 상한
+# (missions/mission3_pipe._resolve_reference_by_image).
+#
+# 왜: rank_superlative()는 후보 전부를 이미지로 붙여 한 번에 보낸다. 좁은 방(후보 3~4개)
+# 에서는 문제가 없지만 넓은 맵에서 picture가 30개 쌓이면 (1) 응답이 느려지고 (2) 그보다
+# 심각하게 VLM 정확도가 무너지며(30장 중 "가장 문에 가까운 것"은 사람도 못 고른다)
+# (3) _rank_key가 후보 집합 전체를 키에 넣어서 후보 하나만 늘어도 전원이 cache miss가
+# 된다. 자르는 건 최종 선택이 아니라 예선이라 품질 손실이 작다.
+RELATION_IMAGE_MAX_CANDIDATES = int(
+    os.getenv("SYSNAV_RELATION_IMAGE_MAX_CANDIDATES", "8")
+)
 
 # Geometric fallback thresholds for on-demand Object-Object edges.
 SCENE_GRAPH_NEAR_DISTANCE_M = float(os.getenv("SYSNAV_NEAR_DISTANCE_M", "1.20"))

@@ -43,6 +43,13 @@ class TerrainMonitor:
         self._updated_time: float | None = None
         # 마지막 판정 결과 요약(진단 로그용).
         self.last_selection: str = "-"
+        # 마지막 nearest_commandable() 호출에서 후보들이 낸 **최선 clearance**(m).
+        # 판정 자체를 못 했으면(terrain 없음/후보 없음) None.
+        #
+        # 왜 문자열과 따로 두나: 0.74m처럼 아깝게 떨어진 것과 0.20m처럼 애초에 접근
+        # 불가한 자리는 대응이 달라야 하는데(goal_publisher.resolve의 near-miss
+        # PASSTHRU), last_selection은 로그용 문자열이라 호출 측이 판단에 못 쓴다.
+        self.last_best_clearance_m: float | None = None
 
     # ------------------------------------------------------------------
     # 수신
@@ -224,6 +231,10 @@ class TerrainMonitor:
           - terrain 데이터가 없거나 오래됨 (판정 불가 -> 호출 측은 원본을 그대로 쓴다)
           - TERRAIN_SNAP_MAX_M 안에 commandable 지점이 없음 (이 목표는 지금 실행 불가)
         """
+        # 이번 호출의 최선 clearance는 아래에서 후보를 실제로 재봤을 때만 채운다.
+        # 여기서 비워두지 않으면 직전 호출의 값이 남아 호출 측이 오판한다.
+        self.last_best_clearance_m = None
+
         if not self.ready():
             self.last_selection = "terrain not ready"
             return None
@@ -255,10 +266,12 @@ class TerrainMonitor:
 
         if len(obstacle):
             margins = self._min_distance_to_obstacles(candidates, obstacle)
+            self.last_best_clearance_m = float(margins.max())
             clear = margins >= config.TERRAIN_CLEARANCE_M
             if not clear.any():
                 # 최선값을 같이 남긴다 - 0.70m면 아깝게 떨어진 것이고 0.20m면 애초에
-                # 접근 불가한 자리다. 이 둘은 대응이 다르다.
+                # 접근 불가한 자리다. 이 둘은 대응이 다르다(goal_publisher.resolve가
+                # last_best_clearance_m을 보고 near-miss면 원본을 그대로 발행한다).
                 self.last_selection = (
                     f"no point with {config.TERRAIN_CLEARANCE_M:.2f}m clearance near goal "
                     f"(best {float(margins.max()):.2f}m of {len(candidates)} candidate(s))"

@@ -110,7 +110,10 @@ def _plan_list_html(steps: list[dict], current_index: int) -> str:
             # 확인에 실패해서 기하로 찍은 step(_best_effort_step_target)을 구분한다 -
             # 예전엔 둘 다 초록 ✓라 "판정 0/4 false인데 3/3 SUCCESS"가 화면상
             # 정상으로 보였다(missions/mission3_pipe._mark_step_basis 주석 참고).
-            if step.get("verified") is False:
+            # skip은 한 걸음도 안 간 step이라 ≈(가긴 갔는데 확인 못 함)와도 다르다.
+            if step.get("skipped"):
+                marker, color = "✗", "#c0392b"  # 아예 못 감
+            elif step.get("verified") is False:
                 marker, color = "≈", "#b45309"  # 기하 폴백으로 커밋 - 확인 안 됨
             else:
                 marker, color = "✓", "#15803d"  # done
@@ -139,7 +142,15 @@ def _mission_detail_rows(snapshot: dict) -> str:
         steps = task.get("steps") or []
         idx = snapshot.get("mission3_step_index", 0)
         rows.append(_row("Parsed via", task.get("parser", "rules")))
-        rows.append(_row("Progress", f"{min(idx, len(steps))} / {len(steps)} steps done"))
+        # "지나간 step 수"와 "실제로 도착한 step 수"는 다르다 - skip된 step도 인덱스는
+        # 올라가므로 그것까지 done으로 세면 화면이 거짓말을 한다.
+        passed = min(idx, len(steps))
+        skipped = sum(1 for step in steps[:passed] if step.get("skipped"))
+        rows.append(_row(
+            "Progress",
+            f"{passed - skipped} / {len(steps)} steps reached"
+            + (f" ({skipped} skipped)" if skipped else ""),
+        ))
         rows.append(_row("Plan", _plan_list_html(steps, idx)))
         forbidden = task.get("global_forbidden") or []
         if forbidden:

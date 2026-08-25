@@ -704,11 +704,25 @@ def _best_effort_step_target(node, step: dict, pose: dict) -> tuple[tuple | None
             )
     reference_positions = [reference["position"] for reference in references]
     if not reference_positions:
+        # 참조 물체를 3D로 못 잡았다(문/커튼/창문처럼 벽과 같은 평면이면 LiDAR로
+        # 분리가 안 돼 grounding이 통째로 실패한다). 예전엔 여기서 관계를 그냥 버리고
+        # "로봇에 가장 가까운 후보"로 떨어졌는데, 그건 사실상 임의 선택이다
+        # (실측 2026-08-25: "the picture closest to the door"에서 door가 안 잡혀
+        # 아무 picture나 골랐다).
+        #
+        # 좌표가 없어도 후보 **자신의 사진**에 참조 물체가 보이는지는 물어볼 수 있다.
+        # 그 용도의 코드가 이미 있는데(reasoning/relation_image_verifier.py) 지금까지
+        # selection_job에서만 쓰고 이 폴백에서는 안 썼다.
+        picked, basis = _resolve_reference_by_image(
+            node, candidates, relation, reference_category, pose
+        )
+        if picked is not None:
+            return picked["position"], basis
         nearest = min(candidates, key=lambda c: _dist2(c["position"], pose))
         return (
             nearest["position"],
             f"nearest candidate to the robot - '{relation} {reference_category}' NOT applied "
-            f"({reference_category} has no 3D position)",
+            f"({reference_category} has no 3D position; {basis})",
         )
 
     def gap(candidate) -> float:
@@ -720,6 +734,66 @@ def _best_effort_step_target(node, step: dict, pose: dict) -> tuple[tuple | None
         f"geometric '{relation} {reference_category}' over {len(candidates)} candidate(s) "
         f"and {len(reference_positions)} reference(s), gap={math.sqrt(gap(picked)):.2f}m"
         f"{attribute_note}",
+    )
+
+
+_SUPERLATIVE_RELATIONS = {"nearest", "closest", "farthest", "furthest"}
+
+
+def _resolve_reference_by_image(node, candidates, relation, reference_category, pose):
+    """참조 물체의 3D 좌표 없이, 후보 사진만으로 관계를 판정해 하나를 고른다.
+
+    반환: (선택된 후보 또는 None, 무슨 일이 있었는지 설명하는 문자열).
+
+    최상급("closest to the door")은 후보마다 yes/no를 물으면 안 된다 - picture 4개 중
+    3개 사진에 문이 보이면 셋 다 통과해서 아무것도 못 가린다. 그때는 후보 전부를 한 번에
+    놓고 VLM이 직접 비교하게 한다(rank_superlative). 그 외에는 후보별 yes/no로 좁힌다.
+
+    판정 결과는 object_memory에 적립해서(update_relation_checks) 같은 사진에 같은 질문을
+    두 번 하지 않는다 - attribute_verifier와 같은 on-demand 캐싱 패턴이다."""
+    verifier = getattr(node, "relation_image_verifier", None)
+    if verifier is None or not candidates:
+        return None, "no image verifier available"
+
+    # 후보가 너무 많으면 로봇 근접순으로 자른다(config.RELATION_IMAGE_MAX_CANDIDATES 주석).
+    # 최종 선택이 아니라 **예선**이다 - mission3는 순차 명령이라 이번 step의 답은 거의
+    # 항상 현재 위치 근처이고, 넓은 맵에서 다른 방의 후보는 애초에 답이 아니다. 동점은
+    # object_id로 갈라 같은 입력이면 같은 결과가 되게 한다.
+    total = len(candidates)
+    pruned = ""
+    if total > config.RELATION_IMAGE_MAX_CANDIDATES:
+        candidates = sorted(
+            candidates,
+            key=lambda c: (_dist2(c["position"], pose), int(c["object_id"])),
+        )[: config.RELATION_IMAGE_MAX_CANDIDATES]
+        pruned = f", top {len(candidates)} of {total} by proximity"
+
+    try:
+        if relation in _SUPERLATIVE_RELATIONS and len(candidates) > 1:
+            checks = verifier.rank_superlative(candidates, reference_category, relation)
+            how = "image comparison"
+        else:
+            checks = verifier.verify(candidates, relation, reference_category)
+            how = "image check"
+    except Exception as error:                      # VLM 실패가 주행을 막으면 안 된다.
+        node.get_logger().warning(f"⚠️ relation image fallback failed: {error}")
+        return None, "image check failed"
+
+    for object_id, result in (checks or {}).items():
+        node.object_memory.update_relation_checks(int(object_id), result)
+    passed = [
+        candidate for candidate in candidates
+        if any((checks or {}).get(int(candidate["object_id"]), {}).values())
+    ]
+    if not passed:
+        return None, f"no candidate passed the {how}{pruned}"
+    # 여럿 남으면 신뢰도가 가장 높은 것으로 가른다. 로봇 거리로 가르면 결과가 로봇
+    # 위치에 따라 흔들려서 재시도마다 목표가 바뀐다(between 쌍 선택과 같은 이유).
+    picked = max(passed, key=lambda c: float(c.get("confidence", 0.0)))
+    return picked, (
+        f"{how} '{relation} {reference_category}' over {len(candidates)} candidate(s) "
+        f"-> {len(passed)} passed, picked {picked['category']}#{picked['object_id']} "
+        f"(no 3D position for {reference_category}{pruned})"
     )
 
 
@@ -794,8 +868,14 @@ def _mark_step_basis(node, verified: bool | None, basis: str) -> None:
 
 
 def _unverified_step_count(task: dict) -> int:
-    """VLM 확인 없이 기하로 찍어서 커밋한 step 수(좌표 step은 세지 않는다)."""
-    return sum(1 for step in (task.get("steps") or []) if step.get("verified") is False)
+    """VLM 확인 없이 기하로 찍어서 커밋한 step 수.
+
+    좌표 step(verified=None)과 아예 못 간 step(skipped)은 세지 않는다 - skip은 "확인
+    없이 커밋했다"가 아니라 "커밋 자체를 못 했다"라서 _skipped_step_count가 따로 센다."""
+    return sum(
+        1 for step in (task.get("steps") or [])
+        if step.get("verified") is False and not step.get("skipped")
+    )
 
 
 def _describe_forbidden(task: dict) -> str:
@@ -952,6 +1032,22 @@ def _on_exploration_result(node, result: dict) -> None:
                     "🔍 exploration exhausted - deciding with whatever evidence exists"
                 )
             return
+        # 탐사가 이미 소진됐는데 또 빈 route다 = 이 step을 풀 물체를 끝내 못 찾았다.
+        # 예전엔 여기서 곧장 FAILED였는데, 그러면 이미 주행한 step까지 빨간불이 되고
+        # 남은 시간을 통째로 버린다(실측 2026-08-25: 0:40 FAILED, 9분 20초 남음).
+        # 남은 step이 있으면 이 step만 건너뛰고 계속 간다.
+        with node.state_lock:
+            task = None if node.task is None else node.task
+        steps = (task or {}).get("steps") or []
+        if task is not None and node.mission3_step_index < len(steps):
+            _skip_step(
+                node, task,
+                reason=(
+                    "no reachable frontier remains and the step could not be resolved "
+                    f"({node.coverage_planner.describe_last_plan_failure()})"
+                ),
+            )
+            return
         with node.state_lock:
             node.state = "FAILED"
         node.get_logger().warning(
@@ -972,13 +1068,31 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
         # 없음 -> 그대로 SUCCESS). 채점은 그걸 감점하므로 로그가 거짓말을 하면 안 된다.
         unenforced = bool(task.get("global_forbidden")) and node.mission3_forbidden_mask is None
         guessed = _unverified_step_count(task)
+        skipped = _skipped_step_count(task)
+        reached = len(steps) - skipped
+        if reached == 0:
+            # 하나도 못 갔으면 성공이 아니다. skip이 있어도 실제로 간 step이 하나라도
+            # 있으면 부분점수가 있으므로 SUCCESS로 두되, 요약에 skip 수를 남긴다.
+            with node.state_lock:
+                node.state = "FAILED"
+            node.last_response_summary = f"0/{len(steps)} steps reached ({skipped} skipped)"
+            node.get_logger().warning(
+                f"❌ TASK FAILED - none of the {len(steps)} step(s) could be reached"
+            )
+            return
         node.last_response_summary = (
-            f"{len(steps)}/{len(steps)} steps completed"
+            f"{reached}/{len(steps)} steps reached"
+            + (f", {skipped} skipped (never resolvable)" if skipped else "")
             + (f" ({guessed} step(s) committed WITHOUT relation verification)" if guessed else "")
             + (" (avoidance constraint NOT enforced)" if unenforced else "")
         )
         with node.state_lock:
             node.state = "SUCCESS"
+        if skipped:
+            node.get_logger().warning(
+                f"🚩 FINISHED with {reached}/{len(steps)} step(s) reached - {skipped} step(s) "
+                "were skipped because their objects were never found or never commandable"
+            )
         if unenforced:
             node.get_logger().warning(
                 "🚩 ALL STEPS COMPLETE but the avoidance constraint was never enforced "
@@ -991,7 +1105,7 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
                 "fallback after the VLM could not verify the relation - the objects reached "
                 "may not be the ones the instruction meant"
             )
-        if not unenforced and not guessed:
+        if not unenforced and not guessed and not skipped:
             node.get_logger().info("🚩🏁 ALL STEPS COMPLETE (task SUCCESS)")
         return
 
@@ -1283,13 +1397,55 @@ def _give_up_step(node, task: dict) -> None:
     """
     steps = task["steps"]
     index = node.mission3_step_index
-    node.clear_target_navigation()
-    node.mission3_step_index += 1
-    node.mission3_subgoal_retries = 0
-    with node.state_lock:
-        node.state = "MISSION3_SELECT_STEP"
+    _advance_past_step(node, task, reason=(
+        f"the committed subgoal was not commandable for "
+        f"{config.MISSION3_SUBGOAL_MAX_RETRIES} consecutive attempts "
+        f"({node.terrain_monitor.last_selection})"
+    ))
     node.get_logger().warning(
         f"🚧 step {index + 1}/{len(steps)} GIVEN UP - the committed subgoal was not "
         f"commandable for {config.MISSION3_SUBGOAL_MAX_RETRIES} consecutive attempts "
         f"({node.terrain_monitor.last_selection}); moving on to keep the remaining steps"
     )
+
+
+def _skip_step(node, task: dict, reason: str) -> None:
+    """이 step을 풀 물체를 끝내 못 찾았다 - 건너뛰고 다음 step으로 간다.
+
+    _give_up_step과 몸통은 같고 사정이 다르다: 저쪽은 "목적지는 정했는데 그 좌표로 못
+    간다"이고, 이쪽은 "목적지를 정할 물체 자체를 못 봤다"이다. 둘 다 step을 소비한다.
+
+    왜 FAILED가 아닌가: 예전엔 탐사가 소진된 뒤 step을 못 풀면 곧장 FAILED였다. 실측
+    2026-08-25에 step 1/2를 실제로 주행하고도 step 3(curtain)에서 0:40에 FAILED가 떴고,
+    10분 예산 중 9분 20초가 남아 있었다. 채점은 실제 궤적을 보고 부분점수가 있으므로,
+    남은 step이라도 시도하는 쪽이 항상 낫다 - 이 파일의 다른 폴백(_give_up_step,
+    forbidden mask 미발견, _best_effort_step_target)과 같은 원칙이다.
+    """
+    steps = task["steps"]
+    index = node.mission3_step_index
+    _advance_past_step(node, task, reason=reason)
+    node.get_logger().warning(
+        f"⏭️ step {index + 1}/{len(steps)} SKIPPED - {reason}; "
+        "moving on to try the remaining steps"
+    )
+
+
+def _advance_past_step(node, task: dict, reason: str) -> None:
+    """step 하나를 소비하고 다음 step 선택으로 돌아간다(_give_up_step/_skip_step 공용).
+
+    step에 skipped 표시를 남긴다 - "확인 없이 커밋했다"(verified=False)와 "아예 못
+    갔다"는 다른 사건이라 대시보드와 종료 요약에서 구분돼야 한다."""
+    steps = task.get("steps") or []
+    index = node.mission3_step_index
+    if 0 <= index < len(steps):
+        steps[index]["skipped"] = True
+        steps[index]["basis"] = f"SKIPPED - {reason}"
+    node.clear_target_navigation()
+    node.mission3_step_index += 1
+    node.mission3_subgoal_retries = 0
+    with node.state_lock:
+        node.state = "MISSION3_SELECT_STEP"
+
+
+def _skipped_step_count(task: dict) -> int:
+    return sum(1 for step in (task.get("steps") or []) if step.get("skipped"))

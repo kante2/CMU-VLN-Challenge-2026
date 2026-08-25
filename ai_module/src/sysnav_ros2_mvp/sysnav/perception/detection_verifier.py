@@ -10,6 +10,7 @@ YOLO-World가 애매한 confidence로 카테고리를 잘못 붙이는 경우(�
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 
@@ -35,10 +36,30 @@ class DetectionVerifier:
 
     @staticmethod
     def _cache_key(detection: dict) -> tuple:
+        """(카테고리, 양자화한 **map 프레임 3D 위치**). 같은 물체면 로봇이 어디서 봐도 같다.
+
+        예전 키는 2D bbox를 48px로 양자화한 값이었다. 파노라마에서 박스는 로봇이 조금만
+        움직여도 그보다 크게 밀리기 때문에 같은 물체를 매번 다시 물었다 - 실측
+        2026-08-25: 33초 동안 같은 picture를 5번 질의(TTL 30초 안인데 전부 miss).
+        3D 위치는 로봇이 움직여도 그대로라 물체당 한 번만 묻게 된다.
+
+        position이 없는 detection(3D grounding 전 호출)은 예전 방식으로 되돌아간다 -
+        키가 없어서 캐시를 못 쓰는 것보다는 낫다.
+        """
+        category = str(detection["category"]).lower()
+        position = detection.get("position")
+        if position is not None:
+            quant = max(1e-6, float(config.DETECTION_VERIFICATION_CACHE_POSITION_QUANT_M))
+            return (
+                category,
+                int(math.floor(float(position[0]) / quant)),
+                int(math.floor(float(position[1]) / quant)),
+                int(math.floor(float(position[2]) / quant)),
+            )
         quant = max(1, int(config.DETECTION_VERIFICATION_CACHE_BBOX_QUANT_PX))
         x1, y1, x2, y2 = detection["bbox"]
         return (
-            str(detection["category"]).lower(),
+            category,
             int(x1) // quant, int(y1) // quant, int(x2) // quant, int(y2) // quant,
         )
 

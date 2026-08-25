@@ -126,36 +126,11 @@ class PerceptionPipeline:
                          f"prompts={', '.join(prompts)}")
             return []
 
-        verified, skipped = self._verify_low_confidence(
-            image_rgb, detections, verify_categories
-        )
-        if len(verified) != len(detections):
-            self._logger.info(
-                f"[Perception] after confidence verification: {self._format_detections(verified)}"
-            )
-        rejected = len(detections) - len(verified) - skipped
-        scope = (
-            "" if verify_categories is None
-            else f" | 지금 step에 필요한 {', '.join(sorted(verify_categories))}만 질의"
-        )
-        activity.add(
-            PERCEPTION,
-            f"② 검출 재확인 - {rejected}개 기각, {len(verified)}개 통과"
-            + (f", {skipped}개 무관해서 미질의" if skipped else ""),
-            (f"conf<{config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD:.2f}인 것만 Gemini에 물어봄"
-             if rejected or skipped or len(verified) != len(detections)
-             else f"conf<{config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD:.2f}인 검출이 없어 건너뜀")
-            + scope,
-        )
-        detections = verified
-        if not detections:
-            return []
-
         segmented = self.segmenter.segment(image_rgb, detections)
         self._logger.info(
             f"[Perception] SAM2 segmented {len(segmented)}/{len(detections)} detections"
         )
-        activity.add(PERCEPTION, f"③ SAM2 분할 {len(segmented)}/{len(detections)}")
+        activity.add(PERCEPTION, f"② SAM2 분할 {len(segmented)}/{len(detections)}")
         if not segmented:
             return []
         grounded = self.grounder.ground(image_rgb, points_sensor, segmented, robot_pose)
@@ -167,11 +142,44 @@ class PerceptionPipeline:
         dropped = len(segmented) - len(grounded)
         activity.add(
             PERCEPTION,
-            f"④ LiDAR 3D 위치 확정 {len(grounded)}/{len(segmented)}",
+            f"③ LiDAR 3D 위치 확정 {len(grounded)}/{len(segmented)}",
             f"precise {precise} / approximate {len(grounded) - precise}"
             + (f" | {dropped}개는 대응 point가 없어 탈락" if dropped else "")
             + (f" | {self._summarize(grounded)}" if grounded else ""),
         )
+
+        # 검출 재확인은 여기서 한다 - YOLO 직후가 아니라 **3D 위치가 정해진 뒤**다.
+        #
+        # 왜 옮겼나: 캐시 키를 map 프레임 3D 위치로 쓰려면 위치가 있어야 한다. 예전
+        # 키(2D bbox)는 로봇이 조금만 움직여도 어긋나서 같은 물체를 매 프레임 다시
+        # 물었다(실측 2026-08-25: 33초에 같은 picture 5회). 덤으로, grounding에서
+        # 탈락한 detection(대응 LiDAR point 없음)은 어차피 memory에 못 들어가므로
+        # 그것들에 Gemini를 쓰던 것도 사라진다. SAM2+grounding은 로컬이라 프레임당
+        # 0.4초 수준이고 Gemini는 건당 수 초라, 순서를 바꾸는 쪽이 항상 싸다.
+        verified, skipped = self._verify_low_confidence(
+            image_rgb, grounded, verify_categories
+        )
+        rejected = len(grounded) - len(verified) - skipped
+        if len(verified) != len(grounded):
+            self._logger.info(
+                f"[Perception] after confidence verification: {self._format_detections(verified)}"
+            )
+        scope = (
+            "" if verify_categories is None
+            else f" | 지금 step에 필요한 {', '.join(sorted(verify_categories))}만 질의"
+        )
+        activity.add(
+            PERCEPTION,
+            f"④ 검출 재확인 - {rejected}개 기각, {len(verified)}개 통과"
+            + (f", {skipped}개 무관해서 미질의" if skipped else ""),
+            (f"conf<{config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD:.2f}인 것만 Gemini에 물어봄"
+             if rejected or skipped or len(verified) != len(grounded)
+             else f"conf<{config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD:.2f}인 검출이 없어 건너뜀")
+            + scope,
+        )
+        grounded = verified
+        if not grounded:
+            return []
         save_debug_image(image_rgb, segmented, grounded) # ai_module/debug에 저장
         return grounded
 
