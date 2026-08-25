@@ -154,6 +154,36 @@ MISSION3_OBJECT_APPROACH_MAX_M = 0.9
 # (missions/path_gate.py). 물체 바로 옆을 스치듯 통과하는 경우까지 잡으려고 선분을 양쪽
 # 끝에서 이만큼 연장한 뒤 교차를 판정한다.
 MISSION3_GATE_EXTENSION_M = 0.3
+
+# "take the path between A and B"에서 A 후보 x B 후보를 **짝으로** 평가할 때 쓰는 값들.
+#
+# 왜: 예전엔 두 참조를 각각 독립적으로 "로봇에 가장 가까운 것" argmin으로 골랐다
+# (detection confidence를 아예 안 읽었고, 두 물체가 실제로 통과 가능한 게이트를 이루는지도
+# 안 봤다). 실측 2026-08-25: "take the path between the sofa and the round tables"에서
+# 신뢰도 0.58짜리 오검출(벽 옆 화분받침을 table로 검출)이 로봇에 더 가깝다는 이유만으로
+# 신뢰도 0.85짜리 진짜 원형 테이블을 이겼다. 게다가 로봇 pose에 의존해서 unreachable
+# 재시도마다 목표가 떠돌았다. 이제 쌍 단위로 채점하고 pose는 쓰지 않는다.
+#
+# GAP: 두 물체 중심 사이 거리의 허용 범위. 하한은 "로봇이 들어갈 틈도 안 되는" 짝을,
+# 상한은 "같은 방에 있을 뿐 통로가 아닌" 짝을 걸러낸다(로봇 거리 항을 없앤 대신 이
+# 상한이 국소성을 담당한다).
+MISSION3_BETWEEN_MIN_GAP_M = float(os.getenv("SYSNAV_MISSION3_BETWEEN_MIN_GAP_M", "0.4"))
+MISSION3_BETWEEN_MAX_GAP_M = float(os.getenv("SYSNAV_MISSION3_BETWEEN_MAX_GAP_M", "6.0"))
+# 게이트 통과 판정용 장애물 팽창 반경. ROBOT_CLEARANCE_M(현재 0.0)을 그대로 쓰면 1셀
+# (0.2m)밖에 안 부풀어서 "로봇이 못 지나갈 만큼 좁은 틈"을 통과 가능으로 본다.
+MISSION3_BETWEEN_GATE_CLEARANCE_M = float(os.getenv("SYSNAV_MISSION3_BETWEEN_GATE_CLEARANCE_M", "0.30"))
+# A-B 선분 위 셀 중 통과 가능해야 하는 최소 비율.
+MISSION3_BETWEEN_MIN_CLEAR_FRACTION = float(os.getenv("SYSNAV_MISSION3_BETWEEN_MIN_CLEAR_FRACTION", "0.6"))
+# 선분을 물체 몸통 밖에서 시작시키기 위해 양 끝에서 잘라낼 반경의 상한. 물체 중심 셀은
+# 당연히 occupied라 안 자르면 모든 짝이 똑같이 감점돼 통과가능성 판정이 무의미해진다.
+MISSION3_BETWEEN_OBJECT_RADIUS_MAX_M = float(os.getenv("SYSNAV_MISSION3_BETWEEN_OBJECT_RADIUS_MAX_M", "1.0"))
+# 쌍 점수 가중치. confidence를 지배항으로 둔다 - 통과 가능한 게이트들 중에서는
+# "신뢰도 높은 쪽이 이긴다"가 되도록. 통과가능성은 점수 항이 아니라 필터(tier)다.
+MISSION3_BETWEEN_CONFIDENCE_WEIGHT = float(os.getenv("SYSNAV_MISSION3_BETWEEN_CONFIDENCE_WEIGHT", "0.65"))
+MISSION3_BETWEEN_GAP_WEIGHT = float(os.getenv("SYSNAV_MISSION3_BETWEEN_GAP_WEIGHT", "0.35"))
+# 쌍 채점 결과를 로그에 몇 줄까지 찍을 것인가(디버깅용).
+MISSION3_BETWEEN_PAIR_LOG_TOP_N = int(os.getenv("SYSNAV_MISSION3_BETWEEN_PAIR_LOG_TOP_N", "5"))
+
 # 확정된 subgoal을 몇 번 연속 "도달 불가"로 받고도 계속 재발행할 것인가.
 #
 # mission3는 한 번 marker까지 만든 subgoal을 탐사 목표로 덮어쓰지 않는다(채점이 subgoal

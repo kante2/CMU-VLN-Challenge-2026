@@ -46,6 +46,8 @@ _ATTRIBUTES = {
     "round", "square",
 }
 _IRREGULAR = {"chairs": "chair", "tables": "table", "pillows": "pillow", "boxes": "box", "shelves": "shelf"}
+# 참조 자리에 물체 이름 대신 올 수 있는 대명사. _resolve_pronouns() 주석 참고.
+_PRONOUNS = {"it", "them", "they", "this", "these", "those", "him", "her"}
 
 
 def _clean(text: str) -> str:
@@ -137,7 +139,34 @@ def _extract_relation_chain(phrase: str) -> list[dict]:
 
         remaining = remaining[end:]
 
-    return chain
+    return _resolve_pronouns(chain)
+
+
+def _resolve_pronouns(chain: list[dict]) -> list[dict]:
+    """대명사 참조("the cabinet with a picture above **it**")를 그 선행사로 되돌린다.
+
+    questions.json의 대명사 18문장은 예외 없이 "X with Y on/above it" 꼴이고, it/them은
+    **같은 명사구의 head noun**을 가리킨다(앞 절이 아니다). 그런데 그 head noun은 이미
+    "cabinet with picture"처럼 카테고리 문자열에 통째로 fuse돼 있어서, 선행사로 되돌리면
+    relation이 자기 자신을 가리키게 된다. 그런 relation은 정보가 없으므로 통째로 버린다 -
+    "picture가 cabinet 위에 있다"는 제약은 이미 그 카테고리 문자열이 담고 있다.
+
+    왜 필요한가: 예전엔 "it"이 그대로 참조 카테고리이자 YOLO 프롬프트가 됐다.
+    find_by_category("it")은 영원히 비어 있어서, mission3의 _missing_categories가 그
+    step을 절대 "관측 완료"로 못 보고 탐사만 반복했다(실측 2026-08-25: "stop at the
+    cabinet with a picture above it"에서 step 3이 확정되지 않음).
+
+    대명사가 자기 relation을 갖고 있으면(데이터엔 없지만) 그 relation을 선행사에 그대로
+    물려줘서 체인이 끊기지 않게 한다. 선행사가 아예 없으면(문장 전체가 대명사) 손대지
+    않는다 - 그건 이미 파싱 실패라 여기서 고칠 수 있는 게 아니다.
+    """
+    resolved: list[dict] = []
+    for node in chain:
+        if node["object"] in _PRONOUNS and resolved:
+            resolved[-1]["relation"] = node["relation"]
+            continue
+        resolved.append(node)
+    return resolved
 
 
 def merge_reference_attributes(pairs: list[tuple[str, list[str]]]) -> dict[str, list[str]]:

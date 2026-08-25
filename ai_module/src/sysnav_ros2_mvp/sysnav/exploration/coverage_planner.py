@@ -300,6 +300,32 @@ class CoveragePlanner:
             radius = max(1, int(round(0.35 / self.resolution)))
             self.grid[max(0, rr - radius):min(self.size_cells, rr + radius + 1), max(0, cc - radius):min(self.size_cells, cc + radius + 1)] = config.OCC_FREE
 
+    def _inflated_obstacles(self, grid: np.ndarray, clearance_m: float) -> np.ndarray:
+        occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
+        inflation = max(1, int(round(clearance_m / self.resolution)))
+        return cv2.dilate(
+            occupied, np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8)
+        ).astype(bool)
+
+    def traversable_mask(
+        self, grid: np.ndarray | None = None, clearance_m: float | None = None
+    ) -> np.ndarray:
+        """occupancy grid -> 통과 가능 셀 마스크.
+
+        clearance_m을 주면 그 반경으로 장애물을 부풀린다(기본 ROBOT_CLEARANCE_M).
+        mission3의 "take the path between A and B" 게이트 판정은 로봇 몸체보다 넉넉한
+        여유를 요구하므로 별도 clearance를 넘긴다 - ROBOT_CLEARANCE_M은 현재 0.0이라
+        (config.py 참고) 그대로 쓰면 "로봇이 못 지나갈 만큼 좁은 틈"을 판정할 수 없다.
+
+        grid를 생략하면 현재 grid의 스냅샷을 쓴다. _build_traversable()이 이 함수를
+        호출하도록 해서 둘의 clearance 해석이 갈라지지 않게 했다.
+        """
+        if grid is None:
+            grid = self.snapshot_grid()
+        if clearance_m is None:
+            clearance_m = config.ROBOT_CLEARANCE_M
+        return (grid == config.OCC_FREE) & (~self._inflated_obstacles(grid, clearance_m))
+
     def _build_traversable(self, grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """occupancy grid -> (traversable, inflated).
 
@@ -311,11 +337,7 @@ class CoveragePlanner:
         plan_route()와 plan_direct_path()가 똑같이 쓰던 3줄이라
         하나로 모았다 - 둘이 서로 다른 clearance를 쓰기 시작하면 조용히 어긋난다.
         """
-        occupied = (grid == config.OCC_OCCUPIED).astype(np.uint8)
-        inflation = max(1, int(round(config.ROBOT_CLEARANCE_M / self.resolution)))
-        inflated = cv2.dilate(
-            occupied, np.ones((2 * inflation + 1, 2 * inflation + 1), np.uint8)
-        ).astype(bool)
+        inflated = self._inflated_obstacles(grid, config.ROBOT_CLEARANCE_M)
         traversable = (grid == config.OCC_FREE) & (~inflated)
         return traversable, inflated
 

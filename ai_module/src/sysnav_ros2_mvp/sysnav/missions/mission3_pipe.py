@@ -24,6 +24,7 @@ MISSION3_SELECT_STEP -> MISSION3_NAVIGATE_STEP -> (다음 step) ... -> SUCCESS.
 
 from __future__ import annotations
 
+import itertools
 import math
 import re
 from collections import deque
@@ -33,7 +34,7 @@ import numpy as np
 from sysnav import config
 from sysnav.missions import path_gate
 from sysnav.reasoning.attribute_filter import filter_by_attributes
-from sysnav.task.query_parser import effective_relation_chain
+from sysnav.task.query_parser import effective_relation_chain, merge_reference_attributes
 
 # ---------------------------------------------------------------------------
 # 문장 -> 절(clause) 분리. questions.json의 instruction_following 30문장 전수
@@ -164,6 +165,7 @@ def parse_instruction(node, question: str) -> dict:
     steps: list[dict] = []
     forbidden: list[dict] = []
     prompt_categories: list[str] = []
+    _REF_LOG_SEEN.clear()  # 새 질문이면 참조 후보 진단 로그를 다시 한 번 찍는다.
 
     raw_steps = _split_clauses(question)
     splitter = "rules"
@@ -240,7 +242,277 @@ def _category_candidates(node, ref_parsed: dict) -> list[dict]:
     candidates = node.object_memory.find_by_category(ref_parsed["target"])
     if not candidates:
         return []
-    return filter_by_attributes(node, candidates, ref_parsed.get("attributes"))
+    passed = filter_by_attributes(node, candidates, ref_parsed.get("attributes"))
+    _log_ref_candidates(node, ref_parsed, candidates, passed)
+    return passed
+
+
+# 후보 구성이 바뀔 때만 진단 로그를 찍기 위한 캐시. _select_step이 0.5초마다 도는데
+# 매번 찍으면 로그가 폭발한다. parse_instruction()이 질문마다 비운다.
+_REF_LOG_SEEN: dict[str, tuple] = {}
+
+
+def _log_ref_candidates(node, ref_parsed: dict, before: list[dict], after: list[dict]) -> None:
+    """속성 필터가 참조 후보를 어떻게 갈랐는지 한 블록으로 찍는다.
+
+    왜 필요한가: "the round tables"에서 "round"는 분명히 파싱되고(task/query_parser.py의
+    _ATTRIBUTES에 있다) filter_by_attributes도 분명히 호출되는데, 실측에서 원형이 아닌
+    화분받침이 살아남아 진짜 원형 테이블 대신 선택됐다. 원인 후보가 5개(속성이 빈 채로
+    파싱됨 / 검증 기능 꺼짐 / VLM이 정말 round=True로 판정 / fail-closed가 정답을 떨어뜨림 /
+    카테고리 문자열 불일치)인데 로그가 없어서 어느 것인지 구분할 수 없었다. 아래 3항목이
+    그 5개를 전부 구분해준다 - 추측 대신 데이터로 정하기 위한 것이다."""
+    target = str(ref_parsed.get("target", ""))
+    attributes = [str(a) for a in (ref_parsed.get("attributes") or [])]
+    passed_ids = {int(c["object_id"]) for c in after}
+    signature = (
+        tuple(sorted((int(c["object_id"]), round(float(c.get("confidence", 0.0)), 3)) for c in before)),
+        tuple(sorted(passed_ids)),
+        tuple(attributes),
+    )
+    if _REF_LOG_SEEN.get(target) == signature:
+        return
+    _REF_LOG_SEEN[target] = signature
+
+    # 이 함수는 순수 진단용이다. object_memory가 조회 API를 다 갖추지 않은 경우에도
+    # (테스트의 축약 fake 등) 절대 resolve 경로를 무너뜨리면 안 되므로 선택적으로 읽는다.
+    memory_get = getattr(node.object_memory, "get", None)
+    all_nodes = getattr(node.object_memory, "all_nodes", None)
+
+    verification = "on" if config.ATTRIBUTE_VERIFICATION_ENABLED else "off"
+    lines = [
+        f"🔎 ref '{target}' attributes={attributes} verification={verification} "
+        f"-> {len(after)}/{len(before)} passed"
+    ]
+    for candidate in sorted(before, key=lambda c: -float(c.get("confidence", 0.0))):
+        object_id = int(candidate["object_id"])
+        # 필터가 방금 캐싱한 판정까지 보려면 memory에서 다시 읽어야 한다(candidate는
+        # filter 호출 **전**에 뜬 복사본이라 self_attributes가 비어 있을 수 있다).
+        stored = (memory_get(object_id) or {}) if memory_get else {}
+        cached = stored.get("self_attributes") or candidate.get("self_attributes") or {}
+        if object_id in passed_ids:
+            verdict = "PASS"
+        else:
+            failed = [a for a in attributes if not cached.get(a, False)]
+            unverified = [a for a in failed if a not in cached]
+            verdict = f"DROP({'unverified: ' if unverified else ''}{','.join(failed) or '?'})"
+        position = candidate.get("position", (0.0, 0.0, 0.0))
+        extent = candidate.get("extent_3d", (0.0, 0.0, 0.0))
+        has_image = "yes" if stored.get("representative_image") is not None else "no"
+        lines.append(
+            f"     #{object_id} conf={float(candidate.get('confidence', 0.0)):.2f} "
+            f"pos=({position[0]:.2f},{position[1]:.2f}) "
+            f"extent=({extent[0]:.2f},{extent[1]:.2f}) "
+            f"obs={candidate.get('observation_count', 0)} image={has_image} "
+            f"attrs={cached} {verdict}"
+        )
+    # find_by_category는 정확한 소문자 문자열 매칭이라 "coffee table"로 저장된 노드는
+    # find_by_category("table")에 안 잡힌다. 그 경우를 즉시 드러낸다.
+    census: dict[str, int] = {}
+    for stored in (all_nodes() if all_nodes else []):
+        category = str(stored.get("category", ""))
+        if target and target in category and category != target:
+            census[category] = census.get(category, 0) + 1
+    if census:
+        related = ", ".join(f"{name}({count})" for name, count in sorted(census.items()))
+        lines.append(f"     related categories not matched by find_by_category('{target}'): {related}")
+    node.get_logger().info("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# "between A and B" 참조 쌍 선택.
+#
+# 예전엔 A와 B를 **각각 독립적으로** "로봇에 가장 가까운 것"으로 골랐다. 그래서
+# (1) detection confidence가 전혀 반영되지 않았고(실측: 신뢰도 0.58 오검출이 0.85 정답을
+# 이김), (2) 두 물체가 실제로 통과 가능한 게이트를 이루는지 아무도 확인하지 않았으며,
+# (3) live pose에 의존해서 unreachable 재시도마다 목표가 떠돌았다.
+#
+# 이제 A 후보 x B 후보 전체를 **짝으로** 채점한다. 로봇 위치는 쓰지 않는다.
+# ---------------------------------------------------------------------------
+
+def _object_radius(candidate: dict) -> float:
+    """extent_3d에서 XY 반경. 게이트 선분을 물체 몸통 밖에서 시작시키기 위한 것."""
+    extent = candidate.get("extent_3d") or (0.0, 0.0, 0.0)
+    try:
+        radius = 0.5 * max(abs(float(extent[0])), abs(float(extent[1])))
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+    if not math.isfinite(radius) or radius <= 0.0:
+        return 0.0
+    return min(radius, config.MISSION3_BETWEEN_OBJECT_RADIUS_MAX_M)
+
+
+def _pair_clearance(planner, traversable, position_a, position_b, radius_a, radius_b):
+    """(통과 가능 셀 비율, 중점 통과 가능 여부). grid origin이 아직 없으면 None.
+
+    선분을 양 끝에서 각 물체 반경만큼 잘라낸 구간만 샘플링한다 - 물체 중심 셀은 당연히
+    occupied라, 안 자르면 모든 짝이 똑같이 감점돼 이 항목이 무의미해진다."""
+    ax, ay = float(position_a[0]), float(position_a[1])
+    bx, by = float(position_b[0]), float(position_b[1])
+    gap = math.hypot(bx - ax, by - ay)
+    if gap < 1e-6:
+        return 0.0, False
+    ux, uy = (bx - ax) / gap, (by - ay) / gap
+    # 양쪽 반경을 합쳐도 gap을 넘지 않도록 줄인다(물체끼리 겹치는 경우).
+    trim_a, trim_b = radius_a, radius_b
+    if trim_a + trim_b >= gap:
+        scale = 0.45 * gap / max(trim_a + trim_b, 1e-6)
+        trim_a, trim_b = trim_a * scale, trim_b * scale
+    start = (ax + ux * trim_a, ay + uy * trim_a)
+    end = (bx - ux * trim_b, by - uy * trim_b)
+
+    cell_start = planner.world_to_grid(start[0], start[1])
+    cell_end = planner.world_to_grid(end[0], end[1])
+    if cell_start is None or cell_end is None:
+        return None
+    cells = planner.line_cells(cell_start, cell_end)
+    if not cells:
+        return 0.0, False
+    rows, cols = traversable.shape
+    clear = sum(
+        1 for row, col in cells
+        if 0 <= row < rows and 0 <= col < cols and bool(traversable[row, col])
+    )
+    midpoint_cell = planner.world_to_grid((ax + bx) / 2.0, (ay + by) / 2.0)
+    midpoint_clear = (
+        midpoint_cell is not None
+        and 0 <= midpoint_cell[0] < rows
+        and 0 <= midpoint_cell[1] < cols
+        and bool(traversable[midpoint_cell])
+    )
+    return clear / len(cells), midpoint_clear
+
+
+def _pair_score(candidate_a: dict, candidate_b: dict) -> dict:
+    """쌍 점수. 로봇 위치를 쓰지 않는다.
+
+    confidence는 min(a, b)이다 - 게이트는 약한 쪽 기둥만큼만 믿을 수 있다.
+    통과가능성은 여기 안 들어간다: _select_object_pair의 tier 필터가 담당한다. 그래야
+    "통과 가능한 게이트들 중에서는 신뢰도 높은 쪽이 이긴다"가 성립한다."""
+    position_a = candidate_a["position"]
+    position_b = candidate_b["position"]
+    gap = math.hypot(
+        float(position_a[0]) - float(position_b[0]),
+        float(position_a[1]) - float(position_b[1]),
+    )
+    confidence = min(
+        float(candidate_a.get("confidence", 0.0)), float(candidate_b.get("confidence", 0.0))
+    )
+    confidence = min(max(confidence, 0.0), 1.0)
+    min_gap = config.MISSION3_BETWEEN_MIN_GAP_M
+    max_gap = config.MISSION3_BETWEEN_MAX_GAP_M
+    gap_score = 1.0 - (gap - min_gap) / max(max_gap - min_gap, 1e-6)
+    gap_score = min(max(gap_score, 0.0), 1.0)
+    weight_confidence = config.MISSION3_BETWEEN_CONFIDENCE_WEIGHT
+    weight_gap = config.MISSION3_BETWEEN_GAP_WEIGHT
+    total = max(weight_confidence + weight_gap, 1e-6)
+    return {
+        "score": (weight_confidence * confidence + weight_gap * gap_score) / total,
+        "confidence": confidence,
+        "gap": gap,
+        "gap_score": gap_score,
+    }
+
+
+def _pair_iter(candidates_a: list[dict], candidates_b: list[dict], collective: bool):
+    """평가할 (a, b) 짝. collective면 같은 리스트의 i<j 조합(자기 자신과 짝 짓지 않음),
+    아니면 교차곱에서 object_id가 같은 짝만 제외한다."""
+    if collective:
+        return list(itertools.combinations(candidates_a, 2))
+    return [
+        (a, b)
+        for a, b in itertools.product(candidates_a, candidates_b)
+        if int(a["object_id"]) != int(b["object_id"])
+    ]
+
+
+def _select_object_pair(node, candidates_a, candidates_b, collective: bool, label: str):
+    """A 후보 x B 후보 전체를 짝으로 채점해 최고점 하나를 고른다. 로봇 위치는 안 쓴다.
+
+    tier 사다리를 쓰는 이유: hard reject가 후보를 전부 날리면 _select_step이 영원히
+    PLAN_EXPLORATION으로 돌아간다(exploration_exhausted 뒤에도 point step엔 탈출구가
+    없다). 런 초반엔 통로가 UNKNOWN이고 unknown은 통과 불가로 취급되므로 순진한
+    hard filter는 실제로 전부 떨어뜨린다. 또 이번 실측처럼 정답 테이블이 소파에 붙어
+    있으면 strict에서 떨어질 수 있는데, 그때 unverified가 회수하고 confidence+gap이
+    올바르게 고른다. 후보가 2개 미만일 때만 None이다."""
+    pairs = _pair_iter(candidates_a, candidates_b, collective)
+    if not pairs:
+        return None
+
+    planner = getattr(node, "coverage_planner", None)
+    grid = planner.snapshot_grid() if planner is not None else None
+
+    def clearance_for(inflation_m):
+        if planner is None or grid is None:
+            return lambda a, b, ra, rb: None
+        traversable = planner.traversable_mask(grid, inflation_m)
+        return lambda a, b, ra, rb: _pair_clearance(planner, traversable, a, b, ra, rb)
+
+    tiers = (
+        ("strict", config.MISSION3_BETWEEN_GATE_CLEARANCE_M, True, True),
+        ("passable", config.ROBOT_CLEARANCE_M, True, False),
+        ("unverified", None, False, False),
+    )
+    min_gap = config.MISSION3_BETWEEN_MIN_GAP_M
+    max_gap = config.MISSION3_BETWEEN_MAX_GAP_M
+    min_fraction = config.MISSION3_BETWEEN_MIN_CLEAR_FRACTION
+
+    for tier_name, inflation_m, check_geometry, check_fraction in tiers:
+        measure = clearance_for(inflation_m) if check_geometry else None
+        scored = []
+        for candidate_a, candidate_b in pairs:
+            metrics = _pair_score(candidate_a, candidate_b)
+            clearance = None
+            if measure is not None:
+                result = measure(
+                    candidate_a["position"], candidate_b["position"],
+                    _object_radius(candidate_a), _object_radius(candidate_b),
+                )
+                if result is not None:
+                    clearance, midpoint_clear = result
+                    if not midpoint_clear:
+                        continue
+                    if check_fraction and clearance < min_fraction:
+                        continue
+            if check_geometry and not (min_gap <= metrics["gap"] <= max_gap):
+                continue
+            metrics["clearance"] = clearance
+            scored.append((candidate_a, candidate_b, metrics))
+        if scored:
+            scored.sort(
+                key=lambda item: (
+                    -item[2]["score"], int(item[0]["object_id"]), int(item[1]["object_id"])
+                )
+            )
+            _log_pair_selection(node, label, tier_name, len(pairs), scored)
+            return scored[0][0], scored[0][1]
+    return None
+
+
+def _log_pair_selection(node, label: str, tier: str, total_pairs: int, scored: list) -> None:
+    best_a, best_b, _ = scored[0]
+    lines = [
+        f"🚪 gate {label} [{tier}]: {total_pairs} pair(s), {len(scored)} passed -> "
+        f"{best_a['category']}#{best_a['object_id']} + {best_b['category']}#{best_b['object_id']}"
+    ]
+    for index, (candidate_a, candidate_b, metrics) in enumerate(
+        scored[: max(1, config.MISSION3_BETWEEN_PAIR_LOG_TOP_N)]
+    ):
+        clearance = metrics.get("clearance")
+        clearance_text = "n/a" if clearance is None else f"{clearance:.2f}"
+        lines.append(
+            f"     {candidate_a['category']}#{candidate_a['object_id']}"
+            f"+{candidate_b['category']}#{candidate_b['object_id']}  "
+            f"score={metrics['score']:.2f} conf={metrics['confidence']:.2f} "
+            f"gap={metrics['gap']:.2f}m clear={clearance_text}"
+            f"{'   PICK' if index == 0 else ''}"
+        )
+    message = "\n".join(lines)
+    # strict가 아닌 tier로 이겼다는 건 게이트가 기하학적으로 검증되지 않았다는 뜻이라
+    # 런 로그에서 눈에 띄어야 한다.
+    if tier == "strict":
+        node.get_logger().info(message)
+    else:
+        node.get_logger().warning(message)
 
 
 def _resolve_single_category_point(node, ref_parsed: dict, pose: dict):
@@ -252,20 +524,29 @@ def _resolve_single_category_point(node, ref_parsed: dict, pose: dict):
 
 
 def _resolve_forbidden_segment(node, point_mode: str, point_refs: list[dict], pose: dict):
-    """(point_a, point_b) 반환 - "near"는 같은 점을 두 번(원형 마스크용)."""
+    """(point_a, point_b) 반환 - "near"는 같은 점을 두 번(원형 마스크용).
+
+    between 계열은 pose를 쓰지 않는다 - 두 참조를 각각 "로봇 최근접"으로 뽑던 것을
+    _select_object_pair의 쌍 채점으로 바꿨기 때문이다(신뢰도/게이트 폭/통과가능성을
+    같이 본다). pose 인자는 "near" 분기와 호출부 시그니처 때문에 남아 있다."""
     if point_mode == "near":
         p = _resolve_single_category_point(node, point_refs[0], pose)
         return (p, p) if p is not None else None
     if point_mode == "between":
-        pa = _resolve_single_category_point(node, point_refs[0], pose)
-        pb = _resolve_single_category_point(node, point_refs[1], pose)
-        return (pa, pb) if pa is not None and pb is not None else None
+        candidates_a = _category_candidates(node, point_refs[0])
+        candidates_b = _category_candidates(node, point_refs[1])
+        if not candidates_a or not candidates_b:
+            return None
+        label = f"'{point_refs[0]['target']}' x '{point_refs[1]['target']}'"
+        pair = _select_object_pair(node, candidates_a, candidates_b, False, label)
+        return (pair[0]["position"], pair[1]["position"]) if pair else None
     if point_mode == "between_collective":
         candidates = _category_candidates(node, point_refs[0])
         if len(candidates) < 2:
             return None
-        nearest_two = sorted(candidates, key=lambda c: _dist2(c["position"], pose))[:2]
-        return (nearest_two[0]["position"], nearest_two[1]["position"])
+        label = f"'{point_refs[0]['target']}' (collective)"
+        pair = _select_object_pair(node, candidates, candidates, True, label)
+        return (pair[0]["position"], pair[1]["position"]) if pair else None
     return None
 
 
@@ -278,6 +559,30 @@ def _resolve_point_ref(node, point_mode: str, point_refs: list[dict], pose: dict
         return None, None
     pa, pb = segment
     return tuple((a + b) / 2.0 for a, b in zip(pa, pb)), segment
+
+
+def _resolve_step_point(node, step: dict, pose: dict):
+    """step의 좌표를 정한다. between 계열은 한 번 확정하면 step에 얼려서 재사용한다.
+
+    왜: _select_step은 navigation이 시작되기 전까지 매 tick 돌고, unreachable 재시도나
+    탐사 왕복 뒤에도 다시 돈다. 매번 새로 풀면 그 사이 object_memory의 position이 EMA로
+    갱신되는 것만으로도 goal이 흔들리고, RViz의 goalN과 로봇이 실제로 향하는 곳이
+    어긋난다. (near는 매 실행의 terrain에서 접근점을 다시 고르는 것이 의도된 동작이라
+    얼리지 않는다.) step dict는 질문마다 parse_instruction이 새로 만들므로 자동으로
+    초기화된다."""
+    if step.get("point_mode") not in ("between", "between_collective"):
+        return _resolve_point_ref(node, step["point_mode"], step["point_refs"], pose)
+
+    frozen = step.get("resolved_segment")
+    if frozen is None:
+        segment = _resolve_forbidden_segment(
+            node, step["point_mode"], step["point_refs"], pose
+        )
+        if segment is None:
+            return None, None
+        frozen = step["resolved_segment"] = segment
+    pa, pb = frozen
+    return tuple((a + b) / 2.0 for a, b in zip(pa, pb)), frozen
 
 
 def _gate_segment(step: dict, segment):
@@ -327,6 +632,25 @@ def _step_categories(step: dict) -> list[str]:
     return prompts
 
 
+def _required_attributes(step: dict) -> dict[str, list[str]]:
+    """이 step에서 카테고리별로 요구되는 속성(category -> attributes).
+
+    _step_categories()와 짝을 이룬다: 저쪽이 "무엇이 보여야 하는가"라면 이쪽은
+    "그중 어떤 것이어야 하는가"다. 파서가 이미 target의 attributes와 참조 물체의
+    reference_attributes를 따로 뽑아주므로 여기서는 하나의 맵으로 합치기만 한다
+    (같은 카테고리가 양쪽에 나오면 합집합 - merge_reference_attributes와 동일 규칙)."""
+    pairs: list[tuple[str, list[str]]] = []
+    if step.get("resolve") == "category":
+        parsed = step["parsed"]
+        pairs.append((parsed.get("target", ""), parsed.get("attributes") or []))
+        pairs.extend((category, attributes) for category, attributes
+                     in (parsed.get("reference_attributes") or {}).items())
+    else:
+        pairs.extend((ref.get("target", ""), ref.get("attributes") or [])
+                     for ref in step.get("point_refs", []))
+    return merge_reference_attributes(pairs)
+
+
 # 기하로 근사할 때 "가장 먼 것"을 골라야 하는 relation. 나머지는 전부 "가장 가까운
 # 것"으로 근사한다 - near/nearest/beside는 그게 정확히 맞고, on/under/above도 XY로는
 # 가장 가까운 후보가 정답인 경우가 대부분이다. left_of/behind처럼 방향이 있는 relation은
@@ -362,6 +686,22 @@ def _best_effort_step_target(node, step: dict, pose: dict) -> tuple[tuple | None
 
     _, relation, reference_category = chain[0]
     references = node.object_memory.find_by_category(reference_category)
+    # 참조 물체의 속성 제약("closest to the **black** chair")을 먼저 건다. 통과하는
+    # 것이 하나도 없을 때만 생 후보로 degrade하고, 그 사실을 basis에 남긴다 - 예전엔
+    # 무조건 생 후보를 써서 "black을 무시했다"는 것이 로그 어디에도 안 남았다.
+    reference_attributes = _required_attributes(step).get(
+        str(reference_category).strip().lower()
+    )
+    attribute_note = ""
+    if reference_attributes and references:
+        narrowed = filter_by_attributes(node, references, reference_attributes)
+        if narrowed:
+            references = narrowed
+        else:
+            attribute_note = (
+                f" - '{' '.join(reference_attributes)}' NOT applied "
+                f"(no {reference_category} passed it)"
+            )
     reference_positions = [reference["position"] for reference in references]
     if not reference_positions:
         nearest = min(candidates, key=lambda c: _dist2(c["position"], pose))
@@ -378,15 +718,58 @@ def _best_effort_step_target(node, step: dict, pose: dict) -> tuple[tuple | None
     return (
         picked["position"],
         f"geometric '{relation} {reference_category}' over {len(candidates)} candidate(s) "
-        f"and {len(reference_positions)} reference(s), gap={math.sqrt(gap(picked)):.2f}m",
+        f"and {len(reference_positions)} reference(s), gap={math.sqrt(gap(picked)):.2f}m"
+        f"{attribute_note}",
     )
 
 
 def _missing_categories(node, step: dict) -> list[str]:
-    return [
-        category for category in _step_categories(step)
-        if not node.object_memory.find_by_category(category)
-    ]
+    """이 step을 판정하려면 무엇이 아직 관측 안 됐는가(로그용 설명 문자열 리스트).
+
+    카테고리 존재만 보면 안 된다: "go near the lamp closest to the **black** chair"에서
+    흰 식탁의자만 4개 보이는 상태를 "chair 관측됨"으로 처리하면, 검은 의자를 한 번도
+    못 봤는데도 이 가드를 그냥 통과해 _best_effort_step_target이 흰 의자를 기준으로
+    lamp를 골라버린다(실측 2026-08-25: 그래서 엉뚱한 방향으로 주행했다).
+
+    "아직 못 본 참조"와 "봤지만 속성이 안 맞는 참조"를 구분하는 것이 요점이다 -
+    전자는 더 탐사해야 하고, 폴백은 후자에만 쓰여야 한다. 속성 제약이 붙은 카테고리는
+    **그 속성을 만족하는 인스턴스가 하나라도** 있어야 관측된 것으로 친다.
+    (판정 결과는 object_memory에 캐싱되므로 매 tick 불러도 VLM 재호출은 없다.)"""
+    required = _required_attributes(step)
+    missing: list[str] = []
+    for category in _step_categories(step):
+        candidates = node.object_memory.find_by_category(category)
+        if not candidates:
+            missing.append(str(category))
+            continue
+        attributes = required.get(str(category).strip().lower())
+        if attributes and not filter_by_attributes(node, candidates, attributes):
+            missing.append(f"{' '.join(attributes)} {category}")
+    return missing
+
+
+def active_categories(node, task: dict) -> list[str] | None:
+    """지금 이 순간 판정에 실제로 필요한 카테고리(= 현재 step + 전역 금지구역 참조).
+
+    None을 돌려주면 "제한 없음"이다(mission1/2는 이 함수 자체가 없어 그렇게 동작한다).
+
+    왜: task["detection_prompts"]는 **모든 step의 합집합**이라, step 3("stop at the
+    cabinet with a picture above it")을 하는 중에도 step 1/2의 lamp·chair 저신뢰
+    검출까지 매 프레임 Gemini 재확인(perception/detection_verifier.py)에 딸려 들어갔다
+    (실측 2026-08-25: 이미 끝난 step의 물체를 계속 재검증). 호출 비용이자 그대로
+    주행 지연이다 - 지금 step이 안 쓰는 카테고리는 물어볼 이유가 없다.
+
+    금지구역 참조는 특정 step이 아니라 전체 경로에 걸리는 제약이라 항상 포함한다."""
+    steps = task.get("steps") or []
+    index = getattr(node, "mission3_step_index", 0)
+    categories: list[str] = []
+    if 0 <= index < len(steps):
+        categories.extend(_step_categories(steps[index]))
+    for forbidden in task.get("global_forbidden") or []:
+        for ref in forbidden.get("point_refs") or []:
+            categories.extend(ref.get("detection_prompts") or [])
+    # step을 아직 못 정했거나(파싱 실패) 카테고리가 하나도 안 나오면 예전처럼 전부 검증한다.
+    return list(dict.fromkeys(categories)) or None
 
 
 def _describe_forbidden(task: dict) -> str:
@@ -630,7 +1013,7 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
         )
         return
 
-    point, segment = _resolve_point_ref(node, step["point_mode"], step["point_refs"], pose)
+    point, segment = _resolve_step_point(node, step, pose)
     if point is None:
         # 참조 카테고리를 아직 못 봤다 - 계속 탐색한다.
         with node.state_lock:

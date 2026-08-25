@@ -720,6 +720,23 @@ class SysNavNode(Node):
     Image + LiDAR + Pose + Timestamp 반환
     '''
 
+    def active_detection_categories(self, task: dict) -> set[str] | None:
+        """지금 이 순간 검출 재확인(Gemini)을 걸 가치가 있는 카테고리. None이면 제한 없음.
+
+        미션 pipe가 active_categories()를 정의하고 있을 때만 좁힌다 - mission3는 step이
+        순차라 "지금 step이 안 쓰는 카테고리"가 명확하지만, mission1/2는 task 전체가 한
+        번에 유효해서 좁힐 게 없다(그쪽은 이 함수가 없어 예전 동작 그대로다)."""
+        mission_pipe = _MISSION_PIPES.get(
+            (task or {}).get("mission_type", MISSION_OBJECT_REFERENCE), mission2_pipe
+        )
+        hook = getattr(mission_pipe, "active_categories", None)
+        if hook is None:
+            return None
+        categories = hook(self, task)
+        if not categories:
+            return None
+        return {str(category).strip().lower() for category in categories}
+
     def perception_job(
         self,
         task_id: int, # 현재 처리중인 질문 번호 / worker가 어느 질문인지 확인하기 위함.
@@ -737,6 +754,10 @@ class SysNavNode(Node):
             points_sensor=points_sensor, # pointcloud -> numpy
             prompts=list(task["detection_prompts"]), #  YOLO-World가 검출해야 하는 객체 목록 -> prompts
             robot_pose=pose, # LiDAR의 객체 point를 map 좌표로 변환
+            # YOLO는 task 전체의 카테고리를 계속 검출하되(로컬이라 싸고, 지나가면서
+            # 뒤 step 물체도 memory에 쌓인다), 비싼 Gemini 재확인은 지금 판정에 실제로
+            # 필요한 카테고리로만 좁힌다.
+            verify_categories=self.active_detection_categories(task),
         )
         '''
         < self.perception.process 내부 구조 >

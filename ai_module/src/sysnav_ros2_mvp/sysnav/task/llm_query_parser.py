@@ -27,7 +27,7 @@ from rclpy.logging import get_logger
 
 from sysnav import config
 from sysnav.activity_log import LLM, activity
-from sysnav.task.query_parser import extract_target, merge_reference_attributes, singularize
+from sysnav.task.query_parser import _PRONOUNS, extract_target, merge_reference_attributes, singularize
 
 # 모든 object reference는 {category, attributes}다 - 예전엔 그냥 문자열이라
 # "the black chair"가 통째로 카테고리가 됐고, 그 문자열이 그대로 YOLO-World 프롬프트로
@@ -210,6 +210,13 @@ def normalize_llm_result(question: str, payload: dict[str, Any]) -> dict:
         reference_refs: list[dict] = []
         for reference in list(item.get("references") or []):
             normalized = _object_ref(reference)
+            # LLM이 대명사를 참조 카테고리로 그대로 내놓는 경우가 있다("the cabinet
+            # with a picture above **it**"). find_by_category("it")은 영원히 비어
+            # 있어서 그 제약은 검증도 안 되고 탐사만 늘린다 - 규칙 파서와 같은 이유로
+            # 버린다(query_parser._resolve_pronouns 주석 참고). 참조가 다 날아가면
+            # 아래 `if relation and reference_refs`가 그 constraint를 통째로 뺀다.
+            if normalized["category"] in _PRONOUNS:
+                continue
             if normalized["category"] and normalized["category"] not in [
                 existing["category"] for existing in reference_refs
             ]:

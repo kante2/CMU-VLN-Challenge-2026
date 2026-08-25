@@ -50,28 +50,59 @@ class PerceptionPipeline:
             for detection in detections
         )
 
-    def _verify_low_confidence(self, image_rgb: np.ndarray, detections: list[dict]) -> list[dict]:
-        # confidence가 DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD 밑인 것만 골라 Gemini
-        # 한 번(프레임당 1회 호출로 묶어서)에 검증하고, 확인 안 된 것만 걸러낸다. 그 이상
-        # confidence인 detection은 건드리지 않고 그대로 통과시킨다.
+    def _verify_low_confidence(
+        self,
+        image_rgb: np.ndarray,
+        detections: list[dict],
+        verify_categories: set[str] | None = None,
+    ) -> tuple[list[dict], int]:
+        """(살아남은 detection, Gemini에 안 묻고 버린 개수).
+
+        confidence가 DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD 밑인 것만 골라 Gemini
+        한 번(프레임당 1회 호출로 묶어서)에 검증하고, 확인 안 된 것만 걸러낸다. 그 이상
+        confidence인 detection은 건드리지 않고 그대로 통과시킨다.
+
+        verify_categories는 "지금 이 판정에 실제로 필요한 카테고리"다(None이면 제한 없음).
+        여기 없는 카테고리의 저신뢰 detection은 **묻지 않고 버린다**:
+          - 묻지 않는 이유 - mission3에서 task["detection_prompts"]는 모든 step의
+            합집합이라, step 3을 하는 중에 이미 끝난 step 1/2의 lamp·chair까지 매
+            프레임 재확인에 딸려 들어갔다. 호출 비용이자 그대로 주행 지연이다.
+          - 그렇다고 통과시키면 안 되는 이유 - 검증을 건너뛴 저신뢰 detection이 memory에
+            쌓이면, 나중에 그 카테고리가 정말 필요해진 step에서 검증 없이 들어온 쓰레기가
+            후보로 올라온다(이 검증기가 원래 막으려던 바로 그 오검출이다).
+        고신뢰(임계값 이상) detection은 카테고리와 무관하게 예전처럼 다 통과하므로,
+        뒤 step에서 쓸 물체도 지나가면서 그대로 memory에 쌓인다."""
         if not config.DETECTION_VERIFICATION_ENABLED:
-            return detections
+            return detections, 0
         uncertain_indices = [
             index for index, detection in enumerate(detections)
             if float(detection.get("confidence", 1.0)) < config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD
         ]
         if not uncertain_indices:
-            return detections
-        uncertain_detections = [detections[index] for index in uncertain_indices]
-        confirmed = self.detection_verifier.verify(image_rgb, uncertain_detections)
-        rejected_indices = {
-            uncertain_indices[position]
-            for position, ok in enumerate(confirmed)
-            if not ok
-        }
-        if not rejected_indices:
-            return detections
-        return [detection for index, detection in enumerate(detections) if index not in rejected_indices]
+            return detections, 0
+        if verify_categories is None:
+            ask_indices, skipped_indices = uncertain_indices, []
+        else:
+            ask_indices, skipped_indices = [], []
+            for index in uncertain_indices:
+                category = str(detections[index].get("category", "")).strip().lower()
+                (ask_indices if category in verify_categories else skipped_indices).append(index)
+
+        dropped_indices = set(skipped_indices)
+        if ask_indices:
+            confirmed = self.detection_verifier.verify(
+                image_rgb, [detections[index] for index in ask_indices]
+            )
+            dropped_indices.update(
+                ask_indices[position] for position, ok in enumerate(confirmed) if not ok
+            )
+        if not dropped_indices:
+            return detections, 0
+        survivors = [
+            detection for index, detection in enumerate(detections)
+            if index not in dropped_indices
+        ]
+        return survivors, len(skipped_indices)
 
     def process(
         self,
@@ -79,6 +110,7 @@ class PerceptionPipeline:
         points_sensor: np.ndarray,
         prompts: list[str],
         robot_pose: dict,
+        verify_categories: set[str] | None = None,
     ) -> list[dict]:
         detections = self.detector.detect(image_rgb, prompts)
         self._logger.info(
@@ -94,18 +126,26 @@ class PerceptionPipeline:
                          f"prompts={', '.join(prompts)}")
             return []
 
-        verified = self._verify_low_confidence(image_rgb, detections)
+        verified, skipped = self._verify_low_confidence(
+            image_rgb, detections, verify_categories
+        )
         if len(verified) != len(detections):
             self._logger.info(
                 f"[Perception] after confidence verification: {self._format_detections(verified)}"
             )
-        rejected = len(detections) - len(verified)
+        rejected = len(detections) - len(verified) - skipped
+        scope = (
+            "" if verify_categories is None
+            else f" | 지금 step에 필요한 {', '.join(sorted(verify_categories))}만 질의"
+        )
         activity.add(
             PERCEPTION,
-            f"② 검출 재확인 - {rejected}개 기각, {len(verified)}개 통과",
-            f"conf<{config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD:.2f}인 것만 Gemini에 물어봄"
-            if rejected or len(verified) != len(detections)
-            else f"conf<{config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD:.2f}인 검출이 없어 건너뜀",
+            f"② 검출 재확인 - {rejected}개 기각, {len(verified)}개 통과"
+            + (f", {skipped}개 무관해서 미질의" if skipped else ""),
+            (f"conf<{config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD:.2f}인 것만 Gemini에 물어봄"
+             if rejected or skipped or len(verified) != len(detections)
+             else f"conf<{config.DETECTION_VERIFICATION_CONFIDENCE_THRESHOLD:.2f}인 검출이 없어 건너뜀")
+            + scope,
         )
         detections = verified
         if not detections:
