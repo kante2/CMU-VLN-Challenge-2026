@@ -13,7 +13,7 @@ import os
 import threading
 import time
 
-from geometry_msgs.msg import Point, PointStamped, PoseStamped
+from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
@@ -297,12 +297,6 @@ class SysNavNode(Node):
         self.task_start_time: float | None = None
         self.last_response_summary: str | None = None
         self._last_dashboard_write_time = 0.0
-        # base autonomy가 우리 목표를 옮긴 정도(actual_waypoint_callback이 채운다).
-        self.last_actual_waypoint_xy: tuple[float, float] | None = None
-        self.last_waypoint_displacement_m: float | None = None
-        self._last_traced_displacement_m: float | None = None
-        # 우리가 마지막으로 waypoint를 발행한 시각. 이 직후 값만 밀림 측정에 쓴다.
-        self._last_goal_publish_time: float | None = None
         # 직전 target goal 발행이 "받아줄 지점 없음"으로 막혔는가. 막힌 채로 두면
         # 로봇에게 아무 명령도 안 가서 그냥 서 있게 되므로, 그 상태를 감지해
         # stuck timeout(20초)을 기다리지 않고 바로 unreachable로 넘긴다.
@@ -349,13 +343,6 @@ class SysNavNode(Node):
             callback_group=self.callback_group,
         )
         # base autonomy가 우리 좌표를 어디로 옮겼는지 읽기만 한다(발행 없음).
-        self.actual_waypoint_sub = self.create_subscription(
-            PointStamped,
-            config.TOPIC_ACTUAL_WAYPOINT,
-            self.actual_waypoint_callback,
-            10,
-            callback_group=self.callback_group,
-        )
         self.map_publish_timer = self.create_timer(
             config.MAP_PUBLISH_INTERVAL_SEC,
             self._publish_map_topics,
@@ -523,93 +510,6 @@ class SysNavNode(Node):
             self.terrain_monitor.update(msg)
         except Exception as error:
             self.get_logger().warning(f"terrain_map parse failed: {error}")
-
-    def actual_waypoint_callback(self, msg: PointStamped) -> None:
-        """base autonomy(waypointConverter)가 최종 확정한 목표를 받아, 우리가 요청한
-        좌표와 얼마나 떨어졌는지 기록한다. Mission 3의 확정 subgoal 주행 중에는 실제
-        좌표를 현재 목표와 marker에도 반영한다.
-
-        waypointConverter는 우리 Pose2D를 그대로 쓰지 않고 obstacleDisThre(0.75m) 조건을
-        만족하는 travArea 점으로 갈아끼운다. 그래서 "우리 planner는 A로 가라고 했는데
-        로봇은 B로 갔다"가 조용히 일어나는데, 지금까지는 그걸 볼 방법이 없었다. 여기서
-        차이를 계산해 RViz 마커와 navigation trace에 남긴다(읽기 전용, 주행에 영향 없음).
-        """
-        actual_xy = (float(msg.point.x), float(msg.point.y))
-        requested_xy = self.goal_publisher.last_requested_xy
-        self.last_actual_waypoint_xy = actual_xy
-        if requested_xy is None or not self._is_measurable_waypoint(actual_xy):
-            return
-
-        displacement = math.hypot(actual_xy[0] - requested_xy[0], actual_xy[1] - requested_xy[1])
-        self.last_waypoint_displacement_m = displacement
-        self.goal_publisher.publish_requested_marker(actual_xy=actual_xy)
-
-        # Mission 3 채점은 실제 trajectory를 보는데, 예전에는 marker/도착 판정은 요청
-        # 좌표 A를 계속 사용하고 로봇은 waypointConverter가 확정한 B로 움직였다. 그러면
-        # B에 정상 도착해도 A까지 1m 이상 남아 같은 subgoal을 무한 재발행한다.
-        #
-        # 도착 뒤 vehicle 앞 0.5m를 내보내는 projection 메시지는 위
-        # _is_measurable_waypoint()에서 이미 제외했다. 또한 탐사 waypoint가 Mission 3
-        # marker를 옮기지 않도록 확정 target 주행 상태에서만 동기화한다.
-        task = self.task
-        sync_mission3_target = (
-            task is not None
-            and task.get("mission_type") == MISSION_INSTRUCTION_FOLLOWING
-            and self.state == "MISSION3_NAVIGATE_STEP"
-            and self.current_goal is not None
-            and self.current_goal.get("type") == "target"
-        )
-        if sync_mission3_target:
-            # 물체 subgoal은 실제 waypoint가 물체 앞의 의미 있는 범위 안에 있을 때만
-            # 동기화한다. waypointConverter가 다른 통과점으로 2~3m 밀어낸 좌표까지
-            # goal marker로 채택하면 "go to pillow" marker가 pillow와 무관한 곳에 찍힌다.
-            object_xy = self.target_object_xy
-            if object_xy is not None:
-                actual_object_distance = math.hypot(
-                    actual_xy[0] - object_xy[0], actual_xy[1] - object_xy[1]
-                )
-                sync_mission3_target = (
-                    actual_object_distance <= config.MISSION3_OBJECT_APPROACH_MAX_M
-                )
-        if sync_mission3_target:
-            with self.state_lock:
-                self.target_goal_xy = actual_xy
-                self.current_goal["x"] = actual_xy[0]
-                self.current_goal["y"] = actual_xy[1]
-            self.refresh_goal_marker()
-
-        # 같은 목표에 대해 매 프레임(10Hz) 같은 내용을 남기면 trace가 쓸모없어지므로,
-        # 임계값을 넘고 직전에 남긴 값과 뚜렷이 달라졌을 때만 기록한다.
-        if displacement < config.WAYPOINT_DISPLACEMENT_WARN_M:
-            return
-        previous = self._last_traced_displacement_m
-        if previous is not None and abs(displacement - previous) < 0.10:
-            return
-        self._last_traced_displacement_m = displacement
-        self._trace_navigation(
-            "PUSHED",
-            f"requested=({requested_xy[0]:.2f},{requested_xy[1]:.2f}) "
-            f"actual=({actual_xy[0]:.2f},{actual_xy[1]:.2f}) "
-            f"displacement={displacement:.2f}m label={self.goal_publisher.last_requested_label}"
-        )
-
-    def _is_measurable_waypoint(self, actual_xy: tuple[float, float]) -> bool:
-        """이 /way_point 값이 "밀림"을 재는 데 쓸 수 있는가 (config.WAYPOINT_PROJ_DIS_M
-        주석 참고). 도달 후 projection 값과 초기값 (0,0)을 걸러낸다."""
-        if actual_xy == (0.0, 0.0):
-            return False
-        published_at = self._last_goal_publish_time
-        if published_at is None:
-            return False
-        if time.monotonic() - published_at > config.WAYPOINT_MEASURE_WINDOW_SEC:
-            return False
-        with self.sensor_lock:
-            pose = None if self.latest_pose is None else dict(self.latest_pose)
-        if pose is not None:
-            from_robot = math.hypot(actual_xy[0] - pose["x"], actual_xy[1] - pose["y"])
-            if abs(from_robot - config.WAYPOINT_PROJ_DIS_M) <= config.WAYPOINT_PROJ_TOLERANCE_M:
-                return False
-        return True
 
     def scan_callback(self, msg: PointCloud2) -> None:
         stamp = message_stamp_to_sec(msg) # ROS 메시지에는 촬영 시간이 존재, 이를 추출
@@ -1574,6 +1474,21 @@ class SysNavNode(Node):
             return False
         self._target_publish_blocked = False
         x, y = float(published.x), float(published.y)
+        if is_final:
+            # 최종 목적지 hop이면 도착 판정 기준(target_goal_xy)도 **실제로 발행한**
+            # 좌표로 맞춘다.
+            #
+            # 왜: publish()는 /terrain_map 판정에 따라 좌표를 최대 TERRAIN_SNAP_MAX_M
+            # (1m)까지 옮겨서 내보낸다. 예전엔 current_goal만 옮긴 값으로 갱신하고
+            # target_goal_xy는 원본 그대로 뒀는데, mission3의 도착 판정
+            # (_navigate_step)이 target_goal_xy를 쓴다. 그래서 로봇이 발행된 좌표 B에
+            # 정상 도착해도 원본 A까지 거리가 남아 같은 subgoal을 계속 재발행하다가
+            # MISSION3_SUBGOAL_MAX_RETRIES(20회)를 소진하고 step을 포기했다.
+            #
+            # 이 어긋남은 예전엔 base autonomy의 /way_point를 구독해서 사후에 메꿨다.
+            # 그 토픽은 README의 System Outputs 허용 목록 밖이라 제거했고, 대신 발행
+            # 시점에 우리가 아는 값으로 맞춘다 - 사후 보정보다 오히려 즉시성이 좋다.
+            self.target_goal_xy = (x, y)
         self.current_goal = {
             "x": float(x),
             "y": float(y),
@@ -2106,13 +2021,12 @@ class SysNavNode(Node):
             "mission2_exploration_complete": self.mission2_exploration_complete,
             "last_response_summary": self.last_response_summary,
             "candidate_count": candidate_count,
-            # base autonomy가 우리 목표를 얼마나 옮겼는지 - "우리 planner는 갈 수 있다고
-            # 보는데 로봇이 안 간다"를 대시보드만 보고 구분하기 위한 값.
-            "requested_waypoint_xy": self.goal_publisher.last_requested_xy,
-            "actual_waypoint_xy": self.last_actual_waypoint_xy,
-            "waypoint_displacement_m": self.last_waypoint_displacement_m,
-            # 발행 직전 스냅(Layer 1)이 좌표를 옮긴 거리. 이게 작동하면 위
-            # waypoint_displacement_m이 0에 수렴해야 한다.
+            # 원래 찍으려던 좌표와, /terrain_map으로 판정해서 **실제로 발행한** 좌표.
+            # "우리 planner는 갈 수 있다고 보는데 로봇이 안 간다"를 대시보드만 보고
+            # 구분하기 위한 값이다. 예전엔 base autonomy의 /way_point를 구독해 사후에
+            # 쟀지만, 그 토픽은 README의 허용 목록 밖이라 제거했다(config.py 주석 참고).
+            "raw_waypoint_xy": self.goal_publisher.last_raw_request_xy,
+            "published_waypoint_xy": self.goal_publisher.last_requested_xy,
             "waypoint_snap_m": self.goal_publisher.last_snap_distance_m,
             # 지도 현황 - "지금 얼마나 만들었고 아직 볼 곳이 남았는지"를 대시보드에서
             # 바로 보기 위한 것. 전부 개수 계산이라 1초 주기로 불러도 부담 없다.

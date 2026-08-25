@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import time
 
 from geometry_msgs.msg import Point, Pose2D
 from visualization_msgs.msg import Marker, MarkerArray
@@ -20,7 +19,7 @@ _MISSION3_GATE_CROSSED_COLOR = (0.1, 0.9, 0.2, 0.9)
 _MARKERS_PER_STEP = 4
 
 _REQUESTED_NAMESPACE = "requested_waypoint"
-_REQUESTED_COLOR = (0.0, 0.9, 1.0, 0.9)  # 청록 - base autonomy의 /way_point와 구분됨
+_REQUESTED_COLOR = (0.0, 0.9, 1.0, 0.9)  # 청록 - 실제로 발행한 좌표
 _DISPLACEMENT_COLOR = (1.0, 0.2, 0.2, 0.9)  # 빨강 - 밀려난 거리를 잇는 선
 
 
@@ -38,6 +37,11 @@ class GoalPublisher:
         self._goal_markers: list[Marker] = []
         # 마지막으로 요청한 좌표와 라벨. sysnav_node의 /way_point 콜백이 이걸 기준으로
         # base autonomy가 얼마나 밀어냈는지 계산한다.
+        # last_raw_request_xy: planner가 원래 찍은 좌표. last_requested_xy: /terrain_map
+        # 판정을 거쳐 **실제로 발행한** 좌표. 둘의 차이가 last_snap_distance_m이고,
+        # 예전에 base autonomy의 /way_point를 구독해서 재던 "밀림"을 대체한다
+        # (그 토픽은 README 허용 목록 밖 - config.WAYPOINT_DISPLACEMENT_WARN_M 주석 참고).
+        self.last_raw_request_xy: tuple[float, float] | None = None
         self.last_requested_xy: tuple[float, float] | None = None
         self.last_requested_label: str = "goal"
         # 발행 직전 스냅이 좌표를 옮긴 거리(None = 스냅 안 함/못 함). 대시보드 표시용.
@@ -192,10 +196,9 @@ class GoalPublisher:
         message.theta = float(theta)
         self.publisher.publish(message)
 
+        self.last_raw_request_xy = requested
         self.last_requested_xy = effective
         self.last_requested_label = label
-        # 밀림 측정 창의 기준 시각 (sysnav_node._is_measurable_waypoint).
-        self._node._last_goal_publish_time = time.monotonic()
         self.last_snap_distance_m = (
             None if snapped is None else math.dist(requested, effective)
         )
@@ -260,13 +263,20 @@ class GoalPublisher:
         marker.pose.orientation.w = 1.0
         return marker
 
-    def publish_requested_marker(self, actual_xy: tuple[float, float] | None = None) -> None:
-        """우리가 요청한 좌표를 청록 구로 그린다. base autonomy가 확정한 좌표(actual_xy)를
-        알고 있으면 그 사이를 빨간 선으로 잇고 밀려난 거리를 글자로 띄운다 - "우리 목표가
-        실제로 얼마나 옮겨졌나"를 RViz에서 한눈에 보기 위한 것이다."""
+    def publish_requested_marker(self) -> None:
+        """실제로 발행한 좌표를 청록 구로 그린다. planner가 원래 찍었던 좌표가 그것과
+        다르면 둘 사이를 빨간 선으로 잇고 옮겨진 거리를 글자로 띄운다 - "우리 목표가
+        발행 전에 얼마나 옮겨졌나"를 RViz에서 한눈에 보기 위한 것이다.
+
+        예전엔 base autonomy가 확정한 /way_point 좌표와 이어 그렸는데, 그 토픽은 README의
+        System Outputs 허용 목록 밖이라 제거했다(config.WAYPOINT_DISPLACEMENT_WARN_M 주석).
+        """
         if self.last_requested_xy is None:
             return
         x, y = self.last_requested_xy
+        raw_xy = self.last_raw_request_xy
+        if raw_xy is not None and math.dist(raw_xy, self.last_requested_xy) < 1e-6:
+            raw_xy = None
         stamp = self._node.get_clock().now().to_msg()
         markers: list[Marker] = []
 
@@ -280,28 +290,28 @@ class GoalPublisher:
         text.pose.position.x, text.pose.position.y, text.pose.position.z = x, y, 0.75
         text.scale.z = 0.22
         (text.color.r, text.color.g, text.color.b, text.color.a) = _REQUESTED_COLOR
-        text.text = f"requested ({self.last_requested_label})"
+        text.text = f"published ({self.last_requested_label})"
         markers.append(text)
 
-        if actual_xy is not None:
-            offset = math.hypot(actual_xy[0] - x, actual_xy[1] - y)
+        if raw_xy is not None:
+            offset = math.hypot(raw_xy[0] - x, raw_xy[1] - y)
             line = self._marker(2, Marker.LINE_LIST, stamp)
             line.scale.x = 0.05
             (line.color.r, line.color.g, line.color.b, line.color.a) = _DISPLACEMENT_COLOR
-            for px, py in ((x, y), actual_xy):
+            for px, py in ((x, y), raw_xy):
                 point = Point()
                 point.x, point.y, point.z = float(px), float(py), 0.2
                 line.points.append(point)
             markers.append(line)
 
             offset_text = self._marker(3, Marker.TEXT_VIEW_FACING, stamp)
-            offset_text.pose.position.x = (x + actual_xy[0]) / 2.0
-            offset_text.pose.position.y = (y + actual_xy[1]) / 2.0
+            offset_text.pose.position.x = (x + raw_xy[0]) / 2.0
+            offset_text.pose.position.y = (y + raw_xy[1]) / 2.0
             offset_text.pose.position.z = 0.45
             offset_text.scale.z = 0.22
             (offset_text.color.r, offset_text.color.g, offset_text.color.b,
              offset_text.color.a) = _DISPLACEMENT_COLOR
-            offset_text.text = f"pushed {offset:.2f}m"
+            offset_text.text = f"snapped {offset:.2f}m"
             markers.append(offset_text)
 
         self.requested_marker_pub.publish(MarkerArray(markers=markers))

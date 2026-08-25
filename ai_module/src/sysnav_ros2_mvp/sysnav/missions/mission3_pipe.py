@@ -772,6 +772,32 @@ def active_categories(node, task: dict) -> list[str] | None:
     return list(dict.fromkeys(categories)) or None
 
 
+def _mark_step_basis(node, verified: bool | None, basis: str) -> None:
+    """이 step의 목적지를 **무엇을 근거로** 정했는지 step dict에 남긴다.
+
+    verified=True  - VLM이 관계/속성까지 확인하고 후보 하나를 확정했다.
+    verified=False - 확인에 실패했지만(relation/attribute/verification pending) 관측된
+                     것만으로 기하 근사해서 커밋했다(_best_effort_step_target).
+    verified=None  - "between A and B" 같은 좌표 step. 원래 VLM 판정 대상이 아니다.
+
+    왜 필요한가: mission3의 SUCCESS는 "step 수만큼 도착했다"일 뿐이라, 관계 판정이
+    0/4로 전부 false여도 폴백이 커밋하고 그대로 3/3 SUCCESS 초록불이 떴다(실측
+    2026-08-25). 채점은 실제 궤적을 보므로 그건 점수가 아닌데 화면은 성공처럼 보인다.
+    forbidden mask를 한 번도 못 걸었을 때 이미 같은 이유로 경고를 남기고 있다
+    (_select_step) - 같은 원칙을 step 확정 근거에도 적용한다: 로그가 거짓말하지 않게."""
+    with node.state_lock:
+        task = node.task
+        steps = (task or {}).get("steps") or []
+        if 0 <= node.mission3_step_index < len(steps):
+            steps[node.mission3_step_index]["verified"] = verified
+            steps[node.mission3_step_index]["basis"] = basis
+
+
+def _unverified_step_count(task: dict) -> int:
+    """VLM 확인 없이 기하로 찍어서 커밋한 step 수(좌표 step은 세지 않는다)."""
+    return sum(1 for step in (task.get("steps") or []) if step.get("verified") is False)
+
+
 def _describe_forbidden(task: dict) -> str:
     parts = []
     for forbidden in task.get("global_forbidden", []):
@@ -841,6 +867,7 @@ def _on_selection_result(node, result: dict) -> None:
         with node.state_lock:
             node.state = "PLAN_EXPLORATION"
         return
+    _mark_step_basis(node, verified=True, basis=f"selected {selected['category']}#{selected['object_id']}")
     _start_navigate_to_point(node, pose, selected["position"], is_object_target=True)
 
 
@@ -899,6 +926,7 @@ def _resolve_pending_step(node, result: dict) -> None:
         f"🎯 step {node.mission3_step_index + 1}: VLM could not confirm ({reason}) but every "
         f"referenced object is already observed - committing now by {basis}"
     )
+    _mark_step_basis(node, verified=False, basis=f"{reason} -> {basis}")
     _start_navigate_to_point(node, pose, position, is_object_target=True)
 
 
@@ -943,8 +971,10 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
         # (2026-08-22: "avoid the path near the cabinet"인데 cabinet 미발견 -> 마스크
         # 없음 -> 그대로 SUCCESS). 채점은 그걸 감점하므로 로그가 거짓말을 하면 안 된다.
         unenforced = bool(task.get("global_forbidden")) and node.mission3_forbidden_mask is None
+        guessed = _unverified_step_count(task)
         node.last_response_summary = (
             f"{len(steps)}/{len(steps)} steps completed"
+            + (f" ({guessed} step(s) committed WITHOUT relation verification)" if guessed else "")
             + (" (avoidance constraint NOT enforced)" if unenforced else "")
         )
         with node.state_lock:
@@ -955,7 +985,13 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
                 f"({_describe_forbidden(task)} was never located) - the followed path may "
                 "pass through a forbidden area"
             )
-        else:
+        if guessed:
+            node.get_logger().warning(
+                f"🚩 ALL STEPS COMPLETE but {guessed} step(s) were committed by geometric "
+                "fallback after the VLM could not verify the relation - the objects reached "
+                "may not be the ones the instruction meant"
+            )
+        if not unenforced and not guessed:
             node.get_logger().info("🚩🏁 ALL STEPS COMPLETE (task SUCCESS)")
         return
 
@@ -1014,6 +1050,10 @@ def _select_step(node, task: dict, task_id: int, pose: dict) -> None:
         return
 
     point, segment = _resolve_step_point(node, step, pose)
+    if point is not None:
+        # 좌표 step은 애초에 VLM 관계 판정을 거치지 않는다(기하 근사가 설계다).
+        # "검증됨"으로 표시하면 안 되지만, 폴백 커밋과도 성격이 달라 따로 구분한다.
+        _mark_step_basis(node, verified=None, basis=f"geometric {step['point_mode']}")
     if point is None:
         # 참조 카테고리를 아직 못 봤다 - 계속 탐색한다.
         with node.state_lock:

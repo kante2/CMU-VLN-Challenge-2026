@@ -21,16 +21,14 @@ TOPIC_OBJECT_MARKERS = "/sysnav/object_markers"
 TOPIC_MISSION3_GOAL_MARKERS = "/sysnav/mission3_goal_markers"
 # base autonomy(waypointConverter)는 우리가 보낸 좌표를 그대로 쓰지 않는다 -
 # obstacleDisThre(0.75m) 안에 장애물이 있는 지점은 후보에서 빼고, 남은 travArea 점 중
-# 하나로 목표를 갈아끼운다(waypointConverter.cpp의 waypointAdj 분기). 우리가 "원한" 좌표는
-# Pose2D(header 없음)라 RViz에 못 띄우므로, 같은 좌표를 Marker로 한 번 더 내보내서
-# base autonomy가 실제로 향하는 /way_point와 나란히 비교할 수 있게 한다.
+# 하나로 목표를 갈아끼운다(waypointConverter.cpp의 waypointAdj 분기). 그래서 우리가
+# /terrain_map으로 먼저 같은 판정을 해서 옮겨 보낸다. 원래 찍으려던 좌표와 실제로 발행한
+# 좌표는 Pose2D(header 없음)라 RViz에 못 띄우므로, 둘을 Marker로 한 번 더 내보내서
+# "우리 목표가 발행 전에 얼마나 옮겨졌나"를 눈으로 확인한다.
 TOPIC_REQUESTED_WAYPOINT = "/sysnav/requested_waypoint"
-# waypointConverter가 최종 확정한 목표(PointStamped). 우리가 구독해서 위 요청 좌표와의
-# 차이를 계산/기록한다 - 읽기 전용이며 base autonomy 동작에는 영향을 주지 않는다.
-TOPIC_ACTUAL_WAYPOINT = "/way_point"
 # 우리 planner가 실제로 보고 있는 지도/경로를 RViz에서 base autonomy 것과 겹쳐 보기
 # 위한 발행 전용 토픽들. PNG(exploration_debug_latest.png)로도 보지만, 그건 별도 창이라
-# /registered_scan, /terrain_map, /way_point와 같은 좌표계에 겹쳐볼 수가 없다.
+# /registered_scan, /terrain_map과 같은 좌표계에 겹쳐볼 수가 없다.
 # occupancy grid의 셀 값(OCC_UNKNOWN/-1, OCC_FREE/0, OCC_OCCUPIED/100)은 이미
 # nav_msgs/OccupancyGrid 규약과 같아서 그대로 내보내면 된다.
 TOPIC_SYSNAV_OCCUPANCY = "/sysnav/occupancy_grid"
@@ -38,17 +36,16 @@ TOPIC_SYSNAV_PATH = "/sysnav/planned_path"
 TOPIC_SYSNAV_FRONTIER = "/sysnav/frontier"
 # 지도 발행 주기(초). 300x300 int8 = 90KB라 1Hz면 부담이 없다.
 MAP_PUBLISH_INTERVAL_SEC = 1.0
-# 요청 좌표와 실제 목표가 이만큼 넘게 벌어지면 "밀려났다"고 보고 로그/추적에 남긴다.
+# 원래 찍으려던 좌표에서 이만큼 넘게 옮겨서 발행하면 "밀려났다"고 보고 로그/추적에 남긴다.
+#
+# 이력: 예전엔 base autonomy가 발행하는 /way_point를 구독해서 "실제로 얼마나 밀렸나"를
+# 사후에 쟀다. 그런데 README의 System Outputs 표(테스트 때 사용 가능한 토픽 6개)에
+# /way_point는 없고, 표 아래에 "these are the only ones allowed to be used during test
+# time"이라고 명시돼 있어 규정 위반이었다. 지금은 발행 **전에** 우리가 /terrain_map으로
+# 직접 계산한 스냅 거리(goal_publisher.last_snap_distance_m)를 같은 용도로 쓴다 -
+# /terrain_map은 표에 있는 허용 토픽이고, waypointConverter가 판정에 쓰는 것과 같은
+# 데이터라 예측이 사후 측정과 사실상 같은 값을 준다(navigation/terrain_monitor.py).
 WAYPOINT_DISPLACEMENT_WARN_M = 0.30
-# /way_point에는 "밀림"이 아닌 값이 섞여 들어온다. 그대로 세면 통계가 망가진다:
-#   1. waypointConverter가 목표에 도달하면(waypointReached) /way_point를 "차량 앞
-#      waypointProjDis(0.5m)" 지점으로 계속 재발행한다 - 이건 밀어낸 게 아니다.
-#   2. 첫 waypoint를 받기 전 초기값 (0,0)이 나온다 (실측 trace에서 389건 중 99건).
-# 그래서 (1)은 로봇에서 0.5m±tolerance면 제외하고, (2)는 정확히 (0,0)이면 제외하며,
-# 우리가 발행한 직후 WAYPOINT_MEASURE_WINDOW_SEC 안의 값만 센다.
-WAYPOINT_PROJ_DIS_M = 0.5
-WAYPOINT_PROJ_TOLERANCE_M = 0.15
-WAYPOINT_MEASURE_WINDOW_SEC = 2.0
 # 채점 대상 토픽(README) - Object Reference: 이 두 개는 절대 이름/타입을 바꾸지 말 것
 # (Marker 단수, MarkerArray 아님 - CLAUDE.md의 하드-런 규칙).
 TOPIC_SELECTED_OBJECT_MARKER = "/selected_object_marker"

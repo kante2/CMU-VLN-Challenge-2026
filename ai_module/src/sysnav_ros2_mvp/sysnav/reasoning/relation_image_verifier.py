@@ -39,6 +39,16 @@ from sysnav.activity_log import LLM, activity
 from sysnav.llm_trace import llm_trace
 
 
+# relation 단어를 그대로 넣으면 영어 문장이 안 되는 것들. 주어는 항상 후보(source)다.
+_RELATION_PHRASE = {
+    "supports": "supporting (i.e. has it resting on top)",
+    "nearest": "the closest one to",
+    "closest": "the closest one to",
+    "farthest": "the farthest one from",
+    "furthest": "the farthest one from",
+}
+
+
 class RelationImageVerifier:
     def __init__(self) -> None:
         self.api_key = os.getenv("GEMINI_API_KEY")
@@ -87,10 +97,23 @@ class RelationImageVerifier:
     def _version(candidate: dict) -> int:
         return int(candidate.get("image_version", 0))
 
+    @staticmethod
+    def _phrase(relation: str) -> str:
+        """relation을 "후보(source)가 주어"인 영어 구로 만든다.
+
+        relation chain은 (source, relation, reference)이고 "source가 reference에 대해
+        relation이다"로 읽는다 - "cabinet under picture" = 캐비닛이 그림 **아래**.
+        그대로 단어만 바꿔 쓰면 어색해지는 것들만 여기서 다듬는다."""
+        return _RELATION_PHRASE.get(str(relation), str(relation).replace("_", " "))
+
     @classmethod
     def _verify_key(cls, candidate: dict, relation: str, reference_category: str) -> str:
-        """후보 하나짜리 판정의 캐시 키. 그 후보의 사진이 바뀌면 키가 바뀐다."""
-        return f"verify|{relation}|{reference_category}|v{cls._version(candidate)}"
+        """후보 하나짜리 판정의 캐시 키. 그 후보의 사진이 바뀌면 키가 바뀐다.
+
+        접두사가 verify2인 이유: verify1 시절의 프롬프트는 관계를 **거꾸로** 물었다
+        (verify()의 프롬프트 주석 참고). 그때 적립된 판정은 전부 틀린 질문의 답이므로 키를
+        바꿔서 통째로 무효화한다."""
+        return f"verify2|{relation}|{reference_category}|v{cls._version(candidate)}"
 
     @classmethod
     def _rank_key(cls, usable: list[dict], relation: str, reference_category: str) -> str:
@@ -149,10 +172,18 @@ class RelationImageVerifier:
             self._load()
             from google.genai import types
 
-            relation_phrase = str(relation).replace("_", " ")
+            relation_phrase = self._phrase(relation)
             contents: list[object] = [
-                f"For each image below, decide whether a {reference_category} is visibly "
-                f"{relation_phrase} the object shown in that same image (the object may be "
+                # 주어는 **후보 물체**여야 한다. 예전엔 "a {reference} is {relation} the
+                # object shown"이라고 물었는데, 체인이 (cabinet, under, picture)일 때
+                # 그 문장은 "picture가 cabinet **아래** 보이는가"가 되어 정확히 반대를
+                # 물었다(실측 2026-08-25: 정답 쌍인데 Gemini가 전부 false를 냈고, 그게
+                # 그 질문에 대해서는 맞는 답이었다). near/between은 대칭이라 우연히
+                # 무사했지만 on/under/above/behind/in_front_of/supports는 전부 뒤집혀
+                # 있었다. 기하 판정(spatial_relation_reasoner._geometry_check)은 처음부터
+                # source 기준이라, 이제 두 경로가 같은 방향을 본다.
+                f"For each image below, decide whether the object shown in that image is "
+                f"visibly {relation_phrase} a {reference_category} (the object may be "
                 "partially cropped/centered in the frame; the reference, if present, would "
                 "appear elsewhere in the same photo). Judge each image independently, purely "
                 "from what's visible in it - do not guess if it's not visible.\n"
@@ -210,7 +241,7 @@ class RelationImageVerifier:
                 results[object_id] = {key: holds[object_id]}
             llm_trace.record(
                 kind="관계 이미지 검증",
-                question=f"각 사진에 {reference_category}이(가) {relation_phrase} 보이는가",
+                question=f"각 사진의 물체가 '{relation_phrase} {reference_category}'인가",
                 images=self._traced_images(usable),
                 verdicts=[
                     (

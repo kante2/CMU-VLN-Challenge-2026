@@ -16,6 +16,14 @@
 실행 (sysnav 컨테이너 안):
     python3 /home/docker/ai_module/src/sysnav_ros2_mvp/tools/measure_waypoint_push.py
 Ctrl-C로 끝내면 요약이 나오고 ai_module/debug/waypoint_push_report.txt로도 저장된다.
+
+
+⚠️  개발 전용. 이 스크립트는 /way_point를 구독하는데, 그 토픽은 README의
+System Outputs 표(테스트 때 사용 가능한 토픽)에 없다. 규정은 개발 중에는
+시뮬레이터가 주는 무엇이든 써도 된다고 하지만("During training/development,
+you are free to use whatever information the system simulator provides"),
+테스트 때는 안 된다. launch에 물리지 말고 손으로만 돌릴 것.
+sysnav 런타임에서는 /way_point 구독을 제거했다(tests/test_allowed_topics.py).
 """
 
 from __future__ import annotations

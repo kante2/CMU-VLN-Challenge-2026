@@ -106,14 +106,26 @@ def _plan_list_html(steps: list[dict], current_index: int) -> str:
     items = []
     for index, step in enumerate(steps):
         if index < current_index:
-            marker, color = "✓", "#15803d"  # done
+            # 도착했다고 다 같은 ✓가 아니다. VLM이 관계까지 확인하고 고른 step과,
+            # 확인에 실패해서 기하로 찍은 step(_best_effort_step_target)을 구분한다 -
+            # 예전엔 둘 다 초록 ✓라 "판정 0/4 false인데 3/3 SUCCESS"가 화면상
+            # 정상으로 보였다(missions/mission3_pipe._mark_step_basis 주석 참고).
+            if step.get("verified") is False:
+                marker, color = "≈", "#b45309"  # 기하 폴백으로 커밋 - 확인 안 됨
+            else:
+                marker, color = "✓", "#15803d"  # done
         elif index == current_index:
             marker, color = "▶", "#2563eb"  # in progress
         else:
             marker, color = "○", "#9ca3af"  # pending
+        basis = step.get("basis")
+        detail = (
+            f' <span style="color:#9ca3af;font-size:11px;">({_esc(str(basis))})</span>'
+            if basis and index < current_index else ""
+        )
         items.append(
             f'<li style="color:{color};margin-bottom:2px;">{marker} '
-            f'{_esc(_describe_step(step))}</li>'
+            f'{_esc(_describe_step(step))}{detail}</li>'
         )
     return f'<ol style="margin:2px 0 0 -18px;padding:0;list-style:none;">{"".join(items)}</ol>'
 
@@ -521,22 +533,28 @@ def export_mission_dashboard(snapshot: dict) -> str | None:
     goal = snapshot.get("current_goal")
     if goal:
         rows.append(_row("Current goal", f"({goal.get('x', 0):.2f}, {goal.get('y', 0):.2f}) type={goal.get('type', '-')}"))
-    # base autonomy(waypointConverter)가 우리 좌표를 obstacleDisThre(0.75m) 조건에 맞는
-    # 지점으로 갈아끼운 정도. 값이 크면 "우리가 찍은 곳으로는 애초에 갈 수 없다"는 뜻이라,
-    # planner를 의심할지 좌표 실행 가능성을 의심할지 여기서 바로 갈린다.
-    requested = snapshot.get("requested_waypoint_xy")
-    actual = snapshot.get("actual_waypoint_xy")
-    displacement = snapshot.get("waypoint_displacement_m")
+    # planner가 찍은 좌표를 /terrain_map 판정으로 옮겨서 발행한 정도. 값이 크면
+    # "우리가 찍은 곳으로는 애초에 갈 수 없다"는 뜻이라, planner를 의심할지 좌표
+    # 실행 가능성을 의심할지 여기서 바로 갈린다.
+    #
+    # 예전엔 base autonomy의 /way_point를 구독해 "실제로 얼마나 밀렸나"를 한 줄 더
+    # 보여줬는데, 그 토픽은 README의 System Outputs 허용 목록 밖이라 제거했다.
+    # waypointConverter가 판정에 쓰는 것과 같은 /terrain_map으로 우리가 먼저 옮기므로,
+    # 이 값이 사실상 같은 정보를 준다(config.WAYPOINT_DISPLACEMENT_WARN_M 주석 참고).
+    raw = snapshot.get("raw_waypoint_xy")
+    published = snapshot.get("published_waypoint_xy")
     snap = snapshot.get("waypoint_snap_m")
     if snap is not None:
-        rows.append(_row("Waypoint snapped before publish (Layer 1)", f"{snap:.2f} m"))
-    if requested and actual and displacement is not None:
-        warn = " style=\"color:#c0392b;font-weight:bold\"" if displacement >= config.WAYPOINT_DISPLACEMENT_WARN_M else ""
+        warn = " style=\"color:#c0392b;font-weight:bold\"" if snap >= config.WAYPOINT_DISPLACEMENT_WARN_M else ""
+        detail = ""
+        if raw and published:
+            detail = (
+                f" &nbsp; ours=({raw[0]:.2f}, {raw[1]:.2f})"
+                f" &rarr; published=({published[0]:.2f}, {published[1]:.2f})"
+            )
         rows.append(_row(
-            "Waypoint pushed by base autonomy",
-            f"<span{warn}>{displacement:.2f} m</span>"
-            f" &nbsp; ours=({requested[0]:.2f}, {requested[1]:.2f})"
-            f" &rarr; actual=({actual[0]:.2f}, {actual[1]:.2f})",
+            "Waypoint snapped before publish (Layer 1)",
+            f"<span{warn}>{snap:.2f} m</span>{detail}",
         ))
 
     # 판정이 끝났으면 자동 새로고침을 멈춘다. 로그를 내려서 읽으려는데 페이지가
