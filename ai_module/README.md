@@ -21,11 +21,14 @@ docker pull kante2/cmu-vln-2026-sysnav:submission-v2
 
 ---
 
-## 1. Prepare the `.env` File — **API key is provided separately**
+## 1. Prepare the `.env` File — **API Key Provided Separately**
 
-`sysnav` uses the Google Gemini API for query parsing and candidate selection. Since the key is not committed to the repository
-(`.gitignore` includes `ai_module/.env`), the **API key should be sent through the designated channel** by the organizers.
-After that, create the `.env` file with the script below and fill in the provided key.
+`sysnav` uses the Google Gemini API for query parsing and candidate selection.
+
+The API key is provided in the Submission Form.
+
+After obtaining the key, create the `.env` file using the script below:
+
 
 ```bash
 cd ~/CMU-VLN-Challenge-2026
@@ -42,11 +45,6 @@ Run this from the repository root.
 cd ~/CMU-VLN-Challenge-2026/docker
 xhost +
 docker compose -f compose_gpu.yml up --build -d system sysnav_module
-```
-
-기존 컨테이너가 이미 있으면 (Exited 상태 등):s
-```bash
-docker start iros2026_system iros2026_sysnav_module
 ```
 
 ---
