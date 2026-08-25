@@ -11,5 +11,8 @@ ai_module/.env
 # debug outputs / backups / archives
 ai_module/debug/
 /map/
+/build/
+/install/
+/log/
 *.bak_*/
 *.zip
