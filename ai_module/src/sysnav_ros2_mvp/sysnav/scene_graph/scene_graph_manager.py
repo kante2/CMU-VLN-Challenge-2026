@@ -18,11 +18,13 @@ from __future__ import annotations
 import copy
 from datetime import datetime, timezone
 from pathlib import Path
+import tempfile
 import threading
 import time
 
 import cv2
 import numpy as np
+from rclpy.logging import get_logger
 
 from sysnav import config
 from sysnav.reasoning.spatial_relation_reasoner import SpatialRelationReasoner
@@ -53,7 +55,11 @@ class SceneGraphManager:
         self._visualizer = SceneGraphVisualizer(debug_dir)
         self._relation_reasoner = SpatialRelationReasoner()
         self._coverage_builder = ViewpointCoverageBuilder()
+        self._logger = get_logger("sysnav_scene_graph")
         self._viewpoint_image_dir = Path(debug_dir) / "scene_graph_viewpoints"
+        # 쓰기 불가로 임시 경로에 전환했는지. 매 프레임 같은 실패를 반복 로그하지 않기 위한 래치.
+        self._viewpoint_image_dir_switched = False
+        self._viewpoint_image_read_failed = False
         self._safe_export()
 
     def clear(self) -> None:
@@ -593,14 +599,22 @@ class SceneGraphManager:
             for source_category, _, target_category in chain
         )
 
-    @staticmethod
-    def _load_viewpoint_image(image_path: str | None) -> np.ndarray:
+    def _load_viewpoint_image(self, image_path: str | None) -> np.ndarray:
         if image_path:
             image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if image_bgr is not None:
                 return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        # Geometry fallback does not require pixels. The tiny image also keeps the
-        # reasoner interface stable when image export is disabled.
+            # 경로가 있는데 못 읽었다면 실제 이상이다. 아래 1x1 이미지를 그대로
+            # 관계 검증에 넘기면 VLM 이 빈 화면을 보고 판정하게 되므로 반드시 알린다.
+            if not self._viewpoint_image_read_failed:
+                self._viewpoint_image_read_failed = True
+                self._logger.error(
+                    f"viewpoint 이미지를 읽지 못했습니다: {image_path}. "
+                    f"이미지 기반 관계 검증이 기하 판정으로만 동작합니다."
+                )
+        # image_path 가 애초에 없는 경우(SYSNAV_SCENE_GRAPH_SAVE_IMAGES=0)는 의도된
+        # 기하 전용 동작이라 조용히 넘어간다. 1x1 이미지는 reasoner 인터페이스를
+        # 유지하기 위한 자리표시자다.
         return np.zeros((1, 1, 3), dtype=np.uint8)
 
     def _add_object_relation_edge(self, viewpoint_id: int, edge: dict) -> bool:
@@ -680,22 +694,72 @@ class SceneGraphManager:
             },
         }
 
+    def _write_viewpoint_jpeg(
+        self, directory: Path, viewpoint_id: int, image_bgr: np.ndarray
+    ) -> tuple[str | None, str]:
+        """(경로, 실패사유). 성공하면 사유는 빈 문자열."""
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"viewpoint_{viewpoint_id:06d}.jpg"
+            if not cv2.imwrite(str(path), image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88]):
+                return None, "cv2.imwrite가 False를 반환"
+            return str(path), ""
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
     def _save_viewpoint_image(self, viewpoint_id: int, image_rgb: np.ndarray) -> str | None:
+        """viewpoint 파노라마를 디스크에 캐시하고 경로를 돌려준다.
+
+        이 이미지는 진단용이 아니라 **파이프라인 입력**이다. 나중에 관계 검증
+        (_load_viewpoint_image -> relation_image_verifier)과 VLM 카운팅(vlm_counter)이
+        경로로 다시 읽어간다. 그래서 저장 실패를 조용히 넘기면 안 된다 - 예전에는
+        `except Exception: return None` 으로 삼켜서, DEBUG_DIR 이 쓰기 불가일 때
+        (예: 호스트 폴더를 bind mount 했는데 소유자가 컨테이너 유저와 다를 때)
+        image_path 가 계속 None 이 되고 _load_viewpoint_image 가 1x1 검은 이미지를
+        돌려줘, 노드는 멀쩡히 돌면서 관계 검증과 카운팅만 조용히 망가졌다.
+
+        그래서 여기서는 (1) 실패를 반드시 로그로 남기고, (2) 한 번에 한해 확실히
+        쓸 수 있는 임시 디렉터리로 전환해서 파이프라인을 계속 살린다. 반환값이
+        여전히 실제 파일 경로이므로 이걸 읽는 다른 코드는 손댈 필요가 없다.
+        """
         if (
             not config.SCENE_GRAPH_SAVE_VIEWPOINT_IMAGES
             or not isinstance(image_rgb, np.ndarray)
             or not image_rgb.size
         ):
             return None
+
         try:
-            self._viewpoint_image_dir.mkdir(parents=True, exist_ok=True)
-            path = self._viewpoint_image_dir / f"viewpoint_{viewpoint_id:06d}.jpg"
             image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-            if not cv2.imwrite(str(path), image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88]):
-                return None
-            return str(path)
-        except Exception:
+        except Exception as exc:
+            self._logger.error(f"viewpoint {viewpoint_id} 이미지 변환 실패: {exc}")
             return None
+
+        path, reason = self._write_viewpoint_jpeg(
+            self._viewpoint_image_dir, viewpoint_id, image_bgr
+        )
+        if path is not None:
+            return path
+
+        if self._viewpoint_image_dir_switched:
+            # 이미 임시 경로로 옮겼는데도 실패. 여기까지 오면 손쓸 방법이 없다.
+            self._logger.error(
+                f"viewpoint {viewpoint_id} 이미지 저장 실패 ({self._viewpoint_image_dir}): {reason}"
+            )
+            return None
+
+        self._viewpoint_image_dir_switched = True
+        fallback = Path(tempfile.gettempdir()) / "sysnav_scene_graph_viewpoints"
+        self._logger.error(
+            f"viewpoint 이미지 디렉터리에 쓸 수 없습니다: {self._viewpoint_image_dir} ({reason}). "
+            f"{fallback} 로 전환합니다. 이 경로는 컨테이너 내부라 재시작하면 사라지지만, "
+            f"관계 검증과 VLM 카운팅이 이미지를 필요로 하므로 계속 진행합니다."
+        )
+        self._viewpoint_image_dir = fallback
+        path, reason = self._write_viewpoint_jpeg(fallback, viewpoint_id, image_bgr)
+        if path is None:
+            self._logger.error(f"임시 경로에도 저장 실패 ({fallback}): {reason}")
+        return path
 
     def _snapshot_locked(self) -> dict:
         return {
