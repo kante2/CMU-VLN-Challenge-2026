@@ -4,4 +4,4 @@
 
 set -e
 
-docker exec -it iros2026_system bash -c "/home/docker/autonomy_stack_mecanum_wheel_platform/system_simulation.sh"
+docker exec -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp -it iros2026_system bash -c "/home/docker/autonomy_stack_mecanum_wheel_platform/system_simulation.sh"

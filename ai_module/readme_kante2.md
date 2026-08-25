@@ -1,3 +1,7 @@
+> **주의**: 저장소 루트의 `docker/` 는 대회 원본이라 수정 금지 (규정).
+> 우리 팀 compose 파일과 실행 스크립트는 전부 `ai_module/docker/` 에 있다.
+> 아래 경로는 전부 레포 루트 기준.
+
 
 ## 빠른 실행 — sh 스크립트 3개 (2026-08-10 추가)
 
@@ -5,15 +9,15 @@
 열고 각각 아래 스크립트만 실행하면 됨 (전부 `docker exec -it`로 컨테이너 안까지 들어가서
 소싱까지 자동으로 함).
 
-- **터미널 A** — 시뮬레이터: `./docker/A_시뮬레이터.sh`
-  (씬을 바꿔서 켜고 싶으면 대신 `./docker/run_scene.sh <씬이름>`, 예: `./docker/run_scene.sh hotel_room_1`)
-- **터미널 B** — sysnav 노드 실행: `./docker/B_sysnav_실행.sh`
+- **터미널 A** — 시뮬레이터: `./ai_module/docker/A_시뮬레이터.sh`
+  (씬을 바꿔서 켜고 싶으면 대신 `./ai_module/docker/run_scene.sh <씬이름>`, 예: `./ai_module/docker/run_scene.sh hotel_room_1`)
+- **터미널 B** — sysnav 노드 실행: `./ai_module/docker/B_sysnav_실행.sh`
   (컨테이너 안에서 `colcon build --symlink-install --packages-select sysnav`로 재빌드까지 하고
   나서 `ros2 launch sysnav sysnav.launch.py` 실행 - 호스트에서 src 고친 뒤에도 그냥 이거 한 번이면 됨)
-- **터미널 C** — 질의: `./docker/C_질의.sh`
+- **터미널 C** — 질의: `./ai_module/docker/C_질의.sh`
   (컨테이너 접속 + ROS2 소싱까지만 자동으로 해주고 셸을 넘겨줌 — `ros2 topic pub` 명령은 직접 입력.
   예: `ros2 topic pub --once /challenge_question std_msgs/msg/String "{data: 'Find the bowl near the trash can.'}"`)
-- **대시보드 확인** (호스트에서, 컨테이너 밖): `./docker/ui_checker.sh`
+- **대시보드 확인** (호스트에서, 컨테이너 밖): `./ai_module/docker/ui_checker.sh`
 
 # sysnav_ros2_mvp 실행 방법 (2026-07-21)
 
@@ -37,7 +41,7 @@ confidence/거리 기반 fallback으로만 동작함 (에러는 안 남).
 ## 1. 컨테이너 빌드 & 기동
 
 ```bash
-cd /home/kante/CMU-VLN-Challenge-2026/docker
+cd /home/kante/CMU-VLN-Challenge-2026/ai_module/docker
 xhost +
 docker compose -f compose_gpu.yml up --build -d system sysnav_module
 ```
@@ -67,12 +71,7 @@ pkill -9 -f joy_node
 pkill -9 -f default_server_endpoint
 
 ## ----------------------코드 수정후 재빌드----------------------------
-docker exec -it iros2026_sysnav_module bash
-source /opt/ros/jazzy/setup.bash
-cd /home/docker/ai_module
-colcon build --symlink-install --packages-select sysnav
-source install/setup.bash
-ros2 launch sysnav sysnav.launch.py
+
 
 
 ## ----------------------명령어 요약--------------------
@@ -82,9 +81,9 @@ docker exec -it iros2026_system bash
 /home/docker/autonomy_stack_mecanum_wheel_platform/system_simulation.sh
 
 or
-./docker/run_scene.sh <씬이름>
-# 예: ./docker/run_scene.sh office_2
-# 예: ./docker/run_scene.sh home_building_1
+./ai_module/docker/run_scene.sh <씬이름>
+# 예: ./ai_module/docker/run_scene.sh office_2
+# 예: ./ai_module/docker/run_scene.sh home_building_1
 
 
 터미널 B — sysnav 실행 (컨테이너 재시작됐으니 새로 exec)
@@ -92,7 +91,10 @@ or
 
 docker exec -it iros2026_sysnav_module bash
 source /opt/ros/jazzy/setup.bash
-source /home/docker/ai_module/install/setup.bash
+rm -rf build/ install/ log/
+cd /home/docker/ai_module
+colcon build --symlink-install --packages-select sysnav
+source install/setup.bash
 ros2 launch sysnav sysnav.launch.py
 
 터미널 C — 질의
@@ -116,9 +118,9 @@ ros2 topic pub --once /challenge_question std_msgs/msg/String \
 
 ## --------------------------------------------------
 ## A - 시뮬레이션 킬때, 방을 변경하고 싶으면 다음 sh을 실행 
-./docker/run_scene.sh home_building_1
+./ai_module/docker/run_scene.sh home_building_1
 
-./docker/run_scene.sh hotel_room_1
+./ai_module/docker/run_scene.sh hotel_room_1
 
 <위 실행 이전에 , 세팅 방법>
 맵 zip 파일을 map/ 폴더에 넣기
@@ -130,13 +132,13 @@ ros2 topic pub --once /challenge_question std_msgs/msg/String \
 컨테이너 실행/최신화 (한 번만, 이미 떠있으면 생략)
 
 
-docker compose -f docker/compose_gpu.yml up -d system   # GPU 없으면 compose.yml
+docker compose -f ai_module/docker/compose_gpu.yml up -d system   # GPU 없으면 compose.yml
 map/ 폴더가 컨테이너 안 /home/docker/maps로 마운트되게 compose 파일에 이미 설정해놨어서, 이 명령 한 번이면 zip이 컨테이너에서 바로 보임.
 
 실행
 
-./docker/run_scene.sh <씬이름>
-예: ./docker/run_scene.sh office_2
+./ai_module/docker/run_scene.sh <씬이름>
+예: ./ai_module/docker/run_scene.sh office_2
 
 
 ## --------------------------------------------------
@@ -227,7 +229,7 @@ ros2 topic pub --once /challenge_question std_msgs/msg/String \
 segmentation mask + 3D position 텍스트) 오버레이 이미지를 `ai_module/debug/sysnav_detect_*.jpg`로
 저장함 (`sysnav/perception/debug_visualize.py`의 `save_debug_image()`).
 - 끄고 싶으면 `.env`에 `SYSNAV_SAVE_DEBUG_IMAGES=0` 추가.
-- `compose_gpu.yml`의 `sysnav_module`에 `../ai_module/debug:/home/docker/ai_module/debug` 마운트
+- `compose_gpu.yml`의 `sysnav_module`에 `../debug:/home/docker/ai_module/debug` 마운트
   추가함 (기존엔 `src`만 마운트되어 있었음). **컨테이너를 새로 만들어야 반영됨**
   (`docker compose -f compose_gpu.yml up -d --force-recreate sysnav_module`).
 - 컨테이너 uid(1001)가 호스트(kante, uid 1000) 소유 폴더에 쓸 수 있어야 해서 ACL 추가함

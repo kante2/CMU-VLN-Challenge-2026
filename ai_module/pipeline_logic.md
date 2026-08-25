@@ -32,7 +32,7 @@ question_callback ──▶ mission_classifier로 미션 타입 결정 ──▶
 ```
 
 디버깅용 실시간 대시보드: `ai_module/debug/mission_status_latest.html`
-(`docker/ui_checker.sh`로 열기, `mission_dashboard.py`가 매 사이클 갱신).
+(`ai_module/docker/ui_checker.sh`로 열기, `mission_dashboard.py`가 매 사이클 갱신).
 
 ---
 
@@ -196,7 +196,7 @@ Anchor는 `viewpoint_memory.is_near_visited()` 예외 대상(문 통과용)인�
 
 ## 10. 디버깅 도구
 
-- **`ai_module/debug/mission_status_latest.html`** — 실시간 대시보드(`mission_dashboard.py`, 1초 갱신). 현재 미션/state, 10분 타임리밋 진행바, 미션별 상세(Numerical: 후보 수, Object Reference: 선택된 물체, Instruction-Following: 전체 plan + 진행 상태 + parser 종류), 마지막 발행값. `./docker/ui_checker.sh`로 열기.
+- **`ai_module/debug/mission_status_latest.html`** — 실시간 대시보드(`mission_dashboard.py`, 1초 갱신). 현재 미션/state, 10분 타임리밋 진행바, 미션별 상세(Numerical: 후보 수, Object Reference: 선택된 물체, Instruction-Following: 전체 plan + 진행 상태 + parser 종류), 마지막 발행값. `./ai_module/docker/ui_checker.sh`로 열기.
 - **`ai_module/debug/scene_graph_latest.png/.json/.dot`** — Viewpoint/Object 그래프.
 - **`ai_module/debug/exploration_debug_latest.png`** — surface point(frontier) + 로봇 위치.
 - **`ai_module/debug/sysnav_relation_check.txt`** — 관계 검증 시도 전부(통과/실패 포함) 기록.

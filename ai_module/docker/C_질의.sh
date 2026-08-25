@@ -5,4 +5,4 @@
 
 set -e
 
-docker exec -it iros2026_sysnav_module bash -c "source /opt/ros/jazzy/setup.bash && exec bash"
+docker exec -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp -it iros2026_sysnav_module bash -c "source /opt/ros/jazzy/setup.bash && exec bash"

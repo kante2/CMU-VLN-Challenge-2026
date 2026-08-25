@@ -1,6 +1,6 @@
 #!/bin/bash
 # 터미널 D — 미션 상태 대시보드 (호스트에서 브라우저로 열기, 컨테이너 접속 아님)
-# 사용법: ./ui_checker.sh
+# 사용법: ./ai_module/docker/ui_checker.sh
 #
 # 대시보드에 있는 것:
 #   - 현재 상태/미션/경과시간, 로봇 위치와 목표
@@ -12,8 +12,8 @@
 
 set -e
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DASHBOARD_PATH="$REPO_ROOT/ai_module/debug/mission_status_latest.html"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DASHBOARD_PATH="$SCRIPT_DIR/../debug/mission_status_latest.html"
 WAIT_SEC="${WAIT_SEC:-60}"
 
 if [ ! -f "$DASHBOARD_PATH" ]; then

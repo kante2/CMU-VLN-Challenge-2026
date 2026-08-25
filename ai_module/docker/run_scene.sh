@@ -2,7 +2,7 @@
 # 씬(맵)을 골라서 iros2026_system 컨테이너의 시뮬레이션을 실행.
 #
 # 사용법:
-#   ./docker/run_scene.sh <scene_name> [launch_script]
+#   ./ai_module/docker/run_scene.sh <scene_name> [launch_script]
 #
 #   scene_name    : map/<scene_name>.zip 의 이름 (예: home_building_1, hotel_room_1)
 #   launch_script : autonomy_stack_mecanum_wheel_platform/ 안의 실행 스크립트.
@@ -15,7 +15,7 @@
 #   3. 이전에 떠있던 시뮬레이션 프로세스 정리
 #   4. launch_script 실행
 #
-# map/ 폴더는 docker-compose.yml / docker-compose_gpu.yml 에서
+# map/ 폴더는 ai_module/docker/compose.yml / compose_gpu.yml 에서
 # /home/docker/maps 로 읽기전용 마운트되어 있어야 함.
 
 set -euo pipefail
@@ -25,7 +25,7 @@ LAUNCH_SCRIPT="${2:-system_simulation.sh}"
 CONTAINER=iros2026_system
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MAP_DIR="$SCRIPT_DIR/../map"
+MAP_DIR="$SCRIPT_DIR/../../map"
 MAP_ZIP="$MAP_DIR/${SCENE}.zip"
 
 if [ ! -f "$MAP_ZIP" ]; then
@@ -35,7 +35,7 @@ if [ ! -f "$MAP_ZIP" ]; then
 fi
 
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-  echo "${CONTAINER} 컨테이너가 안 떠있음. 먼저 'docker compose -f docker/compose_gpu.yml up -d' (GPU 없으면 compose.yml) 실행할 것" >&2
+  echo "${CONTAINER} 컨테이너가 안 떠있음. 먼저 'docker compose -f ai_module/docker/compose_gpu.yml up -d' (GPU 없으면 compose.yml) 실행할 것" >&2
   exit 1
 fi
 
@@ -75,4 +75,4 @@ docker exec "$CONTAINER" bash -lc "
 "
 
 echo "[run_scene] ${LAUNCH_SCRIPT} 실행 (씬: ${SCENE})"
-docker exec -it "$CONTAINER" bash -lc "/home/docker/autonomy_stack_mecanum_wheel_platform/${LAUNCH_SCRIPT}"
+docker exec -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp -it "$CONTAINER" bash -lc "/home/docker/autonomy_stack_mecanum_wheel_platform/${LAUNCH_SCRIPT}"
