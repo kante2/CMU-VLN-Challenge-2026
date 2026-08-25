@@ -78,6 +78,29 @@ RUN /bin/bash -c "\
 
 RUN echo "source /home/docker/ai_module/install/setup.bash" >> /home/docker/.bashrc
 
+# system 컨테이너와 동일한 DDS 를 쓰도록 고정한다.
+# 베이스 이미지의 ~/.bashrc 도 CycloneDDS 를 export 하지만 그건 대화형 셸에서만 실행된다
+# (Ubuntu 기본 .bashrc 는 비대화형이면 맨 앞에서 즉시 return). `bash -c` 나 `bash -lc` 로
+# 띄우면 기본값 FastDDS 로 떨어지는데, 두 컨테이너는 network_mode: host 이면서 ipc 가
+# private 이라 /dev/shm 이 분리돼 있다. FastDDS 는 둘을 "같은 호스트"로 보고 공유메모리
+# 전송을 골라서, discovery 는 되는데 데이터가 한 건도 안 온다. ENV 로 박아두면 실행
+# 방식과 무관하게 보장된다.
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+# 이 이미지를 Docker Hub 에서 받아 단독으로 띄우는 사람을 위한 실행 스크립트.
+# docker exec 는 ENTRYPOINT(/ros_entrypoint.sh)를 거치지 않고, 비대화형 셸은 ~/.bashrc 를
+# 읽지 않으므로 소싱을 여기서 명시적으로 해준다.
+#   docker exec -e GEMINI_API_KEY=<key> -it <container> /home/docker/run_sysnav.sh
+RUN printf '%s\n' \
+      '#!/bin/bash' \
+      'set -e' \
+      'source /opt/ros/jazzy/setup.bash' \
+      'source /home/docker/ai_module/install/setup.bash' \
+      'exec ros2 launch sysnav sysnav.launch.py' \
+      > /home/docker/run_sysnav.sh \
+    && chmod +x /home/docker/run_sysnav.sh \
+    && chown docker:docker /home/docker/run_sysnav.sh
+
 ENV SAM2_CHECKPOINT=/home/docker/ai_module/weights/sam2.1_hiera_tiny.pt
 ENV SAM2_MODEL_CFG=configs/sam2.1/sam2.1_hiera_t.yaml
 ENV YOLO_WORLD_WEIGHTS=/home/docker/ai_module/weights/yolov8x-worldv2.pt

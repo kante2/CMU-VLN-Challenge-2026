@@ -7,7 +7,7 @@
 # 이미지에 이미 들어있으므로 여기서 다시 설치하지 않는다. 레포의 sysnav 소스만 덮어쓰고
 # 다시 빌드하므로, 이미지가 오래됐더라도 **레포 코드가 항상 우선**한다.
 #   https://hub.docker.com/r/kante2/cmu-vln-2026-sysnav
-FROM kante2/cmu-vln-2026-sysnav:submission-v3
+FROM kante2/cmu-vln-2026-sysnav:submission-v4
 
 # system 컨테이너와 동일한 DDS를 쓰도록 고정한다.
 #
