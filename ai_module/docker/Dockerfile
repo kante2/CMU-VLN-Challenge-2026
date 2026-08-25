@@ -7,7 +7,7 @@
 # 이미지에 이미 들어있으므로 여기서 다시 설치하지 않는다. 레포의 sysnav 소스만 덮어쓰고
 # 다시 빌드하므로, 이미지가 오래됐더라도 **레포 코드가 항상 우선**한다.
 #   https://hub.docker.com/r/kante2/cmu-vln-2026-sysnav
-FROM kante2/cmu-vln-2026-sysnav:submission-v4
+FROM kante2/cmu-vln-2026-sysnav:submission-v5
 
 # system 컨테이너와 동일한 DDS를 쓰도록 고정한다.
 #
@@ -26,6 +26,9 @@ COPY --chown=docker:docker src/sysnav_ros2_mvp /home/docker/ai_module/src/sysnav
 WORKDIR /home/docker/ai_module
 RUN /bin/bash -c "source /opt/ros/jazzy/setup.bash && \
     colcon build --symlink-install --packages-select sysnav"
+
+# debug 출력 폴더 보장. 베이스 이미지 태그와 무관하게 항상 존재하도록 래퍼에도 둔다.
+RUN mkdir -p /home/docker/ai_module/debug/scene_graph_viewpoints
 
 # 평가자용 실행 스크립트.
 # docker exec는 ENTRYPOINT(/ros_entrypoint.sh)를 거치지 않고, 비대화형 셸은 ~/.bashrc를

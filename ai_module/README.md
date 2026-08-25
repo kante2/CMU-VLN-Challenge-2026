@@ -14,7 +14,7 @@ below was executed end-to-end on the submission image before publishing this doc
 ## 1. Docker Hub submission image
 
 - Repository: https://hub.docker.com/r/kante2/cmu-vln-2026-sysnav
-- **Image: `kante2/cmu-vln-2026-sysnav:submission-v4`**
+- **Image: `kante2/cmu-vln-2026-sysnav:submission-v5`**
 
 Everything needed at runtime is baked into the image — **no downloads happen during
 evaluation**:
@@ -33,7 +33,7 @@ You do not need to pull manually — step 2 pulls the image as part of the build
 can pre-fetch it:
 
 ```bash
-docker pull kante2/cmu-vln-2026-sysnav:submission-v4
+docker pull kante2/cmu-vln-2026-sysnav:submission-v5
 ```
 
 ---

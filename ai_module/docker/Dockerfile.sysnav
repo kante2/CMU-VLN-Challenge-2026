@@ -106,6 +106,13 @@ ENV SAM2_MODEL_CFG=configs/sam2.1/sam2.1_hiera_t.yaml
 ENV YOLO_WORLD_WEIGHTS=/home/docker/ai_module/weights/yolov8x-worldv2.pt
 ENV YOLO12_WEIGHTS=/home/docker/ai_module/weights/yolo12s.pt
 
+# debug 출력 폴더를 미리 만들어 둔다.
+# 코드도 기동 시 os.makedirs 로 만들지만(scene_graph_visualizer.py), 이미지에 미리
+# 있으면 소유권이 docker 로 확정되고 "폴더가 없다 = 노드가 안 떴다"를 바로 구분할 수 있다.
+# viewpoint 파노라마(scene_graph_viewpoints/)가 여기 쌓이고, 관계 검증과 VLM 카운팅이
+# 그 파일을 다시 읽어가므로 이 경로는 진단용이 아니라 파이프라인 경로다.
+RUN mkdir -p /home/docker/ai_module/debug/scene_graph_viewpoints
+
 RUN chown -R docker:docker /home/docker/ai_module
 
 # 원래 유저로 복귀
