@@ -74,6 +74,20 @@ services:
     volumes:
       - ../ai_module/src/sysnav_ros2_mvp:/home/docker/ai_module/src/sysnav_ros2_mvp
       - ../ai_module/debug:/home/docker/ai_module/debug
+    # debug 폴더 소유권을 컨테이너 유저로 맞춘 뒤 셸을 띄운다.
+    # Dockerfile.sysnav의 `chown -R docker:docker`로는 못 고친다 - 그건 빌드 시점이라
+    # 이미지 레이어에만 남고, 런타임엔 위의 bind mount가 그 위를 통째로 덮어버린다.
+    # 호스트 쪽 ai_module/debug는 호스트 유저(uid 1000)나 root 소유 755라, 컨테이너
+    # 프로세스(uid 1001 docker)는 `other`(r-x)에 걸려 쓰기가 막힌다. 그러면 노드는
+    # 안 죽고 "permission denied" 경고만 반복해서(exploration_debug_latest.png,
+    # mission_status_latest.html, llm_trace/) 노드 버그처럼 보인다.
+    # 지금까지는 머신마다 사람이 손으로 setfacl을 걸어 넘겼는데, 안 건 머신에선 그대로
+    # 재발한다. 마운트가 붙은 뒤(=런타임) 고쳐야 하므로 여기가 제자리다.
+    # entrypoint(/ros_entrypoint.sh)는 그대로 두고 command만 덮으므로 ROS 소싱은 유지된다.
+    command: >
+      bash -c "sudo chown -R docker:docker /home/docker/ai_module/debug &&
+               sudo chmod -R u+rwX /home/docker/ai_module/debug &&
+               exec bash"
     deploy:
         resources:
           reservations:
